@@ -14,14 +14,18 @@
 
 این سامانه فقط اطلاعات عمومی را بررسی می‌کند و هیچ رمز عبور، کوکی حساب شخصی یا دسترسی رسمی اینستاگرام از کاربر دریافت نمی‌کند.
 
+![نمونه کارت تأیید پیج](docs/profile-preview-example.jpg)
+
 ### امکانات
 
 - رابط کاربری کاملاً فارسی با `aiogram 3`
 - پایش ناهمگام پیج‌های عمومی با `HTTPX`
 - تشخیص تغییر وضعیت فعال و دی‌اکتیو
 - تنظیم جداگانه اعلان‌ها برای هر پیج
-- نمایش زنده عکس پروفایل، تعداد دنبال‌کننده، دنبال‌شونده، پست‌ها و عمومی یا خصوصی‌بودن پیج
-- نمایش بیوگرافی، دسته‌بندی و لینک تکمیلی پیج‌های عمومی در صورت دسترسی
+- نمایش زنده عکس پروفایل، تعداد دنبال‌کننده، پست‌ها و عمومی یا خصوصی‌بودن پیج
+- نمایش بیوگرافی پیج عمومی در صورتی که نمای embed آن را ارائه کند
+- ساخت کارت تصویری اختصاصی هنگام ثبت پیج برای تأیید نام، عکس، آمار و بیوگرافی قابل‌دسترسی
+- امکان ثبت نام کاربری غیرفعال برای کاربرانی که منتظر فعال‌شدن آن هستند
 - پلن رایگان با ۱ پیج، پریمیوم با ۱۰ پیج و ویژه با ۵۰ پیج
 - شناسایی خودکار مدیر اصلی با پلن ویژه، منوی اختصاصی و اعتبار مدیریتی
 - پنل مدیریت برای مشاهده آمار، تمدید اشتراک، تغییر فاصله و اجرای بررسی فوری
@@ -198,7 +202,13 @@ instagram
 https://www.instagram.com/instagram/
 ```
 
-پس از انتخاب هر پیج، دکمه `مشاهده اطلاعات زنده پیج 🔎` در دسترس است. ربات در صورت دسترسی، عکس پروفایل، تعداد دنبال‌کننده، دنبال‌شونده، پست، عمومی یا خصوصی‌بودن، وضعیت تأیید و اطلاعات تکمیلی پیج عمومی را ارسال می‌کند.
+پس از انتخاب هر پیج، دکمه `مشاهده اطلاعات زنده پیج 🔎` در دسترس است. ربات در صورت دسترسی، عکس پروفایل، تعداد دنبال‌کننده، پست، عمومی یا خصوصی‌بودن، وضعیت تأیید و اطلاعات تکمیلی پیج عمومی را ارسال می‌کند.
+
+هنگام افزودن پیج، ربات ابتدا آدرس `/embed/` را بدون ورود به حساب بررسی می‌کند:
+
+- اگر پیج فعال باشد، Chromium نمای عمومی را رندر می‌کند و ربات یک کارت تصویری اختصاصی برای تأیید کاربر می‌فرستد. پیج تنها پس از انتخاب «بله، همین پیج ثبت شود» ذخیره می‌شود.
+- اگر پاسخ `404` باشد، گزینه «ثبت به‌عنوان پیج غیرفعال» نمایش داده می‌شود. این پیج با وضعیت غیرفعال ذخیره می‌شود و به‌محض بازگشت پاسخ `200`، اعلان فعال‌شدن ارسال خواهد شد.
+- پاسخ‌های موقت، redirect و خطاهای نامطمئن باعث ثبت اشتباه یا تغییر وضعیت نمی‌شوند.
 
 ### پنل مدیریت
 
@@ -256,9 +266,12 @@ https://www.instagram.com/instagram/
 | `CHECK_JITTER_MIN_SECONDS` | خیر | `0.5` | کمترین تأخیر تصادفی |
 | `CHECK_JITTER_MAX_SECONDS` | خیر | `3.0` | بیشترین تأخیر تصادفی |
 | `INSTAGRAM_BASE_URL` | خیر | `https://www.instagram.com` | نشانی پایه صفحات عمومی |
-| `INSTAGRAM_WEB_APP_ID` | خیر | `936619743392459` | شناسه عمومی برنامه وب برای دریافت جزئیات پیج |
 | `INSTAGRAM_REQUEST_TIMEOUT_SECONDS` | خیر | `20` | مهلت هر درخواست HTTP |
 | `RATE_LIMIT_COOLDOWN_SECONDS` | خیر | `900` | توقف پیش‌فرض پس از محدودیت درخواست |
+| `CHROMIUM_EXECUTABLE` | خیر | `/usr/bin/chromium` | مسیر Chromium نصب‌شده از مخزن Debian |
+| `PROFILE_PREVIEW_TIMEOUT_SECONDS` | خیر | `25` | مهلت رندر نمای عمومی پیج |
+| `PROFILE_PREVIEW_CACHE_SECONDS` | خیر | `900` | مدت کش اطلاعات تصویری پیج |
+| `PROFILE_PREVIEW_CONCURRENCY` | خیر | `2` | حداکثر رندر هم‌زمان Chromium |
 | `FREE_TRIAL_DAYS` | خیر | `7` | اعتبار اولیه کاربر جدید |
 | `LOG_LEVEL` | خیر | `INFO` | سطح ثبت رویدادها |
 
@@ -317,6 +330,7 @@ farstar-warner/
     ├── database.py
     ├── models.py
     ├── checker.py
+    ├── profile_preview.py
     ├── main.py
     ├── handlers/
     │   ├── admin.py
@@ -337,7 +351,8 @@ Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram p
 - Asynchronous Telegram UI with aiogram 3
 - Public-profile checks with HTTPX
 - Activation, deactivation, and username-change notifications
-- On-demand profile photo, follower, following, post, privacy, verification, bio, category, and link details when publicly available
+- On-demand profile card with photo, follower count, post count, privacy, verification, and biography when exposed by the public embed
+- Confirmation before saving active profiles and an explicit waiting-list path for inactive usernames
 - Per-profile notification settings
 - Free, Premium, and VIP target limits
 - Restricted administrator panel
@@ -379,6 +394,6 @@ Open the bot and send `/start`. The configured administrator can access the rest
 
 ### Operational note
 
-Instagram can change public page behavior or apply temporary access restrictions at any time. Login redirects, challenge pages, network errors, and temporary server failures are treated as unknown results and do not overwrite the last known profile state. A `429` response activates a shared Redis cooldown.
+Instagram can change public page behavior or apply temporary access restrictions at any time. Login redirects, challenge pages, network errors, and temporary server failures are treated as unknown results and do not overwrite the last known profile state. A `429` response activates a status-check-only Redis cooldown; profile previews use a separate cache and cannot pause monitoring.
 
 Use the software only for public profiles and in accordance with applicable law and platform terms.

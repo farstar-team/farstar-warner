@@ -40,6 +40,7 @@ services:
 
   bot-app:
     image: farstar-warner:latest
+    init: true
     build:
       context: .
       dockerfile: Dockerfile
@@ -56,7 +57,8 @@ services:
       - outbound
     read_only: true
     tmpfs:
-      - /tmp:size=64m,mode=1777
+      - /tmp:size=256m,mode=1777
+    shm_size: 256m
     cap_drop:
       - ALL
     security_opt:

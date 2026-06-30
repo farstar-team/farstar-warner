@@ -73,6 +73,31 @@ def confirm_delete_keyboard(page_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def registration_confirmation_keyboard(
+    *, inactive: bool = False
+) -> InlineKeyboardMarkup:
+    confirm_text = (
+        "⏳ ثبت به‌عنوان پیج غیرفعال" if inactive else "✅ بله، همین پیج ثبت شود"
+    )
+    status = "inactive" if inactive else "active"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=confirm_text,
+                    callback_data=f"register:confirm:{status}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ خیر، لغو ثبت",
+                    callback_data="register:cancel",
+                )
+            ],
+        ]
+    )
+
+
 def settings_pages_keyboard(pages: list[TargetPage]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for page in pages:

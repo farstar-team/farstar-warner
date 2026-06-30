@@ -20,6 +20,7 @@ from bot.config import Settings, get_settings
 from bot.database import SessionFactory, create_database, initialize_database
 from bot.handlers import admin, user
 from bot.models import PlanTier, User, UserStatus
+from bot.profile_preview import ProfilePreviewService
 
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,7 @@ async def run() -> None:
         },
     )
     checker = InstagramChecker(bot, session_factory, redis, settings)
+    profile_preview = ProfilePreviewService(redis, settings)
 
     try:
         await wait_for_dependencies(engine, redis)
@@ -158,10 +160,12 @@ async def run() -> None:
             redis=redis,
             scheduler=scheduler,
             checker=checker,
+            profile_preview=profile_preview,
         )
     finally:
         if scheduler.running:
             scheduler.shutdown(wait=False)
+        await profile_preview.close()
         await checker.close()
         await redis.aclose()
         await engine.dispose()

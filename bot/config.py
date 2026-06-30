@@ -37,9 +37,12 @@ class Settings(BaseSettings):
     check_jitter_min_seconds: float = Field(default=0.5, ge=0, le=30)
     check_jitter_max_seconds: float = Field(default=3.0, ge=0, le=60)
     instagram_base_url: str = "https://www.instagram.com"
-    instagram_web_app_id: str = "936619743392459"
     instagram_request_timeout_seconds: float = Field(default=20.0, ge=5, le=60)
     rate_limit_cooldown_seconds: int = Field(default=900, ge=60, le=86400)
+    chromium_executable: str = "/usr/bin/chromium"
+    profile_preview_timeout_seconds: int = Field(default=25, ge=10, le=60)
+    profile_preview_cache_seconds: int = Field(default=900, ge=60, le=86400)
+    profile_preview_concurrency: int = Field(default=2, ge=1, le=5)
     free_trial_days: int = Field(default=7, ge=1, le=365)
     log_level: str = "INFO"
 

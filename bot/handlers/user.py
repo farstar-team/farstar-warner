@@ -12,12 +12,12 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObject
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from bot.checker import CheckOutcome, InstagramChecker, ProfileDetails
+from bot.checker import CheckOutcome, InstagramChecker
 from bot.config import Settings
 from bot.database import SessionFactory
 from bot.keyboards.inline import (
@@ -25,6 +25,7 @@ from bot.keyboards.inline import (
     notification_settings_keyboard,
     page_details_keyboard,
     pages_keyboard,
+    registration_confirmation_keyboard,
     settings_pages_keyboard,
     subscription_keyboard,
 )
@@ -37,6 +38,7 @@ from bot.models import (
     User,
     UserStatus,
 )
+from bot.profile_preview import EmbedProfile, PreviewOutcome, ProfilePreviewService
 
 
 router = Router(name="user")
@@ -50,13 +52,14 @@ PLAN_NAMES = {
 }
 PAGE_STATUS_NAMES = {
     PageStatus.ACTIVE: "فعال 🟢",
-    PageStatus.DEACTIVATED: "دی‌اکتیو 🔴",
+    PageStatus.DEACTIVATED: "غیرفعال / منتظر فعال‌شدن 🔴",
     None: "در انتظار اولین بررسی ⚪",
 }
 
 
 class AddPageState(StatesGroup):
     waiting_for_username = State()
+    waiting_for_confirmation = State()
 
 
 class UserAccessMiddleware(BaseMiddleware):
@@ -281,12 +284,96 @@ async def add_page(
     state: FSMContext,
     db_user: User,
     session_factory: SessionFactory,
-    settings: Settings,
+    checker: InstagramChecker,
+    profile_preview: ProfilePreviewService,
 ) -> None:
     username = normalize_instagram_username(message.text or "")
     if username is None:
         await message.answer(
             "نام کاربری معتبر نیست. فقط حروف انگلیسی، عدد، نقطه و زیرخط مجاز است. دوباره تلاش کنید."
+        )
+        return
+
+    async with session_factory() as session:
+        existing = await session.scalar(
+            select(TargetPage.id).where(
+                TargetPage.user_id == db_user.telegram_id,
+                TargetPage.instagram_username == username,
+            )
+        )
+    if existing is not None:
+        await message.answer("این پیج قبلاً به فهرست شما اضافه شده است.")
+        return
+
+    await message.answer("در حال بررسی پیج و ساخت تصویر تأیید… لطفاً کمی صبر کنید.")
+    status = await checker.fetch_profile(username)
+    if status.outcome == CheckOutcome.ACTIVE:
+        preview = await profile_preview.inspect(username, use_cache=False)
+        if preview.outcome != PreviewOutcome.ACTIVE:
+            preview = EmbedProfile(PreviewOutcome.ACTIVE, username=username)
+        card = await profile_preview.render_card(preview)
+        await state.update_data(
+            pending_username=username,
+            pending_status=PageStatus.ACTIVE.value,
+            pending_profile_id=status.profile_id,
+        )
+        await state.set_state(AddPageState.waiting_for_confirmation)
+        await message.answer_photo(
+            BufferedInputFile(card, filename=f"farstar-{username}.jpg"),
+            caption=(
+                f"پیج <b>@{html.escape(username)}</b> پیدا شد. این تصویر برای تأیید پیج ساخته شده است.\n\n"
+                "آیا همین پیج را می‌خواهید پایش کنید؟"
+            ),
+            reply_markup=registration_confirmation_keyboard(),
+        )
+        return
+
+    if status.outcome == CheckOutcome.DEACTIVATED:
+        await state.update_data(
+            pending_username=username,
+            pending_status=PageStatus.DEACTIVATED.value,
+            pending_profile_id=None,
+        )
+        await state.set_state(AddPageState.waiting_for_confirmation)
+        await message.answer(
+            f"پیج <b>@{html.escape(username)}</b> اکنون پیدا نشد. ممکن است دی‌اکتیو، حذف یا نام کاربری آن تغییر کرده باشد.\n\n"
+            "اگر منتظر فعال‌شدن این نام کاربری هستید، می‌توانید آن را به‌صورت غیرفعال ثبت کنید.",
+            reply_markup=registration_confirmation_keyboard(inactive=True),
+        )
+        return
+
+    if status.outcome == CheckOutcome.RATE_LIMITED:
+        await message.answer(
+            "بررسی وضعیت اینستاگرام موقتاً محدود شده است. نام کاربری ثبت نشد؛ کمی بعد دوباره تلاش کنید."
+        )
+        return
+    await message.answer(
+        "در حال حاضر پاسخ قابل‌اعتمادی از اینستاگرام دریافت نشد. برای جلوگیری از ثبت اشتباه، کمی بعد دوباره تلاش کنید."
+    )
+
+
+@router.callback_query(
+    AddPageState.waiting_for_confirmation,
+    F.data.startswith("register:confirm:"),
+)
+async def confirm_page_registration(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_user: User,
+    session_factory: SessionFactory,
+    settings: Settings,
+) -> None:
+    data = await state.get_data()
+    username = data.get("pending_username")
+    stored_status = data.get("pending_status")
+    requested_status = (callback.data or "").rsplit(":", 1)[1]
+    expected_status = (
+        "inactive" if stored_status == PageStatus.DEACTIVATED.value else "active"
+    )
+    if not isinstance(username, str) or requested_status != expected_status:
+        await state.clear()
+        await callback.answer(
+            "درخواست ثبت معتبر نیست. دوباره تلاش کنید.", show_alert=True
         )
         return
 
@@ -298,9 +385,8 @@ async def add_page(
                 .with_for_update()
             )
             if user is None:
-                await message.answer(
-                    "حساب کاربری شما پیدا نشد. لطفاً دستور /start را اجرا کنید."
-                )
+                await state.clear()
+                await callback.answer("حساب کاربری پیدا نشد.", show_alert=True)
                 return
             target_count = await session.scalar(
                 select(func.count(TargetPage.id)).where(
@@ -310,14 +396,8 @@ async def add_page(
             guard_message = _add_guard_message(user, int(target_count or 0))
             if guard_message:
                 await state.clear()
-                await message.answer(
-                    guard_message,
-                    reply_markup=main_menu_keyboard(
-                        is_admin=db_user.telegram_id == settings.admin_telegram_id
-                    ),
-                )
+                await callback.answer(guard_message, show_alert=True)
                 return
-
             existing = await session.scalar(
                 select(TargetPage.id).where(
                     TargetPage.user_id == user.telegram_id,
@@ -325,27 +405,63 @@ async def add_page(
                 )
             )
             if existing is not None:
-                await message.answer("این پیج قبلاً به فهرست شما اضافه شده است.")
+                await state.clear()
+                await callback.answer("این پیج قبلاً ثبت شده است.", show_alert=True)
                 return
-
-            target = TargetPage(instagram_username=username, user_id=user.telegram_id)
+            page_status = PageStatus(stored_status)
+            target = TargetPage(
+                instagram_username=username,
+                user_id=user.telegram_id,
+                last_known_status=page_status,
+                last_known_id=data.get("pending_profile_id"),
+                last_checked_at=datetime.now(timezone.utc),
+            )
             session.add(target)
             await session.flush()
             session.add(
                 NotificationSettings(user_id=user.telegram_id, target_page_id=target.id)
             )
             await session.commit()
-    except IntegrityError:
-        await message.answer("این پیج قبلاً به فهرست شما اضافه شده است.")
+    except (IntegrityError, ValueError):
+        await state.clear()
+        await callback.answer("ثبت پیج انجام نشد یا قبلاً ثبت شده است.", show_alert=True)
         return
 
     await state.clear()
-    await message.answer(
-        f"پیج <b>@{html.escape(username)}</b> با موفقیت اضافه شد. اولین وضعیت پس از بررسی بعدی ثبت می‌شود. ✅",
-        reply_markup=main_menu_keyboard(
-            is_admin=db_user.telegram_id == settings.admin_telegram_id
-        ),
+    status_text = (
+        "فعال"
+        if stored_status == PageStatus.ACTIVE.value
+        else "غیرفعال و منتظر فعال‌شدن"
     )
+    if callback.message:
+        await callback.message.answer(
+            f"پیج <b>@{html.escape(username)}</b> با وضعیت «{status_text}» ثبت شد. ✅",
+            reply_markup=main_menu_keyboard(
+                is_admin=db_user.telegram_id == settings.admin_telegram_id
+            ),
+        )
+    await callback.answer("پیج ثبت شد. ✅")
+
+
+@router.callback_query(
+    AddPageState.waiting_for_confirmation,
+    F.data == "register:cancel",
+)
+async def cancel_page_registration(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_user: User,
+    settings: Settings,
+) -> None:
+    await state.clear()
+    if callback.message:
+        await callback.message.answer(
+            "ثبت پیج لغو شد.",
+            reply_markup=main_menu_keyboard(
+                is_admin=db_user.telegram_id == settings.admin_telegram_id
+            ),
+        )
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("page:view:"))
@@ -380,42 +496,36 @@ async def view_page(
     await callback.answer()
 
 
-def _profile_details_caption(details: ProfileDetails) -> str:
-    username = html.escape(details.username or "نامشخص")
+def _profile_details_caption(details: EmbedProfile) -> str:
+    username = html.escape(details.username)
     full_name = html.escape(details.full_name or "ثبت نشده")
-    if details.is_private is True:
+    if details.is_private:
         privacy = "خصوصی 🔒"
-    elif details.is_private is False:
-        privacy = "عمومی 🌐"
     else:
-        privacy = "نامشخص"
+        privacy = "عمومی 🌐"
     verified = "تأییدشده ✅" if details.is_verified else "تأییدنشده"
+    follower_text = (
+        to_persian_digits(details.follower_display)
+        if details.follower_display
+        else format_count(details.follower_count)
+    )
     lines = [
         f"اطلاعات زنده پیج <b>@{username}</b> 🔎",
         "",
         f"نام: <b>{full_name}</b>",
         f"نوع پیج: <b>{privacy}</b>",
         f"وضعیت تأیید: {verified}",
-        f"تعداد دنبال‌کننده: <b>{format_count(details.follower_count)}</b>",
-        f"تعداد دنبال‌شونده: <b>{format_count(details.following_count)}</b>",
+        f"تعداد دنبال‌کننده: <b>{follower_text}</b>",
         f"تعداد پست: <b>{format_count(details.post_count)}</b>",
     ]
-    if details.profile_id:
-        lines.append(
-            f"شناسه اینستاگرام: <code>{html.escape(details.profile_id)}</code>"
-        )
-    if details.is_private is False:
-        if details.category_name:
-            lines.append(f"دسته‌بندی: {html.escape(details.category_name)}")
-        if details.biography:
-            biography = details.biography.strip()
-            if len(biography) > 350:
-                biography = biography[:347] + "…"
-            lines.extend(("", f"معرفی پیج:\n{html.escape(biography)}"))
-        if details.external_url:
-            escaped_url = html.escape(details.external_url, quote=True)
-            lines.append(f'وب‌سایت: <a href="{escaped_url}">مشاهده لینک</a>')
-    lines.extend(("", "این اطلاعات همین حالا از صفحه عمومی دریافت شد."))
+    if details.biography:
+        biography = details.biography.strip()
+        if len(biography) > 350:
+            biography = biography[:347] + "…"
+        lines.extend(("", f"بیوگرافی:\n{html.escape(biography)}"))
+    else:
+        lines.extend(("", "بیوگرافی در نمای عمومی اینستاگرام ارائه نشده است."))
+    lines.extend(("", "اطلاعات از نمای عمومی و بدون ورود به حساب دریافت شد."))
     return "\n".join(lines)
 
 
@@ -425,6 +535,7 @@ async def live_profile_details(
     db_user: User,
     session_factory: SessionFactory,
     checker: InstagramChecker,
+    profile_preview: ProfilePreviewService,
 ) -> None:
     page_id = int((callback.data or "").rsplit(":", 1)[1])
     async with session_factory() as session:
@@ -442,36 +553,38 @@ async def live_profile_details(
         return
 
     await callback.answer("در حال دریافت اطلاعات زنده…")
-    details = await checker.fetch_profile_details(page.instagram_username)
-    if details.outcome == CheckOutcome.RATE_LIMITED:
-        wait_seconds = to_persian_digits(details.retry_after or 60)
-        await callback.message.answer(
-            "اینستاگرام موقتاً تعداد درخواست‌ها را محدود کرده است. "
-            f"حدود {wait_seconds} ثانیه دیگر دوباره تلاش کنید."
-        )
-        return
-    if details.outcome == CheckOutcome.DEACTIVATED:
+    details = await profile_preview.inspect(page.instagram_username)
+    if details.outcome == PreviewOutcome.DEACTIVATED:
         await callback.message.answer(
             f"پیج <b>@{html.escape(page.instagram_username)}</b> در حال حاضر در دسترس نیست یا دی‌اکتیو شده است."
         )
         return
-    if details.outcome != CheckOutcome.ACTIVE:
+    if details.outcome != PreviewOutcome.ACTIVE:
+        status = await checker.fetch_profile(page.instagram_username)
+        if status.outcome == CheckOutcome.ACTIVE:
+            await callback.message.answer(
+                f"پیج <b>@{html.escape(page.instagram_username)}</b> فعال است، اما ساخت تصویر زنده این بار انجام نشد. کمی بعد دوباره تلاش کنید."
+            )
+            return
+        if status.outcome == CheckOutcome.DEACTIVATED:
+            await callback.message.answer(
+                f"پیج <b>@{html.escape(page.instagram_username)}</b> اکنون در دسترس نیست."
+            )
+            return
         await callback.message.answer(
             "دریافت اطلاعات زنده این پیج فعلاً ممکن نیست. کمی بعد دوباره تلاش کنید."
         )
         return
 
     caption = _profile_details_caption(details)
-    if details.profile_picture_url:
-        try:
-            await callback.message.answer_photo(
-                photo=details.profile_picture_url,
-                caption=caption,
-            )
-            return
-        except TelegramAPIError:
-            pass
-    await callback.message.answer(caption)
+    card = await profile_preview.render_card(details)
+    try:
+        await callback.message.answer_photo(
+            BufferedInputFile(card, filename=f"farstar-{page.instagram_username}.jpg"),
+            caption=caption,
+        )
+    except TelegramAPIError:
+        await callback.message.answer(caption)
 
 
 @router.callback_query(F.data.startswith("page:delete:"))
