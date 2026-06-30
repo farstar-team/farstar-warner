@@ -76,17 +76,18 @@ async def cancel_admin_message(
     await state.clear()
     await message.answer(
         "عملیات لغو شد.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=True),
     )
 
 
+@router.message(F.text == "پنل مدیریت 🛡️")
 @router.message(Command("admin"))
 async def admin_panel(message: Message, settings: Settings, state: FSMContext) -> None:
     if await _reject_message(message, settings):
         return
     await state.clear()
     await message.answer(
-        "پنل مدیریت فارستار وارنر 🛡️\n\nیک گزینه را انتخاب کنید:",
+        "پنل مدیریت اصلی فارستار وارنر 🛡️\n\nیک گزینه را انتخاب کنید:",
         reply_markup=admin_panel_keyboard(),
     )
 
@@ -261,7 +262,7 @@ async def finish_renew_subscription(
         f"شناسه کاربر: <code>{_digits(user_id)}</code>\n"
         f"پلن: {PLAN_NAMES[plan]}\n"
         f"اعتبار جدید: {expiry_text} به وقت جهانی",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=True),
     )
 
 
@@ -285,6 +286,21 @@ async def begin_schedule_change(
             reply_markup=cancel_keyboard(),
         )
     await callback.answer()
+
+
+@router.callback_query(F.data == "admin:check_now")
+async def run_checker_now(
+    callback: CallbackQuery,
+    settings: Settings,
+    scheduler: AsyncIOScheduler,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    scheduler.modify_job(
+        "instagram-checker",
+        next_run_time=datetime.now(timezone.utc),
+    )
+    await callback.answer("بررسی فوری در صف اجرا قرار گرفت. ✅", show_alert=True)
 
 
 @router.message(AdminScheduleState.waiting_for_interval)
@@ -314,7 +330,7 @@ async def finish_schedule_change(
     await state.clear()
     await message.answer(
         f"فاصله بررسی‌ها روی {_digits(interval)} ثانیه تنظیم شد. ✅",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=True),
     )
 
 

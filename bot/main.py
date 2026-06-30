@@ -17,8 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from bot.checker import InstagramChecker
 from bot.config import Settings, get_settings
-from bot.database import create_database, initialize_database
+from bot.database import SessionFactory, create_database, initialize_database
 from bot.handlers import admin, user
+from bot.models import PlanTier, User, UserStatus
 
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,30 @@ async def configure_commands(bot: Bot, settings: Settings) -> None:
     )
 
 
+async def ensure_primary_admin(
+    session_factory: SessionFactory,
+    settings: Settings,
+) -> None:
+    minimum_expiry = datetime.now(timezone.utc) + timedelta(days=3650)
+    async with session_factory() as session:
+        admin_user = await session.get(User, settings.admin_telegram_id)
+        if admin_user is None:
+            admin_user = User(
+                telegram_id=settings.admin_telegram_id,
+                username=None,
+                subscription_expiry=minimum_expiry,
+                status=UserStatus.ACTIVE,
+                plan_tier=PlanTier.VIP,
+            )
+            session.add(admin_user)
+        else:
+            admin_user.status = UserStatus.ACTIVE
+            admin_user.plan_tier = PlanTier.VIP
+            if admin_user.subscription_expiry < minimum_expiry:
+                admin_user.subscription_expiry = minimum_expiry
+        await session.commit()
+
+
 async def run() -> None:
     settings = get_settings()
     logging.basicConfig(
@@ -94,6 +119,7 @@ async def run() -> None:
     try:
         await wait_for_dependencies(engine, redis)
         await initialize_database(engine)
+        await ensure_primary_admin(session_factory, settings)
         await bot.delete_webhook(drop_pending_updates=False)
         await configure_commands(bot, settings)
 
@@ -131,6 +157,7 @@ async def run() -> None:
             settings=settings,
             redis=redis,
             scheduler=scheduler,
+            checker=checker,
         )
     finally:
         if scheduler.running:

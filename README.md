@@ -20,14 +20,18 @@
 - پایش ناهمگام پیج‌های عمومی با `HTTPX`
 - تشخیص تغییر وضعیت فعال و دی‌اکتیو
 - تنظیم جداگانه اعلان‌ها برای هر پیج
+- نمایش زنده عکس پروفایل، تعداد دنبال‌کننده، دنبال‌شونده، پست‌ها و عمومی یا خصوصی‌بودن پیج
+- نمایش بیوگرافی، دسته‌بندی و لینک تکمیلی پیج‌های عمومی در صورت دسترسی
 - پلن رایگان با ۱ پیج، پریمیوم با ۱۰ پیج و ویژه با ۵۰ پیج
-- پنل مدیریت برای مشاهده آمار، تمدید اشتراک و تغییر فاصله بررسی‌ها
+- شناسایی خودکار مدیر اصلی با پلن ویژه، منوی اختصاصی و اعتبار مدیریتی
+- پنل مدیریت برای مشاهده آمار، تمدید اشتراک، تغییر فاصله و اجرای بررسی فوری
 - PostgreSQL برای نگهداری کاربران، پیج‌ها و تنظیمات
 - Redis برای وضعیت‌های موقت ربات، قفل توزیع‌شده و کنترل محدودیت درخواست
 - زمان‌بندی بررسی‌ها با APScheduler
 - تأخیر تصادفی، User-Agent چرخشی، هم‌روندی محدود و توقف خودکار هنگام دریافت خطای `429`
 - اجرای ایمن در کانتینر بدون دسترسی ریشه، با فایل‌سیستم فقط‌خواندنی
 - نصب تعاملی روی اوبونتو با یک اسکریپت انگلیسی
+- پنل مدیریت انگلیسی سرور با فرمان `farstar` و پشتیبانی از چند ربات مستقل
 
 ### معماری
 
@@ -77,17 +81,81 @@ chmod +x install.sh
 5. رمز PostgreSQL
 6. رمز Redis؛ با خالی‌گذاشتن این مقدار یک رمز امن ساخته می‌شود
 
+توکن تلگرام هنگام تایپ نمایش داده می‌شود تا بتوانید درستی آن را کنترل کنید؛ رمزهای PostgreSQL و Redis برای امنیت مخفی می‌مانند.
+
 سپس فایل `.env` با سطح دسترسی محدود ساخته شده و دستور زیر خودکار اجرا می‌شود:
 
 ```bash
 docker compose up --build -d
 ```
 
+در پایان نصب، فرمان سراسری `farstar` نیز روی سرور فعال می‌شود.
+
+### فعال‌کردن پنل سرور روی نصب قبلی
+
+اگر نسخه قبلی ربات از قبل نصب است، ابتدا آخرین نسخه را دریافت و نصب‌کننده را دوباره اجرا کنید:
+
+```bash
+cd farstar-warner
+git pull
+chmod +x install.sh farstar.sh
+./install.sh
+```
+
+نصب‌کننده فایل `.env` قبلی را تشخیص می‌دهد. برای حفظ توکن و اطلاعات فعلی، در پاسخ به پرسش استفاده مجدد از تنظیمات، Enter یا `y` را بزنید. پس از این مرحله فرمان زیر پنل را باز می‌کند:
+
+```bash
+farstar
+```
+
+### پنل مدیریت سرور با فرمان farstar
+
+فرمان `farstar` یک منوی انگلیسی برای عملیات روزمره سرور باز می‌کند:
+
+- افزودن و نصب ربات جدید با PostgreSQL و Redis مستقل
+- فهرست‌کردن همه ربات‌ها و وضعیت اجرای آن‌ها
+- شروع، توقف و راه‌اندازی مجدد هر ربات
+- مشاهده زنده لاگ هر نمونه
+- دریافت آخرین نسخه شاخه `main` از GitHub و بازسازی ربات‌های در حال اجرا
+- ویرایش تنظیمات هر ربات
+- پشتیبان‌گیری و بازیابی PostgreSQL
+- حذف امن ربات با امکان نگه‌داشتن یا پاک‌کردن داده‌ها
+- مشاهده نسخه Docker و مصرف منابع کانتینرها
+
+فرمان‌های مستقیم نیز در دسترس هستند:
+
+```bash
+farstar list
+farstar status warner
+farstar logs warner
+farstar apply warner
+farstar update
+farstar backup warner
+farstar doctor
+farstar help
+```
+
+ربات اولیه با نام `warner` ثبت می‌شود. هر ربات جدید نام نمونه، توکن، مدیر، پایگاه داده، Redis، شبکه و volumeهای جداگانه دارد.
+
+برای نصب ربات جدید:
+
+```bash
+farstar add
+```
+
+برای حذف یک ربات:
+
+```bash
+farstar remove NAME
+```
+
+حذف volumeها اختیاری است. اگر در پاسخ حذف داده‌ها `y` وارد کنید، اطلاعات PostgreSQL و Redis آن نمونه نیز پاک می‌شود.
+
 ### بررسی وضعیت اجرا
 
 ```bash
-docker compose ps
-docker compose logs -f bot-app
+farstar status warner
+farstar logs warner
 ```
 
 برای خروج از نمایش زنده لاگ‌ها، کلیدهای `Ctrl+C` را فشار دهید. این کار سرویس ربات را متوقف نمی‌کند.
@@ -96,20 +164,19 @@ docker compose logs -f bot-app
 
 ```bash
 # راه‌اندازی مجدد ربات
-docker compose restart bot-app
+farstar restart warner
 
 # توقف همه سرویس‌ها بدون حذف داده‌ها
-docker compose down
+farstar stop warner
 
 # اجرای دوباره سرویس‌ها
-docker compose up -d
+farstar start warner
 
 # دریافت کد جدید و بازسازی برنامه
-git pull
-docker compose up --build -d
+farstar update
 ```
 
-برای جلوگیری از حذف اطلاعات، از `docker compose down -v` استفاده نکنید؛ گزینه `-v` داده‌های PostgreSQL و Redis را پاک می‌کند.
+برای حذف ربات از `farstar remove` استفاده کنید. مدیر سرور قبل از حذف volumeهای PostgreSQL و Redis تأیید جداگانه می‌گیرد.
 
 ### استفاده از ربات
 
@@ -121,6 +188,7 @@ docker compose up --build -d
 - `خرید اشتراک 💎`: ارسال درخواست پلن پریمیوم یا ویژه برای مدیر
 - `تنظیمات اعلان‌ها ⚙️`: فعال یا غیرفعال‌کردن اعلان هر پیج
 - `حساب کاربری 👤`: مشاهده پلن، اعتبار و تعداد پیج‌ها
+- `پنل مدیریت 🛡️`: فقط برای مدیر اصلی نمایش داده می‌شود
 
 نام کاربری اینستاگرام را می‌توان به یکی از شکل‌های زیر فرستاد:
 
@@ -129,6 +197,8 @@ docker compose up --build -d
 instagram
 https://www.instagram.com/instagram/
 ```
+
+پس از انتخاب هر پیج، دکمه `مشاهده اطلاعات زنده پیج 🔎` در دسترس است. ربات در صورت دسترسی، عکس پروفایل، تعداد دنبال‌کننده، دنبال‌شونده، پست، عمومی یا خصوصی‌بودن، وضعیت تأیید و اطلاعات تکمیلی پیج عمومی را ارسال می‌کند.
 
 ### پنل مدیریت
 
@@ -143,6 +213,9 @@ https://www.instagram.com/instagram/
 - مشاهده تعداد کاربران و وضعیت پیج‌ها
 - تمدید اشتراک کاربر و انتخاب پلن جدید
 - تغییر فاصله بررسی چکر بین ۳۰ تا ۸۶۴۰۰ ثانیه
+- قراردادن بررسی فوری همه پیج‌ها در صف اجرا
+
+حساب مدیر اصلی هنگام شروع برنامه به‌صورت خودکار فعال، روی پلن ویژه و با منوی اختصاصی ثبت می‌شود.
 
 فاصله جدید در Redis ذخیره می‌شود و پس از راه‌اندازی مجدد نیز باقی می‌ماند.
 
@@ -183,15 +256,16 @@ https://www.instagram.com/instagram/
 | `CHECK_JITTER_MIN_SECONDS` | خیر | `0.5` | کمترین تأخیر تصادفی |
 | `CHECK_JITTER_MAX_SECONDS` | خیر | `3.0` | بیشترین تأخیر تصادفی |
 | `INSTAGRAM_BASE_URL` | خیر | `https://www.instagram.com` | نشانی پایه صفحات عمومی |
+| `INSTAGRAM_WEB_APP_ID` | خیر | `936619743392459` | شناسه عمومی برنامه وب برای دریافت جزئیات پیج |
 | `INSTAGRAM_REQUEST_TIMEOUT_SECONDS` | خیر | `20` | مهلت هر درخواست HTTP |
 | `RATE_LIMIT_COOLDOWN_SECONDS` | خیر | `900` | توقف پیش‌فرض پس از محدودیت درخواست |
 | `FREE_TRIAL_DAYS` | خیر | `7` | اعتبار اولیه کاربر جدید |
 | `LOG_LEVEL` | خیر | `INFO` | سطح ثبت رویدادها |
 
-بعد از تغییر دستی `.env`، برنامه را بازسازی و اجرا کنید:
+برای تغییر امن تنظیمات نمونه اصلی از پنل استفاده کنید؛ در پایان، پنل درباره بازسازی کانتینر سؤال می‌کند:
 
 ```bash
-docker compose up --build -d
+farstar edit warner
 ```
 
 اگر فاصله بررسی قبلاً از پنل مدیریت تغییر کرده باشد، مقدار ذخیره‌شده در Redis بر `CHECK_INTERVAL_SECONDS` اولویت دارد. برای تغییر آن دوباره از گزینه زمان‌بندی در پنل مدیریت استفاده کنید.
@@ -201,13 +275,13 @@ docker compose up --build -d
 ساخت نسخه پشتیبان:
 
 ```bash
-docker compose exec -T postgres sh -c 'pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB"' > farstar-backup.sql
+farstar backup warner
 ```
 
-بازیابی نسخه پشتیبان در پایگاه داده موجود:
+مسیر فایل ساخته‌شده در خروجی نمایش داده می‌شود. برای بازیابی نسخه پشتیبان در پایگاه داده موجود:
 
 ```bash
-docker compose exec -T postgres sh -c 'psql -U "$POSTGRES_USER" "$POSTGRES_DB"' < farstar-backup.sql
+farstar restore warner
 ```
 
 پیش از بازیابی، از وضعیت فعلی نسخه پشتیبان بگیرید؛ بازیابی می‌تواند اطلاعات موجود را تغییر دهد.
@@ -234,6 +308,7 @@ docker compose logs --tail=100 bot-app
 ```text
 farstar-warner/
 ├── install.sh
+├── farstar.sh
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
@@ -262,12 +337,15 @@ Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram p
 - Asynchronous Telegram UI with aiogram 3
 - Public-profile checks with HTTPX
 - Activation, deactivation, and username-change notifications
+- On-demand profile photo, follower, following, post, privacy, verification, bio, category, and link details when publicly available
 - Per-profile notification settings
 - Free, Premium, and VIP target limits
 - Restricted administrator panel
+- Automatic primary-administrator provisioning with a dedicated menu
 - PostgreSQL persistence and Redis coordination
 - APScheduler background checks with jitter, bounded concurrency, distributed locking, and HTTP 429 cooldown
 - Hardened, non-root Docker deployment
+- An English `farstar` Ubuntu server manager for multiple isolated bot instances
 
 ### Ubuntu installation
 
@@ -280,7 +358,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer checks Docker and the Docker Compose plugin, installs them when missing, prompts for application and database credentials, creates `.env`, and starts all services.
+The installer checks Docker and the Docker Compose plugin, installs them when missing, prompts for application and database credentials, creates `.env`, installs the global `farstar` command, and starts all services. The Telegram token is visible while typing; database and Redis passwords remain hidden.
 
 Check the deployment:
 
@@ -292,9 +370,10 @@ docker compose logs -f bot-app
 Update and rebuild:
 
 ```bash
-git pull
-docker compose up --build -d
+farstar update
 ```
+
+Run `farstar` without arguments to open the interactive manager. Use `farstar add` to install another isolated bot or `farstar help` to see all commands.
 
 Open the bot and send `/start`. The configured administrator can access the restricted panel with `/admin`.
 

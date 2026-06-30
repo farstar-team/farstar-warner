@@ -1,5 +1,3 @@
-name: farstar-warner
-
 services:
   postgres:
     image: postgres:17-alpine
@@ -41,12 +39,13 @@ services:
       - no-new-privileges:true
 
   bot-app:
+    image: farstar-warner:latest
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file:
-      - .env
+      - ${BOT_ENV_FILE:-.env}
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,4 +71,3 @@ networks:
   backend:
     internal: true
   outbound:
-

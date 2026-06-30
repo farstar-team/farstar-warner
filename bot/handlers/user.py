@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from aiogram import BaseMiddleware, Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -16,6 +17,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
+from bot.checker import CheckOutcome, InstagramChecker, ProfileDetails
 from bot.config import Settings
 from bot.database import SessionFactory
 from bot.keyboards.inline import (
@@ -74,16 +76,26 @@ class UserAccessMiddleware(BaseMiddleware):
 
         async with self.session_factory() as session:
             user = await session.get(User, telegram_user.id)
+            is_admin = telegram_user.id == self.settings.admin_telegram_id
             if user is None:
                 user = User(
                     telegram_id=telegram_user.id,
                     username=telegram_user.username,
                     subscription_expiry=datetime.now(timezone.utc)
-                    + timedelta(days=self.settings.free_trial_days),
+                    + timedelta(
+                        days=3650 if is_admin else self.settings.free_trial_days
+                    ),
+                    plan_tier=PlanTier.VIP if is_admin else PlanTier.FREE,
                 )
                 session.add(user)
             elif user.username != telegram_user.username:
                 user.username = telegram_user.username
+            if is_admin:
+                minimum_admin_expiry = datetime.now(timezone.utc) + timedelta(days=3650)
+                user.status = UserStatus.ACTIVE
+                user.plan_tier = PlanTier.VIP
+                if user.subscription_expiry < minimum_admin_expiry:
+                    user.subscription_expiry = minimum_admin_expiry
             await session.commit()
 
         if user.status == UserStatus.BANNED:
@@ -97,6 +109,7 @@ class UserAccessMiddleware(BaseMiddleware):
             return None
 
         data["db_user"] = user
+        data["is_primary_admin"] = is_admin
         return await handler(event, data)
 
 
@@ -108,6 +121,12 @@ def register_middlewares(session_factory: SessionFactory, settings: Settings) ->
 
 def to_persian_digits(value: object) -> str:
     return str(value).translate(PERSIAN_DIGITS)
+
+
+def format_count(value: int | None) -> str:
+    if value is None:
+        return "نامشخص"
+    return f"{value:,}".replace(",", "٬").translate(PERSIAN_DIGITS)
 
 
 def format_datetime(value: datetime | None) -> str:
@@ -160,29 +179,43 @@ def _add_guard_message(user: User, target_count: int) -> str | None:
 
 
 @router.message(CommandStart())
-async def start(message: Message, db_user: User) -> None:
+async def start(message: Message, db_user: User, settings: Settings) -> None:
     await message.answer(
         "سلام! به فارستار وارنر خوش آمدید. 🌟\n\n"
         "از اینجا می‌توانید وضعیت پیج‌های عمومی اینستاگرام را پایش کنید و هنگام تغییر وضعیت اعلان بگیرید.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(
+            is_admin=db_user.telegram_id == settings.admin_telegram_id
+        ),
     )
 
 
 @router.message(Command("help"))
-async def help_command(message: Message) -> None:
+async def help_command(message: Message, db_user: User, settings: Settings) -> None:
     await message.answer(
         "راهنمای فارستار وارنر 📘\n\n"
         "برای افزودن یا حذف پیج از «مدیریت پیج‌ها» استفاده کنید. "
         "در بخش «تنظیمات اعلان‌ها» می‌توانید اعلان هر پیج را جداگانه تغییر دهید. "
         "نام کاربری را به‌صورت @username یا لینک کامل اینستاگرام بفرستید.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(
+            is_admin=db_user.telegram_id == settings.admin_telegram_id
+        ),
     )
 
 
 @router.message(StateFilter("*"), F.text == "لغو عملیات ↩️")
-async def cancel_operation(message: Message, state: FSMContext) -> None:
+async def cancel_operation(
+    message: Message,
+    state: FSMContext,
+    db_user: User,
+    settings: Settings,
+) -> None:
     await state.clear()
-    await message.answer("عملیات لغو شد.", reply_markup=main_menu_keyboard())
+    await message.answer(
+        "عملیات لغو شد.",
+        reply_markup=main_menu_keyboard(
+            is_admin=db_user.telegram_id == settings.admin_telegram_id
+        ),
+    )
 
 
 @router.message(F.text == "مدیریت پیج‌ها 📊")
@@ -248,6 +281,7 @@ async def add_page(
     state: FSMContext,
     db_user: User,
     session_factory: SessionFactory,
+    settings: Settings,
 ) -> None:
     username = normalize_instagram_username(message.text or "")
     if username is None:
@@ -276,7 +310,12 @@ async def add_page(
             guard_message = _add_guard_message(user, int(target_count or 0))
             if guard_message:
                 await state.clear()
-                await message.answer(guard_message, reply_markup=main_menu_keyboard())
+                await message.answer(
+                    guard_message,
+                    reply_markup=main_menu_keyboard(
+                        is_admin=db_user.telegram_id == settings.admin_telegram_id
+                    ),
+                )
                 return
 
             existing = await session.scalar(
@@ -303,7 +342,9 @@ async def add_page(
     await state.clear()
     await message.answer(
         f"پیج <b>@{html.escape(username)}</b> با موفقیت اضافه شد. اولین وضعیت پس از بررسی بعدی ثبت می‌شود. ✅",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(
+            is_admin=db_user.telegram_id == settings.admin_telegram_id
+        ),
     )
 
 
@@ -337,6 +378,100 @@ async def view_page(
             text, reply_markup=page_details_keyboard(page.id)
         )
     await callback.answer()
+
+
+def _profile_details_caption(details: ProfileDetails) -> str:
+    username = html.escape(details.username or "نامشخص")
+    full_name = html.escape(details.full_name or "ثبت نشده")
+    if details.is_private is True:
+        privacy = "خصوصی 🔒"
+    elif details.is_private is False:
+        privacy = "عمومی 🌐"
+    else:
+        privacy = "نامشخص"
+    verified = "تأییدشده ✅" if details.is_verified else "تأییدنشده"
+    lines = [
+        f"اطلاعات زنده پیج <b>@{username}</b> 🔎",
+        "",
+        f"نام: <b>{full_name}</b>",
+        f"نوع پیج: <b>{privacy}</b>",
+        f"وضعیت تأیید: {verified}",
+        f"تعداد دنبال‌کننده: <b>{format_count(details.follower_count)}</b>",
+        f"تعداد دنبال‌شونده: <b>{format_count(details.following_count)}</b>",
+        f"تعداد پست: <b>{format_count(details.post_count)}</b>",
+    ]
+    if details.profile_id:
+        lines.append(
+            f"شناسه اینستاگرام: <code>{html.escape(details.profile_id)}</code>"
+        )
+    if details.is_private is False:
+        if details.category_name:
+            lines.append(f"دسته‌بندی: {html.escape(details.category_name)}")
+        if details.biography:
+            biography = details.biography.strip()
+            if len(biography) > 350:
+                biography = biography[:347] + "…"
+            lines.extend(("", f"معرفی پیج:\n{html.escape(biography)}"))
+        if details.external_url:
+            escaped_url = html.escape(details.external_url, quote=True)
+            lines.append(f'وب‌سایت: <a href="{escaped_url}">مشاهده لینک</a>')
+    lines.extend(("", "این اطلاعات همین حالا از صفحه عمومی دریافت شد."))
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("profile:details:"))
+async def live_profile_details(
+    callback: CallbackQuery,
+    db_user: User,
+    session_factory: SessionFactory,
+    checker: InstagramChecker,
+) -> None:
+    page_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        page = await session.scalar(
+            select(TargetPage).where(
+                TargetPage.id == page_id,
+                TargetPage.user_id == db_user.telegram_id,
+            )
+        )
+    if page is None:
+        await callback.answer("این پیج پیدا نشد.", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("نمایش اطلاعات در این پیام ممکن نیست.", show_alert=True)
+        return
+
+    await callback.answer("در حال دریافت اطلاعات زنده…")
+    details = await checker.fetch_profile_details(page.instagram_username)
+    if details.outcome == CheckOutcome.RATE_LIMITED:
+        wait_seconds = to_persian_digits(details.retry_after or 60)
+        await callback.message.answer(
+            "اینستاگرام موقتاً تعداد درخواست‌ها را محدود کرده است. "
+            f"حدود {wait_seconds} ثانیه دیگر دوباره تلاش کنید."
+        )
+        return
+    if details.outcome == CheckOutcome.DEACTIVATED:
+        await callback.message.answer(
+            f"پیج <b>@{html.escape(page.instagram_username)}</b> در حال حاضر در دسترس نیست یا دی‌اکتیو شده است."
+        )
+        return
+    if details.outcome != CheckOutcome.ACTIVE:
+        await callback.message.answer(
+            "دریافت اطلاعات زنده این پیج فعلاً ممکن نیست. کمی بعد دوباره تلاش کنید."
+        )
+        return
+
+    caption = _profile_details_caption(details)
+    if details.profile_picture_url:
+        try:
+            await callback.message.answer_photo(
+                photo=details.profile_picture_url,
+                caption=caption,
+            )
+            return
+        except TelegramAPIError:
+            pass
+    await callback.message.answer(caption)
 
 
 @router.callback_query(F.data.startswith("page:delete:"))
@@ -552,6 +687,7 @@ async def account_info(
     message: Message,
     db_user: User,
     session_factory: SessionFactory,
+    settings: Settings,
 ) -> None:
     async with session_factory() as session:
         target_count = await session.scalar(
@@ -564,21 +700,30 @@ async def account_info(
         if db_user.subscription_expiry > datetime.now(timezone.utc)
         else "منقضی‌شده ❌"
     )
+    is_admin = db_user.telegram_id == settings.admin_telegram_id
+    role_text = "مدیر اصلی 🛡️" if is_admin else "کاربر"
     await message.answer(
         "اطلاعات حساب کاربری 👤\n\n"
         f"شناسه تلگرام: <code>{to_persian_digits(db_user.telegram_id)}</code>\n"
+        f"نقش: <b>{role_text}</b>\n"
         f"پلن: <b>{PLAN_NAMES[db_user.plan_tier]}</b>\n"
         f"وضعیت اشتراک: {validity}\n"
         f"تاریخ پایان: {format_datetime(db_user.subscription_expiry)}\n"
         f"تعداد پیج‌ها: {to_persian_digits(target_count or 0)} از "
         f"{to_persian_digits(db_user.plan_tier.target_limit)}",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=is_admin),
     )
 
 
 @router.message()
-async def unknown_message(message: Message) -> None:
+async def unknown_message(
+    message: Message,
+    db_user: User,
+    settings: Settings,
+) -> None:
     await message.answer(
         "متوجه درخواست شما نشدم. لطفاً یکی از گزینه‌های منوی اصلی را انتخاب کنید.",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(
+            is_admin=db_user.telegram_id == settings.admin_telegram_id
+        ),
     )

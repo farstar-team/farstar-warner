@@ -71,6 +71,25 @@ class ProfileResult:
     http_status: int | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class ProfileDetails:
+    outcome: CheckOutcome
+    username: str | None = None
+    full_name: str | None = None
+    biography: str | None = None
+    profile_id: str | None = None
+    profile_picture_url: str | None = None
+    follower_count: int | None = None
+    following_count: int | None = None
+    post_count: int | None = None
+    is_private: bool | None = None
+    is_verified: bool | None = None
+    category_name: str | None = None
+    external_url: str | None = None
+    retry_after: int | None = None
+    http_status: int | None = None
+
+
 class InstagramChecker:
     LOCK_KEY = "farstar:checker:lock"
     COOLDOWN_KEY = "farstar:checker:cooldown"
@@ -166,6 +185,110 @@ class InstagramChecker:
             if canonical_username
             else username,
             profile_id=profile_id,
+            http_status=status_code,
+        )
+
+    async def fetch_profile_details(self, username: str) -> ProfileDetails:
+        cooldown_ttl = await self.redis.ttl(self.COOLDOWN_KEY)
+        if cooldown_ttl > 0:
+            return ProfileDetails(
+                CheckOutcome.RATE_LIMITED,
+                retry_after=cooldown_ttl,
+                http_status=429,
+            )
+
+        await asyncio.sleep(
+            random.uniform(
+                self.settings.check_jitter_min_seconds,
+                self.settings.check_jitter_max_seconds,
+            )
+        )
+        url = f"{self.settings.instagram_base_url}/api/v1/users/web_profile_info/"
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{self.settings.instagram_base_url}/{username}/",
+            "X-IG-App-ID": self.settings.instagram_web_app_id,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        try:
+            response = await self._client.get(
+                url,
+                params={"username": username},
+                headers=headers,
+            )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            logger.warning("Instagram details request failed for %s: %s", username, exc)
+            return ProfileDetails(CheckOutcome.UNKNOWN)
+
+        status_code = response.status_code
+        if status_code == 429:
+            cooldown = self._parse_retry_after(response.headers.get("Retry-After"))
+            active_cooldown = await self._activate_cooldown(cooldown)
+            return ProfileDetails(
+                CheckOutcome.RATE_LIMITED,
+                retry_after=active_cooldown,
+                http_status=status_code,
+            )
+        if status_code == 404:
+            return ProfileDetails(
+                CheckOutcome.DEACTIVATED,
+                username=username,
+                http_status=status_code,
+            )
+        if status_code != 200:
+            logger.info(
+                "Instagram details endpoint returned HTTP %s for %s",
+                status_code,
+                username,
+            )
+            return ProfileDetails(CheckOutcome.UNKNOWN, http_status=status_code)
+
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.warning("Instagram returned invalid JSON details for %s", username)
+            return ProfileDetails(CheckOutcome.UNKNOWN, http_status=status_code)
+
+        payload_data = payload.get("data") if isinstance(payload, dict) else None
+        user_data = payload_data.get("user") if isinstance(payload_data, dict) else None
+        if not isinstance(user_data, dict):
+            return ProfileDetails(
+                CheckOutcome.DEACTIVATED, username=username, http_status=404
+            )
+
+        return ProfileDetails(
+            CheckOutcome.ACTIVE,
+            username=self._string_value(user_data.get("username")) or username,
+            full_name=self._string_value(user_data.get("full_name")),
+            biography=self._string_value(user_data.get("biography")),
+            profile_id=self._string_value(user_data.get("id") or user_data.get("pk")),
+            profile_picture_url=self._https_url(
+                user_data.get("profile_pic_url_hd") or user_data.get("profile_pic_url")
+            ),
+            follower_count=self._nested_count(
+                user_data,
+                "edge_followed_by",
+                fallback_key="follower_count",
+            ),
+            following_count=self._nested_count(
+                user_data,
+                "edge_follow",
+                fallback_key="following_count",
+            ),
+            post_count=self._nested_count(
+                user_data,
+                "edge_owner_to_timeline_media",
+                fallback_key="media_count",
+            ),
+            is_private=self._boolean_value(user_data.get("is_private")),
+            is_verified=self._boolean_value(user_data.get("is_verified")),
+            category_name=self._string_value(
+                user_data.get("category_name") or user_data.get("category")
+            ),
+            external_url=self._https_url(user_data.get("external_url")),
             http_status=status_code,
         )
 
@@ -267,13 +390,8 @@ class InstagramChecker:
         if result.outcome == CheckOutcome.UNKNOWN:
             return
         if result.outcome == CheckOutcome.RATE_LIMITED:
-            cooldown = result.retry_after or self.settings.rate_limit_cooldown_seconds
-            cooldown = max(60, min(cooldown, 86400))
             self._rate_limited.set()
-            await self.redis.set(self.COOLDOWN_KEY, str(cooldown), ex=cooldown)
-            logger.warning(
-                "Instagram rate limit detected; pausing checks for %s seconds", cooldown
-            )
+            await self._activate_cooldown(result.retry_after)
             return
 
         notifications: list[str] = []
@@ -376,3 +494,48 @@ class InstagramChecker:
             return max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
         except (TypeError, ValueError, OverflowError):
             return None
+
+    async def _activate_cooldown(self, requested_seconds: int | None) -> int:
+        cooldown = requested_seconds or self.settings.rate_limit_cooldown_seconds
+        cooldown = max(60, min(cooldown, 86400))
+        await self.redis.set(self.COOLDOWN_KEY, str(cooldown), ex=cooldown)
+        logger.warning(
+            "Instagram rate limit detected; pausing checks for %s seconds", cooldown
+        )
+        return cooldown
+
+    @staticmethod
+    def _nested_count(
+        data: dict[str, object],
+        nested_key: str,
+        fallback_key: str,
+    ) -> int | None:
+        nested = data.get(nested_key)
+        if isinstance(nested, dict):
+            value = nested.get("count")
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+        fallback = data.get(fallback_key)
+        if isinstance(fallback, int) and not isinstance(fallback, bool):
+            return fallback
+        return None
+
+    @staticmethod
+    def _string_value(value: object) -> str | None:
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            normalized = str(value).strip()
+            return normalized or None
+        return None
+
+    @staticmethod
+    def _boolean_value(value: object) -> bool | None:
+        return value if isinstance(value, bool) else None
+
+    @staticmethod
+    def _https_url(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if normalized.startswith("https://") and len(normalized) <= 2048:
+            return normalized
+        return None

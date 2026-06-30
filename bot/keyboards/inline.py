@@ -37,6 +37,12 @@ def page_details_keyboard(page_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
+                    text="🔎 مشاهده اطلاعات زنده پیج",
+                    callback_data=f"profile:details:{page_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⚙️ تنظیم اعلان‌های این پیج",
                     callback_data=f"settings:view:{page_id}",
                 )
@@ -138,6 +144,11 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text="تنظیم زمان‌بندی چکر ⏱️", callback_data="admin:schedule"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="بررسی فوری همه پیج‌ها 🔄", callback_data="admin:check_now"
                 )
             ],
         ]

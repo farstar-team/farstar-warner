@@ -3,6 +3,10 @@ set -Eeuo pipefail
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${PROJECT_DIR}/.env"
+MANAGER_DIR="/etc/farstar-warner"
+INSTANCE_DIR="${MANAGER_DIR}/instances"
+MAIN_INSTANCE="warner"
+MAIN_INSTANCE_ENV="${INSTANCE_DIR}/${MAIN_INSTANCE}.env"
 
 log() {
   printf '\n[Farstar Warner] %s\n' "$1"
@@ -18,6 +22,7 @@ if [[ "$(uname -s)" != "Linux" ]] || ! command -v apt-get >/dev/null 2>&1; then
 fi
 
 [[ -r /etc/os-release ]] || fail "Unable to identify this operating system."
+# shellcheck disable=SC1091
 . /etc/os-release
 [[ "${ID:-}" == "ubuntu" ]] || fail "This installer supports Ubuntu Linux only."
 
@@ -36,6 +41,7 @@ install_docker() {
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg | "${SUDO[@]}" tee /etc/apt/keyrings/docker.asc >/dev/null
   "${SUDO[@]}" chmod a+r /etc/apt/keyrings/docker.asc
 
+  # shellcheck disable=SC1091
   . /etc/os-release
   local codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
   [[ -n "${codename}" ]] || fail "Unable to determine the Ubuntu release codename."
@@ -61,12 +67,18 @@ elif ! docker compose version >/dev/null 2>&1 && ! "${SUDO[@]}" docker compose v
   "${SUDO[@]}" apt-get install -y docker-compose-plugin
 fi
 
-if docker info >/dev/null 2>&1; then
+if [[ ${EUID} -eq 0 ]] && docker info >/dev/null 2>&1; then
   DOCKER=(docker)
 elif "${SUDO[@]}" docker info >/dev/null 2>&1; then
   DOCKER=("${SUDO[@]}" docker)
 else
   fail "Docker is installed but the daemon is unavailable. Start Docker and run this installer again."
+fi
+
+if ! command -v git >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+  log "Installing Git and OpenSSL for updates and secure credential generation..."
+  "${SUDO[@]}" apt-get update
+  "${SUDO[@]}" apt-get install -y git openssl
 fi
 
 prompt_required() {
@@ -103,50 +115,65 @@ valid_env_secret() {
   [[ "$1" =~ ^[A-Za-z0-9._~!@%+=:-]+$ ]]
 }
 
-log "Collecting application settings. Secrets are hidden while you type."
-
-while true; do
-  prompt_required TELEGRAM_BOT_TOKEN "Telegram bot token" true
-  [[ "${TELEGRAM_BOT_TOKEN}" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && break
-  printf 'The Telegram bot token format is invalid.\n'
-done
-
-while true; do
-  prompt_required ADMIN_TELEGRAM_ID "Administrator Telegram numeric ID"
-  [[ "${ADMIN_TELEGRAM_ID}" =~ ^[1-9][0-9]*$ ]] && break
-  printf 'Enter a positive numeric Telegram ID.\n'
-done
-
-while true; do
-  prompt_default POSTGRES_DB "PostgreSQL database name" "farstar_warner"
-  valid_identifier "${POSTGRES_DB}" && break
-  printf 'Use letters, numbers, and underscores; the first character must be a letter or underscore.\n'
-done
-
-while true; do
-  prompt_default POSTGRES_USER "PostgreSQL username" "farstar"
-  valid_identifier "${POSTGRES_USER}" && break
-  printf 'Use letters, numbers, and underscores; the first character must be a letter or underscore.\n'
-done
-
-while true; do
-  prompt_required POSTGRES_PASSWORD "PostgreSQL password" true
-  valid_env_secret "${POSTGRES_PASSWORD}" && break
-  printf 'Use only letters, numbers, and these symbols: . _ ~ ! @ %% + = : -\n'
-done
-
-DEFAULT_REDIS_PASSWORD="$(openssl rand -base64 36 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 40 || true)"
-if [[ -z "${DEFAULT_REDIS_PASSWORD}" ]]; then
-  DEFAULT_REDIS_PASSWORD="$(date +%s%N)${RANDOM}${RANDOM}"
+REUSE_EXISTING=false
+if [[ -f "${ENV_FILE}" || -L "${ENV_FILE}" ]] && "${SUDO[@]}" test -s "${ENV_FILE}"; then
+  read -r -p "An existing .env configuration was found. Reuse it? [Y/n]: " reuse_answer
+  if [[ "${reuse_answer,,}" != "n" && "${reuse_answer,,}" != "no" ]]; then
+    REUSE_EXISTING=true
+    log "Reusing the existing bot configuration."
+  fi
 fi
-read -r -s -p "Redis password [press Enter to generate one]: " REDIS_PASSWORD
-printf '\n'
-REDIS_PASSWORD="${REDIS_PASSWORD:-${DEFAULT_REDIS_PASSWORD}}"
-valid_env_secret "${REDIS_PASSWORD}" || fail "The Redis password contains unsupported characters."
 
-umask 077
-cat >"${ENV_FILE}" <<EOF
+if [[ "${REUSE_EXISTING}" == "false" ]]; then
+  log "Collecting application settings. Passwords are hidden; the Telegram token is visible."
+
+  while true; do
+    prompt_required TELEGRAM_BOT_TOKEN "Telegram bot token (visible while typing)"
+    [[ "${TELEGRAM_BOT_TOKEN}" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] && break
+    printf 'The Telegram bot token format is invalid.\n'
+  done
+
+  while true; do
+    prompt_required ADMIN_TELEGRAM_ID "Administrator Telegram numeric ID"
+    [[ "${ADMIN_TELEGRAM_ID}" =~ ^[1-9][0-9]*$ ]] && break
+    printf 'Enter a positive numeric Telegram ID.\n'
+  done
+
+  while true; do
+    prompt_default POSTGRES_DB "PostgreSQL database name" "farstar_warner"
+    valid_identifier "${POSTGRES_DB}" && break
+    printf 'Use letters, numbers, and underscores; the first character must be a letter or underscore.\n'
+  done
+
+  while true; do
+    prompt_default POSTGRES_USER "PostgreSQL username" "farstar"
+    valid_identifier "${POSTGRES_USER}" && break
+    printf 'Use letters, numbers, and underscores; the first character must be a letter or underscore.\n'
+  done
+
+  while true; do
+    prompt_required POSTGRES_PASSWORD "PostgreSQL password" true
+    valid_env_secret "${POSTGRES_PASSWORD}" && break
+    printf 'Use only letters, numbers, and these symbols: . _ ~ ! @ %% + = : -\n'
+  done
+
+  DEFAULT_REDIS_PASSWORD="$(openssl rand -base64 36 2>/dev/null | tr -dc 'A-Za-z0-9' | head -c 40 || true)"
+  if [[ -z "${DEFAULT_REDIS_PASSWORD}" ]]; then
+    DEFAULT_REDIS_PASSWORD="$(date +%s%N)${RANDOM}${RANDOM}"
+  fi
+  read -r -s -p "Redis password [press Enter to generate one]: " REDIS_PASSWORD
+  printf '\n'
+  REDIS_PASSWORD="${REDIS_PASSWORD:-${DEFAULT_REDIS_PASSWORD}}"
+  valid_env_secret "${REDIS_PASSWORD}" || fail "The Redis password contains unsupported characters."
+
+  umask 077
+  if [[ -L "${ENV_FILE}" ]]; then
+    "${SUDO[@]}" rm -f -- "${ENV_FILE}"
+  fi
+  cat >"${ENV_FILE}" <<EOF
+INSTANCE_NAME=${MAIN_INSTANCE}
 COMPOSE_PROJECT_NAME=farstar-warner
+BOT_ENV_FILE=${MAIN_INSTANCE_ENV}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 ADMIN_TELEGRAM_ID=${ADMIN_TELEGRAM_ID}
 POSTGRES_DB=${POSTGRES_DB}
@@ -165,12 +192,48 @@ CHECK_JITTER_MAX_SECONDS=3.0
 FREE_TRIAL_DAYS=7
 LOG_LEVEL=INFO
 EOF
-chmod 600 "${ENV_FILE}"
+  chmod 600 "${ENV_FILE}"
+fi
+
+log "Installing the Farstar server management command..."
+"${SUDO[@]}" mkdir -p "${INSTANCE_DIR}"
+CURRENT_ENV_TARGET="$(readlink -f -- "${ENV_FILE}" 2>/dev/null || true)"
+if [[ "${CURRENT_ENV_TARGET}" != "${MAIN_INSTANCE_ENV}" ]]; then
+  {
+    if ! "${SUDO[@]}" grep -q '^INSTANCE_NAME=' "${ENV_FILE}"; then
+      printf '\nINSTANCE_NAME=%s\n' "${MAIN_INSTANCE}"
+    fi
+    if ! "${SUDO[@]}" grep -q '^BOT_ENV_FILE=' "${ENV_FILE}"; then
+      printf 'BOT_ENV_FILE=%s\n' "${MAIN_INSTANCE_ENV}"
+    fi
+  } | "${SUDO[@]}" tee -a "${ENV_FILE}" >/dev/null
+  "${SUDO[@]}" install -m 600 "${ENV_FILE}" "${MAIN_INSTANCE_ENV}"
+  "${SUDO[@]}" rm -f -- "${ENV_FILE}"
+  "${SUDO[@]}" ln -s "${MAIN_INSTANCE_ENV}" "${ENV_FILE}"
+fi
+
+{
+  printf 'APP_DIR=%q\n' "${PROJECT_DIR}"
+  printf 'INSTANCE_DIR=%q\n' "${INSTANCE_DIR}"
+  printf 'REPOSITORY_URL=%q\n' "https://github.com/farstar-team/farstar-warner.git"
+} | "${SUDO[@]}" tee "${MANAGER_DIR}/farstar.conf" >/dev/null
+"${SUDO[@]}" chmod 644 "${MANAGER_DIR}/farstar.conf"
+"${SUDO[@]}" chmod 755 "${PROJECT_DIR}/farstar.sh"
+"${SUDO[@]}" ln -sfn "${PROJECT_DIR}/farstar.sh" /usr/local/bin/farstar
 
 log "Building and starting Farstar Warner..."
 cd "${PROJECT_DIR}"
-"${DOCKER[@]}" compose up --build -d
-"${DOCKER[@]}" compose ps
+"${DOCKER[@]}" compose \
+  --project-name "farstar-${MAIN_INSTANCE}" \
+  --env-file "${MAIN_INSTANCE_ENV}" \
+  --file "${PROJECT_DIR}/docker-compose.yml" \
+  up --build -d
+"${DOCKER[@]}" compose \
+  --project-name "farstar-${MAIN_INSTANCE}" \
+  --env-file "${MAIN_INSTANCE_ENV}" \
+  --file "${PROJECT_DIR}/docker-compose.yml" \
+  ps
 
 log "Installation completed successfully."
-printf 'View logs with: %s compose logs -f bot-app\n' "${DOCKER[*]}"
+printf 'Open the server manager at any time with: farstar\n'
+printf 'View this bot log with: farstar logs %s\n' "${MAIN_INSTANCE}"
