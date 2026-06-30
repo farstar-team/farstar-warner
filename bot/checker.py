@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
-from urllib.parse import unquote
 
 import httpx
 from aiogram import Bot
@@ -40,14 +39,6 @@ USER_AGENTS = (
     "(KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36",
 )
 
-USERNAME_PATTERNS = (
-    re.compile(
-        r'<meta\s+(?:property|name)=["\']og:url["\']\s+content=["\'][^"\']*instagram\.com/([^/"\'?]+)',
-        re.I,
-    ),
-    re.compile(r'"username"\s*:\s*"([A-Za-z0-9._]{1,30})"', re.I),
-    re.compile(r"&quot;username&quot;\s*:\s*&quot;([A-Za-z0-9._]{1,30})&quot;", re.I),
-)
 PROFILE_ID_PATTERNS = (
     re.compile(r'"profile_id"\s*:\s*"?(\d{3,30})"?', re.I),
     re.compile(r'"user_id"\s*:\s*"?(\d{3,30})"?', re.I),
@@ -113,7 +104,7 @@ class InstagramChecker:
                 max_keepalive_connections=max(settings.check_concurrency, 5),
                 keepalive_expiry=30.0,
             ),
-            follow_redirects=True,
+            follow_redirects=False,
             verify=True,
         )
         self._rate_limited = asyncio.Event()
@@ -142,7 +133,7 @@ class InstagramChecker:
             "Sec-Fetch-Site": "none",
             "Upgrade-Insecure-Requests": "1",
         }
-        url = f"{self.settings.instagram_base_url}/{username}/"
+        url = f"{self.settings.instagram_base_url}/{username}/embed/"
 
         try:
             response = await self._client.get(url, headers=headers)
@@ -161,32 +152,21 @@ class InstagramChecker:
             )
         if status_code == 404:
             return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
-        if status_code != 200:
-            logger.info("Instagram returned HTTP %s for %s", status_code, username)
-            return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+        if status_code == 200:
+            profile_id = self._extract_first(PROFILE_ID_PATTERNS, response.text)
+            return ProfileResult(
+                CheckOutcome.ACTIVE,
+                canonical_username=username,
+                profile_id=profile_id,
+                http_status=status_code,
+            )
 
-        final_path = response.url.path.lower()
-        body_lower = response.text[:250_000].lower()
-        if final_path.startswith("/accounts/login") or final_path.startswith(
-            "/challenge"
-        ):
-            return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
-        if (
-            "sorry, this page isn't available" in body_lower
-            or "page not found" in body_lower
-        ):
-            return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
-
-        canonical_username = self._extract_first(USERNAME_PATTERNS, response.text)
-        profile_id = self._extract_first(PROFILE_ID_PATTERNS, response.text)
-        return ProfileResult(
-            CheckOutcome.ACTIVE,
-            canonical_username=unquote(canonical_username)
-            if canonical_username
-            else username,
-            profile_id=profile_id,
-            http_status=status_code,
+        logger.info(
+            "Instagram embed endpoint returned HTTP %s for %s",
+            status_code,
+            username,
         )
+        return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
 
     async def fetch_profile_details(self, username: str) -> ProfileDetails:
         cooldown_ttl = await self.redis.ttl(self.COOLDOWN_KEY)
