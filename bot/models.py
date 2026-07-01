@@ -1,209 +1,33 @@
-from __future__ import annotations
+from sqlalchemy import Column, String, BigInteger, Integer, Boolean, DateTime, ForeignKey
+from sqlalchemy.orm import declarative_base, relationship
+from datetime import datetime
 
-import enum
-from datetime import datetime, timedelta, timezone
-
-from sqlalchemy import (
-    BigInteger,
-    Boolean,
-    DateTime,
-    Enum,
-    ForeignKey,
-    Index,
-    Integer,
-    String,
-    UniqueConstraint,
-    func,
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-class UserStatus(str, enum.Enum):
-    ACTIVE = "Active"
-    BANNED = "Banned"
-
-
-class PlanTier(str, enum.Enum):
-    FREE = "Free"
-    PREMIUM = "Premium"
-    VIP = "VIP"
-
-    @property
-    def target_limit(self) -> int:
-        return {
-            PlanTier.FREE: 1,
-            PlanTier.PREMIUM: 10,
-            PlanTier.VIP: 50,
-        }[self]
-
-
-class PageStatus(str, enum.Enum):
-    ACTIVE = "Active"
-    DEACTIVATED = "Deactivated"
-
-
-class Base(DeclarativeBase):
-    pass
-
+Base = declarative_base()
 
 class User(Base):
-    __tablename__ = "users"
-
-    telegram_id: Mapped[int] = mapped_column(
-        BigInteger, primary_key=True, autoincrement=False
-    )
-    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    subscription_expiry: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        default=lambda: utc_now() + timedelta(days=7),
-    )
-    status: Mapped[UserStatus] = mapped_column(
-        Enum(
-            UserStatus,
-            name="user_status",
-            values_callable=lambda e: [item.value for item in e],
-        ),
-        nullable=False,
-        default=UserStatus.ACTIVE,
-        index=True,
-    )
-    plan_tier: Mapped[PlanTier] = mapped_column(
-        Enum(
-            PlanTier,
-            name="plan_tier",
-            values_callable=lambda e: [item.value for item in e],
-        ),
-        nullable=False,
-        default=PlanTier.FREE,
-        index=True,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-        onupdate=func.now(),
-    )
-
-    targets: Mapped[list[TargetPage]] = relationship(
-        back_populates="owner",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    notification_settings: Mapped[list[NotificationSettings]] = relationship(
-        back_populates="user",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-
+    __tablename__ = 'users'
+    
+    telegram_id = Column(BigInteger, primary_key=True)
+    username = Column(String, nullable=True)
+    subscription_expiry = Column(DateTime, default=datetime.utcnow)
+    status = Column(String, default="active")  # active, banned
+    plan_tier = Column(String, default="free")  # free, premium, vip
+    
+    targets = relationship("TargetPage", back_populates="user")
 
 class TargetPage(Base):
-    __tablename__ = "target_pages"
-    __table_args__ = (
-        UniqueConstraint(
-            "user_id", "instagram_username", name="uq_target_owner_username"
-        ),
-        Index("ix_target_pages_user_status", "user_id", "last_known_status"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    instagram_username: Mapped[str] = mapped_column(String(30), nullable=False)
-    last_known_status: Mapped[PageStatus | None] = mapped_column(
-        Enum(
-            PageStatus,
-            name="page_status",
-            values_callable=lambda e: [item.value for item in e],
-        ),
-        nullable=True,
-        index=True,
-    )
-    last_known_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    last_checked_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("users.telegram_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-
-    owner: Mapped[User] = relationship(back_populates="targets")
-    notification_settings: Mapped[NotificationSettings] = relationship(
-        back_populates="target_page",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        uselist=False,
-    )
-    events: Mapped[list[PageEvent]] = relationship(
-        back_populates="target_page",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-
-
-class NotificationSettings(Base):
-    __tablename__ = "notification_settings"
-
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("users.telegram_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    target_page_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("target_pages.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    notify_activation: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True
-    )
-    notify_deactivation: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True
-    )
-    notify_username_change: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=True
-    )
-
-    user: Mapped[User] = relationship(back_populates="notification_settings")
-    target_page: Mapped[TargetPage] = relationship(
-        back_populates="notification_settings"
-    )
-
-
-class PageEvent(Base):
-    __tablename__ = "page_events"
-    __table_args__ = (
-        Index("ix_page_events_target_created", "target_page_id", "created_at"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    target_page_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("target_pages.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    user_id: Mapped[int] = mapped_column(
-        BigInteger,
-        ForeignKey("users.telegram_id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    event_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
-    description: Mapped[str] = mapped_column(String(500), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
-    )
-
-    target_page: Mapped[TargetPage] = relationship(back_populates="events")
+    __tablename__ = 'target_pages'
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    instagram_username = Column(String, nullable=False)
+    last_known_status = Column(String, default="unknown")  # active, deactivated
+    instagram_id = Column(String, nullable=True)
+    
+    # متادیتای آماری پیج
+    follower_count = Column(Integer, default=0)
+    following_count = Column(Integer, default=0)
+    post_count = Column(Integer, default=0)
+    full_name = Column(String, nullable=True)
+    
+    user_id = Column(BigInteger, ForeignKey('users.telegram_id'))
+    user = relationship("User", back_populates="targets")
