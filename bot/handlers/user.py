@@ -393,12 +393,15 @@ async def add_page(
     status = await checker.fetch_profile(username)
     if status.outcome == CheckOutcome.ACTIVE:
         preview = await profile_preview.inspect(username)
+        preview_is_complete = preview.outcome == PreviewOutcome.ACTIVE
         if preview.outcome != PreviewOutcome.ACTIVE:
-            await message.answer(
-                "پیج فعال به نظر می‌رسد، اما تصویر و مشخصات عمومی آن برای تأیید دریافت نشد. "
-                "برای جلوگیری از ثبت پیج اشتباه، کمی بعد دوباره تلاش کنید."
+            diagnostic = preview.diagnostic
+            preview = EmbedProfile(
+                PreviewOutcome.ACTIVE,
+                username=username,
+                full_name="Public profile confirmed",
+                diagnostic=diagnostic,
             )
-            return
         card = await profile_preview.render_card(preview)
         await state.update_data(
             pending_username=username,
@@ -406,13 +409,22 @@ async def add_page(
             pending_profile_id=status.profile_id,
         )
         await state.set_state(AddPageState.waiting_for_confirmation)
+        caption = (
+            f"پیج <b>@{html.escape(username)}</b> پیدا شد و مشخصات عمومی آن در تصویر آمده است.\n\n"
+            "آیا همین پیج را می‌خواهید پایش کنید؟"
+            if preview_is_complete
+            else (
+                f"فعال‌بودن پیج <b>@{html.escape(username)}</b> از پاسخ عمومی اینستاگرام تأیید شد، "
+                "اما اینستاگرام جزئیات تصویر و آمار را به Chromium سرور نداد.\n\n"
+                "برای اطمینان، پیج را با دکمه زیر مستقیماً باز کنید. در صورت درست‌بودن نام کاربری، ثبت را تأیید کنید."
+            )
+        )
         await message.answer_photo(
             BufferedInputFile(card, filename=f"farstar-{username}.jpg"),
-            caption=(
-                f"پیج <b>@{html.escape(username)}</b> پیدا شد. این تصویر برای تأیید پیج ساخته شده است.\n\n"
-                "آیا همین پیج را می‌خواهید پایش کنید؟"
+            caption=caption,
+            reply_markup=registration_confirmation_keyboard(
+                profile_url=f"https://www.instagram.com/{username}/"
             ),
-            reply_markup=registration_confirmation_keyboard(),
         )
         return
 

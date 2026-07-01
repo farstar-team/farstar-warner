@@ -47,6 +47,7 @@ class EmbedProfile:
     post_count: int | None = None
     is_private: bool | None = None
     is_verified: bool = False
+    diagnostic: str | None = None
 
 
 class ProfilePreviewService:
@@ -163,12 +164,20 @@ class ProfilePreviewService:
             browser = await self._ensure_browser()
         except Exception:
             logger.exception("Chromium could not be started for profile preview")
-            return EmbedProfile(PreviewOutcome.UNKNOWN, username=username)
+            return EmbedProfile(
+                PreviewOutcome.UNKNOWN,
+                username=username,
+                diagnostic="chromium_start_failed",
+            )
 
         context = await browser.new_context(
             viewport={"width": 430, "height": 900},
             locale="en-US",
             java_script_enabled=True,
+            user_agent=USER_AGENTS[0],
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         )
         page = await context.new_page()
         url = f"{self.settings.instagram_base_url}/{username}/embed/"
@@ -179,20 +188,58 @@ class ProfilePreviewService:
                 timeout=self.settings.profile_preview_timeout_seconds * 1000,
             )
             if response is not None and response.status == 404:
-                return EmbedProfile(PreviewOutcome.DEACTIVATED, username=username)
+                return EmbedProfile(
+                    PreviewOutcome.DEACTIVATED,
+                    username=username,
+                    diagnostic="http_404",
+                )
             if response is not None and response.status != 200:
-                return EmbedProfile(PreviewOutcome.UNKNOWN, username=username)
+                return EmbedProfile(
+                    PreviewOutcome.UNKNOWN,
+                    username=username,
+                    diagnostic=f"http_{response.status}",
+                )
+            if "/accounts/login" in page.url:
+                return EmbedProfile(
+                    PreviewOutcome.UNKNOWN,
+                    username=username,
+                    diagnostic="login_redirect",
+                )
             try:
-                await page.wait_for_selector(
-                    'img[alt*="profile picture"]',
-                    state="visible",
+                await page.wait_for_function(
+                    r"""
+                    requestedUsername => {
+                      const text = (document.body?.innerText || '').toLowerCase();
+                      const usernameVisible = text.split(/\n+/)
+                        .some(line => line.trim() === requestedUsername.toLowerCase());
+                      const metricsVisible = /\bfollowers\b/.test(text) && /\bposts\b/.test(text);
+                      const profileImage = Array.from(document.images).some(img =>
+                        (img.alt || '').toLowerCase().includes('profile picture'));
+                      return usernameVisible && metricsVisible && profileImage;
+                    }
+                    """,
+                    arg=username,
                     timeout=self.settings.profile_preview_timeout_seconds * 1000,
                 )
             except PlaywrightTimeoutError:
                 body_text = (await page.locator("body").inner_text()).lower()
                 if "page isn't available" in body_text or "page not found" in body_text:
-                    return EmbedProfile(PreviewOutcome.DEACTIVATED, username=username)
-                return EmbedProfile(PreviewOutcome.UNKNOWN, username=username)
+                    return EmbedProfile(
+                        PreviewOutcome.DEACTIVATED,
+                        username=username,
+                        diagnostic="not_available_text",
+                    )
+                if "log in" in body_text or "login" in page.url:
+                    return EmbedProfile(
+                        PreviewOutcome.UNKNOWN,
+                        username=username,
+                        diagnostic="login_wall",
+                    )
+                return EmbedProfile(
+                    PreviewOutcome.UNKNOWN,
+                    username=username,
+                    diagnostic="profile_content_timeout",
+                )
             try:
                 await page.get_by_text(
                     "View full profile on Instagram", exact=True
@@ -264,13 +311,25 @@ class ProfilePreviewService:
                 """,
                 username,
             )
-            return EmbedProfile(PreviewOutcome.ACTIVE, **data)
+            return EmbedProfile(
+                PreviewOutcome.ACTIVE,
+                diagnostic="rendered_embed",
+                **data,
+            )
         except PlaywrightTimeoutError:
             logger.warning("Profile preview timed out for %s", username)
-            return EmbedProfile(PreviewOutcome.UNKNOWN, username=username)
+            return EmbedProfile(
+                PreviewOutcome.UNKNOWN,
+                username=username,
+                diagnostic="navigation_timeout",
+            )
         except Exception:
             logger.exception("Profile preview failed for %s", username)
-            return EmbedProfile(PreviewOutcome.UNKNOWN, username=username)
+            return EmbedProfile(
+                PreviewOutcome.UNKNOWN,
+                username=username,
+                diagnostic="browser_exception",
+            )
         finally:
             await context.close()
 

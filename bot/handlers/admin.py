@@ -19,7 +19,7 @@ from bot.handlers.user import AddPageState
 from bot.keyboards.inline import admin_panel_keyboard, admin_plan_keyboard
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import PageStatus, PlanTier, TargetPage, User, UserStatus
-from bot.profile_preview import ProfilePreviewService
+from bot.profile_preview import PreviewOutcome, ProfilePreviewService
 
 
 router = Router(name="admin")
@@ -126,6 +126,7 @@ async def instagram_connection_health(
     await callback.answer("در حال آزمایش مسیر عمومی اینستاگرام…")
     browser_ok, browser_version = await profile_preview.browser_health()
     result = await checker.fetch_profile("instagram")
+    rendered = await profile_preview.inspect("instagram", use_cache=False)
     cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
 
     outcome_names = {
@@ -145,6 +146,26 @@ async def instagram_connection_health(
         else "غیرفعال ✅"
     )
     http_text = _digits(result.http_status) if result.http_status else "ثبت نشد"
+    render_names = {
+        PreviewOutcome.ACTIVE: "جزئیات پیج رندر شد ✅",
+        PreviewOutcome.DEACTIVATED: "پاسخ قطعی عدم دسترسی دریافت شد",
+        PreviewOutcome.UNKNOWN: "جزئیات پیج رندر نشد ⚠️",
+    }
+    diagnostic_names = {
+        "rendered_embed": "سالم",
+        "chromium_start_failed": "Chromium اجرا نشد",
+        "navigation_timeout": "مهلت بازشدن صفحه تمام شد",
+        "profile_content_timeout": "محتوای پروفایل بارگذاری نشد",
+        "login_redirect": "انتقال به صفحه ورود",
+        "login_wall": "صفحه ورود نمایش داده شد",
+        "browser_exception": "خطای داخلی مرورگر",
+        "http_404": "پاسخ ۴۰۴",
+        "not_available_text": "پیام در دسترس نبودن پیج",
+    }
+    render_diagnostic = diagnostic_names.get(
+        rendered.diagnostic or "",
+        rendered.diagnostic or "ثبت نشد",
+    )
     text = (
         "وضعیت اتصال اینستاگرام 🌐\n\n"
         "حالت دسترسی: <b>نمای عمومی بدون ورود</b>\n"
@@ -153,6 +174,8 @@ async def instagram_connection_health(
         f"Chromium: <b>{browser_text}</b>\n"
         f"نتیجه تست: <b>{outcome_names[result.outcome]}</b>\n"
         f"کد HTTP: <code>{http_text}</code>\n"
+        f"رندر واقعی: <b>{render_names[rendered.outcome]}</b>\n"
+        f"تشخیص رندر: <b>{render_diagnostic}</b>\n"
         f"توقف موقت چکر: <b>{cooldown_text}</b>\n\n"
         "پاسخ نامشخص هیچ‌گاه وضعیت پیج را به دی‌اکتیو تغییر نمی‌دهد."
     )

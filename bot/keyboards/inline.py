@@ -132,14 +132,26 @@ def confirm_delete_keyboard(page_id: int) -> InlineKeyboardMarkup:
 
 
 def registration_confirmation_keyboard(
-    *, inactive: bool = False
+    *,
+    inactive: bool = False,
+    profile_url: str | None = None,
 ) -> InlineKeyboardMarkup:
     confirm_text = (
         "⏳ ثبت به‌عنوان پیج غیرفعال" if inactive else "✅ بله، همین پیج ثبت شود"
     )
     status = "inactive" if inactive else "active"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    rows: list[list[InlineKeyboardButton]] = []
+    if profile_url:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="◈ بازکردن پیج در اینستاگرام",
+                    url=profile_url,
+                )
+            ]
+        )
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text=confirm_text,
@@ -154,6 +166,7 @@ def registration_confirmation_keyboard(
             ],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def settings_pages_keyboard(pages: list[TargetPage]) -> InlineKeyboardMarkup:
