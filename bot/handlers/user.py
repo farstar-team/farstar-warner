@@ -25,6 +25,7 @@ from bot.checker import CheckOutcome, InstagramChecker, ProfileResult
 from bot.config import Settings
 from bot.database import SessionFactory
 from bot.keyboards.inline import (
+    account_actions_keyboard,
     confirm_delete_keyboard,
     notification_settings_keyboard,
     page_details_keyboard,
@@ -36,9 +37,12 @@ from bot.keyboards.inline import (
     required_channels_keyboard,
     security_tools_keyboard,
     settings_pages_keyboard,
+    store_product_keyboard,
+    store_products_keyboard,
 )
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import (
+    DiscountCode,
     NotificationSettings,
     PaymentConfig,
     PaymentReceipt,
@@ -47,8 +51,12 @@ from bot.models import (
     PageStatus,
     PlanTier,
     ReceiptStatus,
+    ReceiptDiscount,
     RequiredChannel,
     SubscriptionPlan,
+    SubscriptionReminderPreference,
+    StoreConfig,
+    StoreProduct,
     TargetPage,
     User,
     UserSubscription,
@@ -81,6 +89,7 @@ class AddPageState(StatesGroup):
 
 
 class PurchaseState(StatesGroup):
+    waiting_for_discount_code = State()
     waiting_for_receipt = State()
 
 
@@ -200,6 +209,9 @@ class UserAccessMiddleware(BaseMiddleware):
 
         data["db_user"] = user
         data["is_primary_admin"] = is_admin
+        async with self.session_factory() as session:
+            store_config = await session.get(StoreConfig, 1)
+        data["store_enabled"] = bool(store_config and store_config.enabled)
         return await handler(event, data)
 
 
@@ -241,7 +253,9 @@ def profile_result_to_embed(
         post_count=result.post_count,
         is_private=result.is_private,
         is_verified=result.is_verified,
-        diagnostic="web_profile_api",
+        diagnostic=(
+            "web_profile_api_cache" if result.from_cache else "web_profile_api"
+        ),
     )
 
 
@@ -375,13 +389,19 @@ def _add_guard_message(
 
 
 @router.message(CommandStart())
-async def start(message: Message, db_user: User, settings: Settings) -> None:
+async def start(
+    message: Message,
+    db_user: User,
+    settings: Settings,
+    store_enabled: bool,
+) -> None:
     await message.answer(
         "سلام! به فارستار وارنر خوش آمدید. 🌟\n\n"
         "از اینجا می‌توانید وضعیت پیج‌های عمومی اینستاگرام را پایش کنید و هنگام تغییر وضعیت اعلان بگیرید.\n\n"
         f"نسخه فعال: <code>{APP_VERSION}</code>",
         reply_markup=main_menu_keyboard(
-            is_admin=db_user.telegram_id == settings.admin_telegram_id
+            is_admin=db_user.telegram_id == settings.admin_telegram_id,
+            store_enabled=store_enabled,
         ),
     )
 
@@ -396,26 +416,34 @@ async def membership_recheck(
     callback: CallbackQuery,
     db_user: User,
     settings: Settings,
+    store_enabled: bool,
 ) -> None:
     await callback.answer("عضویت شما تأیید شد. ✅", show_alert=True)
     if callback.message:
         await callback.message.answer(
             "عضویت کانال‌ها تأیید شد؛ اکنون می‌توانید از ربات استفاده کنید.",
             reply_markup=main_menu_keyboard(
-                is_admin=db_user.telegram_id == settings.admin_telegram_id
+                is_admin=db_user.telegram_id == settings.admin_telegram_id,
+                store_enabled=store_enabled,
             ),
         )
 
 
 @router.message(Command("help"))
-async def help_command(message: Message, db_user: User, settings: Settings) -> None:
+async def help_command(
+    message: Message,
+    db_user: User,
+    settings: Settings,
+    store_enabled: bool,
+) -> None:
     await message.answer(
         "راهنمای فارستار وارنر 📘\n\n"
         "برای افزودن یا حذف پیج از «مدیریت پیج‌ها» استفاده کنید. "
         "در بخش «تنظیمات اعلان‌ها» می‌توانید اعلان هر پیج را جداگانه تغییر دهید. "
         "نام کاربری را به‌صورت @username یا لینک کامل اینستاگرام بفرستید.",
         reply_markup=main_menu_keyboard(
-            is_admin=db_user.telegram_id == settings.admin_telegram_id
+            is_admin=db_user.telegram_id == settings.admin_telegram_id,
+            store_enabled=store_enabled,
         ),
     )
 
@@ -426,12 +454,14 @@ async def cancel_operation(
     state: FSMContext,
     db_user: User,
     settings: Settings,
+    store_enabled: bool,
 ) -> None:
     await state.clear()
     await message.answer(
         "عملیات لغو شد.",
         reply_markup=main_menu_keyboard(
-            is_admin=db_user.telegram_id == settings.admin_telegram_id
+            is_admin=db_user.telegram_id == settings.admin_telegram_id,
+            store_enabled=store_enabled,
         ),
     )
 
@@ -610,6 +640,7 @@ async def confirm_page_registration(
     db_user: User,
     session_factory: SessionFactory,
     settings: Settings,
+    store_enabled: bool,
 ) -> None:
     data = await state.get_data()
     username = data.get("pending_username")
@@ -710,7 +741,8 @@ async def confirm_page_registration(
         await callback.message.answer(
             f"پیج <b>@{html.escape(username)}</b> با وضعیت «{status_text}» ثبت شد. ✅",
             reply_markup=main_menu_keyboard(
-                is_admin=db_user.telegram_id == settings.admin_telegram_id
+                is_admin=db_user.telegram_id == settings.admin_telegram_id,
+                store_enabled=store_enabled,
             ),
         )
     await callback.answer("پیج ثبت شد. ✅")
@@ -725,13 +757,15 @@ async def cancel_page_registration(
     state: FSMContext,
     db_user: User,
     settings: Settings,
+    store_enabled: bool,
 ) -> None:
     await state.clear()
     if callback.message:
         await callback.message.answer(
             "ثبت پیج لغو شد.",
             reply_markup=main_menu_keyboard(
-                is_admin=db_user.telegram_id == settings.admin_telegram_id
+                is_admin=db_user.telegram_id == settings.admin_telegram_id,
+                store_enabled=store_enabled,
             ),
         )
     await callback.answer()
@@ -801,7 +835,12 @@ def _profile_details_caption(details: EmbedProfile) -> str:
         lines.extend(("", f"بیوگرافی:\n{html.escape(biography)}"))
     else:
         lines.extend(("", "بیوگرافی در نمای عمومی اینستاگرام ارائه نشده است."))
-    lines.extend(("", "اطلاعات از رابط وب اینستاگرام و بدون ورود به حساب دریافت شد."))
+    source_text = (
+        "آخرین پاسخ سالم ذخیره‌شده نمایش داده شد؛ اینستاگرام موقتاً پاسخ زنده نداد."
+        if details.diagnostic == "web_profile_api_cache"
+        else "اطلاعات از رابط وب اینستاگرام و بدون ورود به حساب دریافت شد."
+    )
+    lines.extend(("", source_text))
     return "\n".join(lines)
 
 
@@ -820,6 +859,11 @@ async def live_profile_details(
                 TargetPage.id == page_id,
                 TargetPage.user_id == db_user.telegram_id,
             )
+        )
+        snapshot = (
+            await session.get(PageSnapshot, page_id)
+            if page is not None
+            else None
         )
     if page is None:
         await callback.answer("این پیج پیدا نشد.", show_alert=True)
@@ -840,10 +884,24 @@ async def live_profile_details(
     else:
         details = await profile_preview.inspect(page.instagram_username)
         if details.outcome != PreviewOutcome.ACTIVE:
-            await callback.message.answer(
-                "دریافت اطلاعات زنده این پیج فعلاً ممکن نیست. وضعیت ذخیره‌شده تغییر نکرد."
+            if snapshot is None:
+                await callback.message.answer(
+                    "دریافت اطلاعات این پیج فعلاً ممکن نیست. وضعیت ذخیره‌شده تغییر نکرد."
+                )
+                return
+            details = EmbedProfile(
+                outcome=PreviewOutcome.ACTIVE,
+                username=page.instagram_username,
+                full_name=snapshot.full_name,
+                biography=snapshot.biography,
+                profile_picture_url=snapshot.profile_picture_url,
+                follower_count=snapshot.follower_count,
+                following_count=snapshot.following_count,
+                post_count=snapshot.post_count,
+                is_private=snapshot.is_private,
+                is_verified=snapshot.is_verified,
+                diagnostic="web_profile_api_cache",
             )
-            return
 
     caption = _profile_details_caption(details)
     try:
@@ -1409,6 +1467,7 @@ async def purchase_plan_details(
         f"مدت اعتبار: <b>{to_persian_digits(plan.duration_days)} روز</b>\n"
         f"ظرفیت پایش: <b>{to_persian_digits(plan.target_limit)} پیج</b>\n"
         f"مبلغ: <b>{price} تومان</b>\n\n"
+        "اگر اشتراک فعال دارید، مدت این خرید به تاریخ پایان فعلی اضافه می‌شود.\n\n"
         "روش پرداخت را انتخاب کنید:"
     )
     if callback.message:
@@ -1421,6 +1480,92 @@ async def purchase_plan_details(
             ),
         )
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("buy:discount:"))
+async def begin_discount_code(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: SessionFactory,
+) -> None:
+    plan_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id)
+    if plan is None or not plan.is_active:
+        await callback.answer("این پلن دیگر فعال نیست.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(purchase_plan_id=plan.id)
+    await state.set_state(PurchaseState.waiting_for_discount_code)
+    if callback.message:
+        await callback.message.answer(
+            "کد تخفیف را ارسال کنید:",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(PurchaseState.waiting_for_discount_code, F.text)
+async def apply_discount_code(
+    message: Message,
+    state: FSMContext,
+    db_user: User,
+    session_factory: SessionFactory,
+) -> None:
+    data = await state.get_data()
+    plan_id = data.get("purchase_plan_id")
+    code_text = (message.text or "").strip().upper()
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id) if isinstance(plan_id, int) else None
+        discount = await session.scalar(
+            select(DiscountCode).where(func.upper(DiscountCode.code) == code_text)
+        )
+        already_used = None
+        if discount is not None:
+            already_used = await session.scalar(
+                select(ReceiptDiscount)
+                .join(PaymentReceipt, PaymentReceipt.id == ReceiptDiscount.receipt_id)
+                .where(
+                    ReceiptDiscount.discount_code_id == discount.id,
+                    ReceiptDiscount.user_id == db_user.telegram_id,
+                    PaymentReceipt.status.in_([ReceiptStatus.PENDING, ReceiptStatus.APPROVED]),
+                )
+            )
+        payment = await session.get(PaymentConfig, 1)
+    valid = bool(
+        plan
+        and plan.is_active
+        and discount
+        and discount.is_active
+        and 1 <= discount.percent <= 100
+        and (discount.expires_at is None or discount.expires_at > now)
+        and (discount.max_uses is None or discount.used_count < discount.max_uses)
+        and already_used is None
+    )
+    if not valid or plan is None or discount is None:
+        await message.answer("کد تخفیف نامعتبر، منقضی یا قبلاً استفاده‌شده است.")
+        return
+    discount_amount = plan.price * discount.percent // 100
+    final_amount = max(0, plan.price - discount_amount)
+    await state.update_data(
+        purchase_discount_code_id=discount.id,
+        purchase_original_amount=plan.price,
+        purchase_discount_amount=discount_amount,
+        purchase_final_amount=final_amount,
+    )
+    await state.set_state(None)
+    await message.answer(
+        "کد تخفیف اعمال شد. ✅\n\n"
+        f"تخفیف: <b>{to_persian_digits(discount.percent)}٪</b>\n"
+        f"مبلغ نهایی: <b>{format_count(final_amount)} تومان</b>\n\n"
+        "روش پرداخت را انتخاب کنید:",
+        reply_markup=purchase_methods_keyboard(
+            plan.id,
+            payment.support_username if payment else None,
+            bool(payment and payment.card_number),
+        ),
+    )
 
 
 @router.callback_query(F.data.startswith("buy:card:"))
@@ -1436,14 +1581,23 @@ async def begin_card_payment(
     if plan is None or not plan.is_active or payment is None or not payment.card_number:
         await callback.answer("پرداخت کارت‌به‌کارت در دسترس نیست.", show_alert=True)
         return
-    await state.update_data(purchase_plan_id=plan.id)
+    purchase_data = await state.get_data()
+    discounted_amount = (
+        purchase_data.get("purchase_final_amount")
+        if purchase_data.get("purchase_plan_id") == plan.id
+        else None
+    )
+    amount = discounted_amount if isinstance(discounted_amount, int) else plan.price
+    if purchase_data.get("purchase_plan_id") != plan.id:
+        await state.clear()
+    await state.update_data(purchase_plan_id=plan.id, purchase_amount=amount)
     await state.set_state(PurchaseState.waiting_for_receipt)
     card_number = html.escape(payment.card_number)
     card_holder = html.escape(payment.card_holder or "ثبت نشده")
     if callback.message:
         await callback.message.answer(
             "پرداخت کارت‌به‌کارت 💳\n\n"
-            f"مبلغ دقیق: <b>{format_count(plan.price)} تومان</b>\n"
+            f"مبلغ دقیق: <b>{format_count(amount)} تومان</b>\n"
             f"شماره کارت: <code>{card_number}</code>\n"
             f"به نام: <b>{card_holder}</b>\n\n"
             "پس از پرداخت، تصویر واضح فیش را همین‌جا ارسال کنید. "
@@ -1461,9 +1615,11 @@ async def receive_payment_receipt(
     session_factory: SessionFactory,
     bot: Bot,
     settings: Settings,
+    store_enabled: bool,
 ) -> None:
     data = await state.get_data()
     plan_id = data.get("purchase_plan_id")
+    purchase_amount = data.get("purchase_amount")
     if not isinstance(plan_id, int):
         await state.clear()
         await message.answer("اطلاعات خرید منقضی شده است؛ دوباره پلن را انتخاب کنید.")
@@ -1498,7 +1654,7 @@ async def receive_payment_receipt(
                 plan_name=plan.name,
                 duration_days=plan.duration_days,
                 target_limit=plan.target_limit,
-                amount=plan.price,
+                amount=(purchase_amount if isinstance(purchase_amount, int) else plan.price),
                 file_id=file_id,
                 file_unique_id=file_unique_id,
                 file_type=file_type,
@@ -1506,6 +1662,23 @@ async def receive_payment_receipt(
             )
             session.add(receipt)
             await session.flush()
+            discount_code_id = data.get("purchase_discount_code_id")
+            discount_amount = data.get("purchase_discount_amount")
+            original_amount = data.get("purchase_original_amount")
+            if (
+                isinstance(discount_code_id, int)
+                and isinstance(discount_amount, int)
+                and isinstance(original_amount, int)
+            ):
+                session.add(
+                    ReceiptDiscount(
+                        receipt_id=receipt.id,
+                        discount_code_id=discount_code_id,
+                        user_id=db_user.telegram_id,
+                        original_amount=original_amount,
+                        discount_amount=discount_amount,
+                    )
+                )
             receipt_id = receipt.id
             await session.commit()
     except IntegrityError:
@@ -1522,7 +1695,7 @@ async def receive_payment_receipt(
         f"شناسه کاربر: <code>{to_persian_digits(db_user.telegram_id)}</code>\n"
         f"نام کاربری: {username_text}\n"
         f"پلن: <b>{html.escape(plan.name)}</b>\n"
-        f"مبلغ مورد انتظار: <b>{format_count(plan.price)} تومان</b>\n"
+        f"مبلغ مورد انتظار: <b>{format_count(receipt.amount)} تومان</b>\n"
         f"مدت: {to_persian_digits(plan.duration_days)} روز\n"
         "وضعیت: در انتظار بررسی مدیر"
     )
@@ -1549,7 +1722,10 @@ async def receive_payment_receipt(
     await state.clear()
     await message.answer(
         "فیش شما ثبت و برای مدیر ارسال شد. پس از بررسی، نتیجه در همین ربات اعلام می‌شود. ✅",
-        reply_markup=main_menu_keyboard(is_admin=False),
+        reply_markup=main_menu_keyboard(
+            is_admin=False,
+            store_enabled=store_enabled,
+        ),
     )
 
 
@@ -1560,12 +1736,115 @@ async def reject_invalid_receipt(message: Message) -> None:
     )
 
 
+@router.callback_query(F.data.in_({"reminder:disable", "reminder:toggle"}))
+async def toggle_expiry_reminders(
+    callback: CallbackQuery,
+    db_user: User,
+    session_factory: SessionFactory,
+) -> None:
+    async with session_factory() as session:
+        preference = await session.get(
+            SubscriptionReminderPreference,
+            db_user.telegram_id,
+        )
+        if preference is None:
+            preference = SubscriptionReminderPreference(user_id=db_user.telegram_id)
+            session.add(preference)
+        if callback.data == "reminder:disable":
+            preference.enabled = False
+        else:
+            preference.enabled = not preference.enabled
+        enabled = preference.enabled
+        await session.commit()
+    await callback.answer(
+        "یادآوری پایان اشتراک فعال شد. 🔔"
+        if enabled
+        else "یادآوری پایان اشتراک غیرفعال شد. 🔕",
+        show_alert=True,
+    )
+    if callback.message and callback.data == "reminder:toggle":
+        await callback.message.edit_reply_markup(
+            reply_markup=account_actions_keyboard(enabled)
+        )
+
+
+async def _send_store_list(
+    message: Message,
+    session_factory: SessionFactory,
+) -> None:
+    async with session_factory() as session:
+        config = await session.get(StoreConfig, 1)
+        products = list(
+            await session.scalars(
+                select(StoreProduct)
+                .where(StoreProduct.is_active.is_(True))
+                .order_by(StoreProduct.id)
+            )
+        )
+    if config is None or not config.enabled:
+        await message.answer("فروشگاه در حال حاضر غیرفعال است.")
+        return
+    if not products:
+        await message.answer("هنوز محصولی در فروشگاه ثبت نشده است.")
+        return
+    await message.answer(
+        "فروشگاه فارستار 🛍️\n\nیک محصول را انتخاب کنید:",
+        reply_markup=store_products_keyboard(products),
+    )
+
+
+@router.message(F.text == "فروشگاه 🛍️")
+async def store_menu(message: Message, session_factory: SessionFactory) -> None:
+    await _send_store_list(message, session_factory)
+
+
+@router.callback_query(F.data == "store:list")
+async def store_list_callback(
+    callback: CallbackQuery,
+    session_factory: SessionFactory,
+) -> None:
+    if callback.message:
+        await _send_store_list(callback.message, session_factory)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("store:view:"))
+async def store_product_details(
+    callback: CallbackQuery,
+    session_factory: SessionFactory,
+) -> None:
+    product_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        config = await session.get(StoreConfig, 1)
+        product = await session.get(StoreProduct, product_id)
+        payment = await session.get(PaymentConfig, 1)
+    if config is None or not config.enabled or product is None or not product.is_active:
+        await callback.answer("این محصول در دسترس نیست.", show_alert=True)
+        return
+    text = (
+        f"<b>{html.escape(product.name)}</b> 🛍️\n\n"
+        f"{html.escape(product.description)}\n\n"
+        f"قیمت: <b>{format_count(product.price)} تومان</b>"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=store_product_keyboard(
+                product.id,
+                product.purchase_url,
+                payment.support_username if payment else None,
+            ),
+        )
+    await callback.answer()
+
+
 @router.message(F.text == "حساب کاربری 👤")
 async def account_info(
     message: Message,
     db_user: User,
     session_factory: SessionFactory,
     settings: Settings,
+    store_enabled: bool,
 ) -> None:
     async with session_factory() as session:
         target_count = await session.scalar(
@@ -1574,6 +1853,10 @@ async def account_info(
             )
         )
         subscription = await session.get(UserSubscription, db_user.telegram_id)
+        reminder_preference = await session.get(
+            SubscriptionReminderPreference,
+            db_user.telegram_id,
+        )
     now = datetime.now(timezone.utc)
     is_admin = db_user.telegram_id == settings.admin_telegram_id
     role_text = "مدیر اصلی 🛡️" if is_admin else "کاربر"
@@ -1603,7 +1886,16 @@ async def account_info(
         f"تاریخ پایان: {expiry}\n"
         f"تعداد پیج‌ها: {to_persian_digits(target_count or 0)} از "
         f"{to_persian_digits(target_limit)}",
-        reply_markup=main_menu_keyboard(is_admin=is_admin),
+        reply_markup=account_actions_keyboard(
+            reminder_preference is None or reminder_preference.enabled
+        ),
+    )
+    await message.answer(
+        "منوی اصلی:",
+        reply_markup=main_menu_keyboard(
+            is_admin=is_admin,
+            store_enabled=store_enabled,
+        ),
     )
 
 
@@ -1612,10 +1904,12 @@ async def unknown_message(
     message: Message,
     db_user: User,
     settings: Settings,
+    store_enabled: bool,
 ) -> None:
     await message.answer(
         "متوجه درخواست شما نشدم. لطفاً یکی از گزینه‌های منوی اصلی را انتخاب کنید.",
         reply_markup=main_menu_keyboard(
-            is_admin=db_user.telegram_id == settings.admin_telegram_id
+            is_admin=db_user.telegram_id == settings.admin_telegram_id,
+            store_enabled=store_enabled,
         ),
     )

@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from redis.asyncio import Redis
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from bot.checker import CheckOutcome, InstagramChecker
@@ -22,21 +22,27 @@ from bot.database import SessionFactory
 from bot.handlers.user import AddPageState
 from bot.keyboards.inline import (
     admin_channels_keyboard,
+    admin_discounts_keyboard,
     admin_panel_keyboard,
     admin_plan_keyboard,
     admin_plans_keyboard,
+    admin_store_keyboard,
     payment_config_keyboard,
     receipt_review_keyboard,
 )
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import (
+    DiscountCode,
     PageEvent,
     PageStatus,
     PaymentConfig,
     PaymentReceipt,
     ReceiptStatus,
+    ReceiptDiscount,
     RequiredChannel,
     SubscriptionPlan,
+    StoreConfig,
+    StoreProduct,
     TargetPage,
     User,
     UserStatus,
@@ -85,6 +91,20 @@ class AdminPaymentState(StatesGroup):
     waiting_for_card_holder = State()
 
 
+class AdminDiscountState(StatesGroup):
+    waiting_for_code = State()
+    waiting_for_percent = State()
+    waiting_for_max_uses = State()
+    waiting_for_expiry_days = State()
+
+
+class AdminStoreState(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_description = State()
+    waiting_for_price = State()
+    waiting_for_url = State()
+
+
 def _digits(value: object) -> str:
     return str(value).translate(PERSIAN_DIGITS)
 
@@ -119,6 +139,14 @@ async def _reject_callback(callback: CallbackQuery, settings: Settings) -> bool:
         AdminPaymentState.waiting_for_support,
         AdminPaymentState.waiting_for_card_number,
         AdminPaymentState.waiting_for_card_holder,
+        AdminDiscountState.waiting_for_code,
+        AdminDiscountState.waiting_for_percent,
+        AdminDiscountState.waiting_for_max_uses,
+        AdminDiscountState.waiting_for_expiry_days,
+        AdminStoreState.waiting_for_name,
+        AdminStoreState.waiting_for_description,
+        AdminStoreState.waiting_for_price,
+        AdminStoreState.waiting_for_url,
     ),
     F.text == "لغو عملیات ↩️",
 )
@@ -760,10 +788,34 @@ async def approve_receipt(
         if user is None:
             await callback.answer("حساب کاربر پیدا نشد.", show_alert=True)
             return
+        receipt_discount = await session.get(ReceiptDiscount, receipt.id)
+        discount_code = None
+        if receipt_discount is not None:
+            discount_code = await session.scalar(
+                select(DiscountCode)
+                .where(DiscountCode.id == receipt_discount.discount_code_id)
+                .with_for_update()
+            )
+            if (
+                discount_code is None
+                or not discount_code.is_active
+                or (
+                    discount_code.max_uses is not None
+                    and discount_code.used_count >= discount_code.max_uses
+                )
+            ):
+                await callback.answer(
+                    "ظرفیت کد تخفیف تکمیل یا کد غیرفعال شده است؛ فیش را رد کنید.",
+                    show_alert=True,
+                )
+                return
         subscription = await session.get(UserSubscription, user.telegram_id)
+        stored_expiry = subscription.expires_at if subscription is not None else None
+        if stored_expiry is not None and stored_expiry.tzinfo is None:
+            stored_expiry = stored_expiry.replace(tzinfo=timezone.utc)
         current_expiry = (
-            subscription.expires_at
-            if subscription is not None and subscription.expires_at > now
+            stored_expiry
+            if stored_expiry is not None and stored_expiry > now
             else now
         )
         new_expiry = current_expiry + timedelta(days=receipt.duration_days)
@@ -789,6 +841,8 @@ async def approve_receipt(
         receipt.status = ReceiptStatus.APPROVED
         receipt.reviewed_by = callback.from_user.id
         receipt.reviewed_at = now
+        if discount_code is not None:
+            discount_code.used_count += 1
         await session.commit()
         recipient_id = user.telegram_id
         plan_name = receipt.plan_name
@@ -833,6 +887,9 @@ async def reject_receipt(
             await callback.answer("این فیش قبلاً بررسی شده است.", show_alert=True)
             return
         receipt.status = ReceiptStatus.REJECTED
+        await session.execute(
+            delete(ReceiptDiscount).where(ReceiptDiscount.receipt_id == receipt.id)
+        )
         receipt.reviewed_by = callback.from_user.id
         receipt.reviewed_at = datetime.now(timezone.utc)
         recipient_id = receipt.user_id
@@ -850,6 +907,263 @@ async def reject_receipt(
         )
     await _finalize_receipt_message(callback, "❌ فیش توسط مدیر رد شد.")
     await callback.answer("فیش رد شد.", show_alert=True)
+
+
+@router.callback_query(F.data == "admin:discounts")
+async def admin_discounts(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    async with session_factory() as session:
+        codes = list(
+            await session.scalars(
+                select(DiscountCode)
+                .where(DiscountCode.is_active.is_(True))
+                .order_by(DiscountCode.id)
+            )
+        )
+    text = "مدیریت کدهای تخفیف 🏷\n\n"
+    text += "هنوز کدی ثبت نشده است." if not codes else "برای حذف، کد موردنظر را انتخاب کنید."
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=admin_discounts_keyboard(codes))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:discount:add")
+async def begin_discount_add(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.clear()
+    await state.set_state(AdminDiscountState.waiting_for_code)
+    if callback.message:
+        await callback.message.answer("کد تخفیف جدید را با حروف انگلیسی ارسال کنید:", reply_markup=cancel_keyboard())
+    await callback.answer()
+
+
+@router.message(AdminDiscountState.waiting_for_code, F.text)
+async def discount_code_received(message: Message, state: FSMContext, settings: Settings) -> None:
+    if await _reject_message(message, settings):
+        return
+    code = (message.text or "").strip().upper()
+    if not code or len(code) > 64 or not all(ch.isalnum() or ch in {"-", "_"} for ch in code):
+        await message.answer("کد فقط می‌تواند شامل حروف انگلیسی، عدد، خط تیره و زیرخط باشد.")
+        return
+    await state.update_data(discount_code=code)
+    await state.set_state(AdminDiscountState.waiting_for_percent)
+    await message.answer("درصد تخفیف را بین ۱ تا ۱۰۰ وارد کنید:")
+
+
+@router.message(AdminDiscountState.waiting_for_percent, F.text)
+async def discount_percent_received(message: Message, state: FSMContext, settings: Settings) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        percent = int((message.text or "").strip())
+    except ValueError:
+        percent = 0
+    if not 1 <= percent <= 100:
+        await message.answer("درصد باید عددی بین ۱ تا ۱۰۰ باشد.")
+        return
+    await state.update_data(discount_percent=percent)
+    await state.set_state(AdminDiscountState.waiting_for_max_uses)
+    await message.answer("حداکثر تعداد استفاده را وارد کنید؛ برای نامحدود عدد ۰ را بفرستید:")
+
+
+@router.message(AdminDiscountState.waiting_for_max_uses, F.text)
+async def discount_limit_received(message: Message, state: FSMContext, settings: Settings) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        max_uses = int((message.text or "").strip())
+    except ValueError:
+        max_uses = -1
+    if max_uses < 0:
+        await message.answer("تعداد استفاده باید صفر یا یک عدد مثبت باشد.")
+        return
+    await state.update_data(discount_max_uses=max_uses)
+    await state.set_state(AdminDiscountState.waiting_for_expiry_days)
+    await message.answer("اعتبار کد چند روز باشد؟ برای بدون انقضا عدد ۰ را بفرستید:")
+
+
+@router.message(AdminDiscountState.waiting_for_expiry_days, F.text)
+async def discount_expiry_received(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        days = int((message.text or "").strip())
+    except ValueError:
+        days = -1
+    if not 0 <= days <= 3650:
+        await message.answer("تعداد روز باید بین ۰ تا ۳۶۵۰ باشد.")
+        return
+    data = await state.get_data()
+    try:
+        async with session_factory() as session:
+            session.add(
+                DiscountCode(
+                    code=data["discount_code"],
+                    percent=data["discount_percent"],
+                    max_uses=data["discount_max_uses"] or None,
+                    expires_at=(datetime.now(timezone.utc) + timedelta(days=days)) if days else None,
+                )
+            )
+            await session.commit()
+    except IntegrityError:
+        await message.answer("این کد قبلاً ثبت شده است.")
+        return
+    await state.clear()
+    await message.answer("کد تخفیف با موفقیت ساخته شد. ✅", reply_markup=main_menu_keyboard(is_admin=True))
+
+
+@router.callback_query(F.data.startswith("admin:discount:delete:"))
+async def delete_discount_code(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    code_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        code = await session.get(DiscountCode, code_id)
+        if code is not None:
+            code.is_active = False
+            await session.commit()
+    await admin_discounts(callback, settings, session_factory)
+
+
+async def _show_admin_store(callback: CallbackQuery, session_factory: SessionFactory) -> None:
+    async with session_factory() as session:
+        config = await session.get(StoreConfig, 1)
+        products = list(await session.scalars(select(StoreProduct).where(StoreProduct.is_active.is_(True)).order_by(StoreProduct.id)))
+    enabled = bool(config and config.enabled)
+    if callback.message:
+        await callback.message.edit_text(
+            f"مدیریت فروشگاه 🛍️\n\nوضعیت نمایش برای کاربران: {'فعال ✅' if enabled else 'غیرفعال ❌'}",
+            reply_markup=admin_store_keyboard(products, enabled),
+        )
+
+
+@router.callback_query(F.data == "admin:store")
+async def admin_store(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await _show_admin_store(callback, session_factory)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:store:toggle")
+async def toggle_store(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    async with session_factory() as session:
+        config = await session.get(StoreConfig, 1)
+        if config is None:
+            config = StoreConfig(id=1, enabled=True)
+            session.add(config)
+        else:
+            config.enabled = not config.enabled
+        await session.commit()
+    await _show_admin_store(callback, session_factory)
+    await callback.answer("وضعیت فروشگاه ذخیره شد. ✅")
+
+
+@router.callback_query(F.data == "admin:store:add")
+async def begin_store_product(callback: CallbackQuery, settings: Settings, state: FSMContext) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.clear()
+    await state.set_state(AdminStoreState.waiting_for_name)
+    if callback.message:
+        await callback.message.answer("نام محصول را ارسال کنید:", reply_markup=cancel_keyboard())
+    await callback.answer()
+
+
+@router.message(AdminStoreState.waiting_for_name, F.text)
+async def store_name_received(message: Message, state: FSMContext, settings: Settings) -> None:
+    if await _reject_message(message, settings):
+        return
+    name = (message.text or "").strip()
+    if not 2 <= len(name) <= 100:
+        await message.answer("نام محصول باید بین ۲ تا ۱۰۰ نویسه باشد.")
+        return
+    await state.update_data(store_name=name)
+    await state.set_state(AdminStoreState.waiting_for_description)
+    await message.answer("توضیحات محصول را ارسال کنید:")
+
+
+@router.message(AdminStoreState.waiting_for_description, F.text)
+async def store_description_received(message: Message, state: FSMContext, settings: Settings) -> None:
+    if await _reject_message(message, settings):
+        return
+    description = (message.text or "").strip()
+    if not 2 <= len(description) <= 2000:
+        await message.answer("توضیحات باید بین ۲ تا ۲۰۰۰ نویسه باشد.")
+        return
+    await state.update_data(store_description=description)
+    await state.set_state(AdminStoreState.waiting_for_price)
+    await message.answer("قیمت محصول را به تومان و فقط با عدد وارد کنید:")
+
+
+@router.message(AdminStoreState.waiting_for_price, F.text)
+async def store_price_received(message: Message, state: FSMContext, settings: Settings) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        price = int((message.text or "").replace(",", "").strip())
+    except ValueError:
+        price = -1
+    if price < 0:
+        await message.answer("قیمت نامعتبر است.")
+        return
+    await state.update_data(store_price=price)
+    await state.set_state(AdminStoreState.waiting_for_url)
+    await message.answer("لینک خرید را ارسال کنید؛ برای استفاده از آیدی پشتیبانی یک خط تیره (-) بفرستید:")
+
+
+@router.message(AdminStoreState.waiting_for_url, F.text)
+async def store_url_received(message: Message, state: FSMContext, settings: Settings, session_factory: SessionFactory) -> None:
+    if await _reject_message(message, settings):
+        return
+    value = (message.text or "").strip()
+    if value != "-" and not value.startswith(("https://", "http://")):
+        await message.answer("لینک باید با http:// یا https:// شروع شود؛ یا فقط - بفرستید.")
+        return
+    data = await state.get_data()
+    async with session_factory() as session:
+        session.add(
+            StoreProduct(
+                name=data["store_name"],
+                description=data["store_description"],
+                price=data["store_price"],
+                purchase_url=None if value == "-" else value,
+            )
+        )
+        await session.commit()
+    await state.clear()
+    await message.answer("محصول به فروشگاه افزوده شد. ✅", reply_markup=main_menu_keyboard(is_admin=True))
+
+
+@router.callback_query(F.data.startswith("admin:store:delete:"))
+async def delete_store_product(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    product_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        product = await session.get(StoreProduct, product_id)
+        if product is not None:
+            product.is_active = False
+            await session.commit()
+    await _show_admin_store(callback, session_factory)
+    await callback.answer("محصول حذف شد. ✅")
 
 
 @router.callback_query(F.data == "admin:add_target")

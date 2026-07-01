@@ -1,7 +1,10 @@
 from aiogram.types import KeyboardButton, ReplyKeyboardMarkup
 
 
-def main_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
+def main_menu_keyboard(
+    is_admin: bool = False,
+    store_enabled: bool = False,
+) -> ReplyKeyboardMarkup:
     keyboard = [
         [
             KeyboardButton(text="مدیریت پیج‌ها 📊"),
@@ -12,6 +15,8 @@ def main_menu_keyboard(is_admin: bool = False) -> ReplyKeyboardMarkup:
             KeyboardButton(text="حساب کاربری 👤"),
         ],
     ]
+    if store_enabled:
+        keyboard.append([KeyboardButton(text="فروشگاه 🛍️")])
     if is_admin:
         keyboard.append([KeyboardButton(text="پنل مدیریت 🛡️")])
     return ReplyKeyboardMarkup(

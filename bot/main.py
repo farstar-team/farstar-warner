@@ -12,6 +12,7 @@ from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import BotCommand, BotCommandScopeChat
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -22,6 +23,7 @@ from bot.database import SessionFactory, create_database, initialize_database
 from bot.handlers import admin, user
 from bot.models import PlanTier, User, UserStatus
 from bot.profile_preview import ProfilePreviewService
+from bot.reminders import send_expiry_reminders
 from bot.version import APP_VERSION, RELEASE_REDIS_KEY, version_message
 
 
@@ -165,6 +167,14 @@ async def run() -> None:
             name="Instagram public profile checker",
             replace_existing=True,
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
+        )
+        scheduler.add_job(
+            send_expiry_reminders,
+            trigger=CronTrigger(hour=6, minute=0, timezone=timezone.utc),
+            id="subscription-expiry-reminders",
+            name="Daily subscription expiry reminders",
+            replace_existing=True,
+            kwargs={"bot": bot, "session_factory": session_factory},
         )
         scheduler.start()
 

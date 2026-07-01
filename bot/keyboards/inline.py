@@ -4,11 +4,13 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from bot.models import (
+    DiscountCode,
     NotificationSettings,
     RequiredChannel,
     SubscriptionPlan,
     PageStatus,
     TargetPage,
+    StoreProduct,
 )
 
 
@@ -302,6 +304,14 @@ def purchase_methods_keyboard(
                 )
             ]
         )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🏷 استفاده از کد تخفیف",
+                callback_data=f"buy:discount:{plan_id}",
+            )
+        ]
+    )
     if support_username:
         username = support_username.lstrip("@")
         rows.append(
@@ -313,6 +323,121 @@ def purchase_methods_keyboard(
             ]
         )
     rows.append([InlineKeyboardButton(text="↩️ بازگشت", callback_data="buy:list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def account_actions_keyboard(reminders_enabled: bool = True) -> InlineKeyboardMarkup:
+    reminder_text = (
+        "🔕 قطع یادآوری پایان اشتراک"
+        if reminders_enabled
+        else "🔔 فعال‌کردن یادآوری پایان اشتراک"
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💎 تمدید اشتراک", callback_data="buy:list")],
+            [
+                InlineKeyboardButton(
+                    text=reminder_text,
+                    callback_data="reminder:toggle",
+                )
+            ],
+        ]
+    )
+
+
+def expiry_reminder_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💎 تمدید اشتراک", callback_data="buy:list")],
+            [
+                InlineKeyboardButton(
+                    text="🔕 دیگر اطلاع‌رسانی نکن",
+                    callback_data="reminder:disable",
+                )
+            ],
+        ]
+    )
+
+
+def store_products_keyboard(products: list[StoreProduct]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for product in products:
+        builder.button(
+            text=f"🛍 {product.name}",
+            callback_data=f"store:view:{product.id}",
+        )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def store_product_keyboard(
+    product_id: int,
+    purchase_url: str | None,
+    support_username: str | None,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if purchase_url:
+        rows.append([InlineKeyboardButton(text="🛒 خرید محصول", url=purchase_url)])
+    elif support_username:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="👤 خرید از پشتیبانی",
+                    url=f"https://t.me/{support_username.lstrip('@')}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="↩️ فروشگاه", callback_data="store:list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_discounts_keyboard(codes: list[DiscountCode]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for code in codes:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑 {code.code} — {code.percent}٪",
+                    callback_data=f"admin:discount:delete:{code.id}",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="➕ کد تخفیف جدید", callback_data="admin:discount:add")],
+            [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_store_keyboard(
+    products: list[StoreProduct],
+    enabled: bool,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=f"{'✅' if enabled else '❌'} نمایش فروشگاه در منوی کاربران",
+                callback_data="admin:store:toggle",
+            )
+        ]
+    ]
+    for product in products:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🗑 حذف {product.name}",
+                    callback_data=f"admin:store:delete:{product.id}",
+                )
+            ]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="➕ افزودن محصول", callback_data="admin:store:add")],
+            [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -441,6 +566,18 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🧾 فیش‌های در انتظار",
                     callback_data="admin:receipts",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏷 مدیریت کدهای تخفیف",
+                    callback_data="admin:discounts",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🛍 مدیریت فروشگاه",
+                    callback_data="admin:store",
                 )
             ],
             [InlineKeyboardButton(text="آمار سیستم 📈", callback_data="admin:stats")],
