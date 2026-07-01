@@ -1,75 +1,31 @@
-services:
-  postgres:
-    image: postgres:17-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-    networks:
-      - backend
-    security_opt:
-      - no-new-privileges:true
+version: '3.8'
 
-  redis:
-    image: redis:8-alpine
-    restart: unless-stopped
+services:
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: farstar_postgres
+    restart: always
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
-    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+      POSTGRES_USER: farstar_admin
+      POSTGRES_PASSWORD: secret_password_123
+      POSTGRES_DB: farstar_warner_db
     volumes:
-      - redis-data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep PONG"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
-    networks:
-      - backend
-    security_opt:
-      - no-new-privileges:true
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
 
   bot-app:
-    image: farstar-warner:latest
-    init: true
-    build:
-      context: .
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    env_file:
-      - ${BOT_ENV_FILE:-.env}
+    build: .
+    container_name: farstar_bot_app
+    restart: always
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    networks:
-      - backend
-      - outbound
-    read_only: true
-    tmpfs:
-      - /tmp:size=256m,mode=1777
-    shm_size: 256m
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    stop_grace_period: 30s
+      - postgres_db
+    environment:
+      - BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN_HERE
+      - ADMIN_ID=YOUR_TELEGRAM_ID_HERE
+      - DATABASE_URL=postgresql+asyncpg://farstar_admin:secret_password_123@postgres_db:5432/farstar_warner_db
+    volumes:
+      - .:/app
 
 volumes:
-  postgres-data:
-  redis-data:
-
-networks:
-  backend:
-    internal: true
-  outbound:
+  pgdata:
