@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from aiogram import BaseMiddleware, Bot, F, Router
+from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,19 +29,29 @@ from bot.keyboards.inline import (
     notification_settings_keyboard,
     page_details_keyboard,
     pages_keyboard,
+    purchase_methods_keyboard,
+    purchase_plans_keyboard,
+    receipt_review_keyboard,
     registration_confirmation_keyboard,
+    required_channels_keyboard,
     security_tools_keyboard,
     settings_pages_keyboard,
-    subscription_keyboard,
 )
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import (
     NotificationSettings,
+    PaymentConfig,
+    PaymentReceipt,
     PageEvent,
+    PageSnapshot,
     PageStatus,
     PlanTier,
+    ReceiptStatus,
+    RequiredChannel,
+    SubscriptionPlan,
     TargetPage,
     User,
+    UserSubscription,
     UserStatus,
 )
 from bot.profile_preview import EmbedProfile, PreviewOutcome, ProfilePreviewService
@@ -66,6 +78,10 @@ PAGE_STATUS_NAMES = {
 class AddPageState(StatesGroup):
     waiting_for_username = State()
     waiting_for_confirmation = State()
+
+
+class PurchaseState(StatesGroup):
+    waiting_for_receipt = State()
 
 
 class UserAccessMiddleware(BaseMiddleware):
@@ -116,6 +132,71 @@ class UserAccessMiddleware(BaseMiddleware):
             elif isinstance(event, Message):
                 await event.answer(text)
             return None
+
+        if not is_admin:
+            async with self.session_factory() as session:
+                channels = list(
+                    await session.scalars(
+                        select(RequiredChannel)
+                        .where(RequiredChannel.is_active.is_(True))
+                        .order_by(RequiredChannel.id)
+                    )
+                )
+            bot: Bot | None = data.get("bot")
+            redis: Redis | None = data.get("redis")
+            missing_channels: list[RequiredChannel] = []
+            if bot is not None:
+                for channel in channels:
+                    membership_key = (
+                        f"farstar:membership:{telegram_user.id}:{channel.id}"
+                    )
+                    if redis is not None and await redis.exists(membership_key):
+                        continue
+                    chat_id: int | str = channel.chat_identifier
+                    if channel.chat_identifier.lstrip("-").isdigit():
+                        chat_id = int(channel.chat_identifier)
+                    try:
+                        membership = await bot.get_chat_member(
+                            chat_id=chat_id,
+                            user_id=telegram_user.id,
+                        )
+                        joined = membership.status in {
+                            ChatMemberStatus.CREATOR,
+                            ChatMemberStatus.ADMINISTRATOR,
+                            ChatMemberStatus.MEMBER,
+                        } or (
+                            membership.status == ChatMemberStatus.RESTRICTED
+                            and bool(getattr(membership, "is_member", False))
+                        )
+                    except TelegramAPIError as exc:
+                        logger.warning(
+                            "Could not verify membership in %s: %s",
+                            channel.chat_identifier,
+                            exc,
+                        )
+                        joined = False
+                    if not joined:
+                        missing_channels.append(channel)
+                    elif redis is not None:
+                        await redis.set(membership_key, "1", ex=300)
+            elif channels:
+                missing_channels = channels
+
+            if missing_channels:
+                text = (
+                    "برای استفاده از ربات ابتدا در کانال‌های زیر عضو شوید، "
+                    "سپس دکمه بررسی دوباره را بزنید."
+                )
+                markup = required_channels_keyboard(missing_channels)
+                if isinstance(event, CallbackQuery):
+                    await event.answer(
+                        "ابتدا عضویت کانال‌ها را تکمیل کنید.", show_alert=True
+                    )
+                    if event.message:
+                        await event.message.answer(text, reply_markup=markup)
+                elif isinstance(event, Message):
+                    await event.answer(text, reply_markup=markup)
+                return None
 
         data["db_user"] = user
         data["is_primary_admin"] = is_admin
@@ -275,13 +356,20 @@ def _risk_score(
     return min(score, 100), reasons or ["نشانه هشدار قابل‌توجهی دیده نشد"]
 
 
-def _add_guard_message(user: User, target_count: int) -> str | None:
-    if user.subscription_expiry <= datetime.now(timezone.utc):
-        return (
-            "اعتبار اشتراک شما به پایان رسیده است. لطفاً ابتدا اشتراک خود را تمدید کنید."
-        )
-    if target_count >= user.plan_tier.target_limit:
-        limit = to_persian_digits(user.plan_tier.target_limit)
+def _add_guard_message(
+    user: User,
+    target_count: int,
+    subscription: UserSubscription | None = None,
+) -> str | None:
+    now = datetime.now(timezone.utc)
+    if subscription is not None and subscription.expires_at > now:
+        target_limit = subscription.target_limit
+    elif user.plan_tier != PlanTier.FREE and user.subscription_expiry > now:
+        target_limit = user.plan_tier.target_limit
+    else:
+        target_limit = PlanTier.FREE.target_limit
+    if target_count >= target_limit:
+        limit = to_persian_digits(target_limit)
         return f"ظرفیت پلن شما تکمیل است. سقف پلن فعلی {limit} پیج است."
     return None
 
@@ -301,6 +389,22 @@ async def start(message: Message, db_user: User, settings: Settings) -> None:
 @router.message(Command("version"))
 async def version_command(message: Message) -> None:
     await message.answer(version_message())
+
+
+@router.callback_query(F.data == "membership:check")
+async def membership_recheck(
+    callback: CallbackQuery,
+    db_user: User,
+    settings: Settings,
+) -> None:
+    await callback.answer("عضویت شما تأیید شد. ✅", show_alert=True)
+    if callback.message:
+        await callback.message.answer(
+            "عضویت کانال‌ها تأیید شد؛ اکنون می‌توانید از ربات استفاده کنید.",
+            reply_markup=main_menu_keyboard(
+                is_admin=db_user.telegram_id == settings.admin_telegram_id
+            ),
+        )
 
 
 @router.message(Command("help"))
@@ -375,7 +479,12 @@ async def begin_add_page(
                 TargetPage.user_id == db_user.telegram_id
             )
         )
-    guard_message = _add_guard_message(db_user, int(target_count or 0))
+        subscription = await session.get(UserSubscription, db_user.telegram_id)
+    guard_message = _add_guard_message(
+        db_user,
+        int(target_count or 0),
+        subscription,
+    )
     if guard_message:
         await callback.answer(guard_message, show_alert=True)
         return
@@ -536,7 +645,12 @@ async def confirm_page_registration(
                     TargetPage.user_id == user.telegram_id
                 )
             )
-            guard_message = _add_guard_message(user, int(target_count or 0))
+            subscription = await session.get(UserSubscription, user.telegram_id)
+            guard_message = _add_guard_message(
+                user,
+                int(target_count or 0),
+                subscription,
+            )
             if guard_message:
                 await state.clear()
                 await callback.answer(guard_message, show_alert=True)
@@ -880,7 +994,13 @@ async def run_security_tool(
         )
         return
 
-    details = await profile_preview.inspect(page.instagram_username, use_cache=False)
+    live_result = await checker.fetch_profile(page.instagram_username)
+    if live_result.outcome == CheckOutcome.ACTIVE:
+        details = profile_result_to_embed(live_result, page.instagram_username)
+    else:
+        details = await profile_preview.inspect(
+            page.instagram_username, use_cache=False
+        )
     if details.outcome != PreviewOutcome.ACTIVE and action in {
         "fingerprint",
         "baseline",
@@ -994,6 +1114,7 @@ async def run_security_tool(
 
     if action == "report":
         async with session_factory() as session:
+            snapshot = await session.get(PageSnapshot, page.id)
             events = list(
                 await session.scalars(
                     select(PageEvent)
@@ -1016,8 +1137,26 @@ async def run_security_tool(
             "public_profile": identity
             | {
                 "followers": details.follower_count,
+                "following": details.following_count,
                 "posts": details.post_count,
+                "is_private": details.is_private,
+                "is_verified": details.is_verified,
             },
+            "monitoring_snapshot": (
+                {
+                    "profile_picture_key": snapshot.profile_picture_key,
+                    "full_name": snapshot.full_name,
+                    "biography": snapshot.biography,
+                    "followers": snapshot.follower_count,
+                    "following": snapshot.following_count,
+                    "posts": snapshot.post_count,
+                    "is_private": snapshot.is_private,
+                    "is_verified": snapshot.is_verified,
+                    "updated_at": snapshot.updated_at.isoformat(),
+                }
+                if snapshot
+                else None
+            ),
             "identity_fingerprint": digest,
             "baseline_fingerprint": baseline_digest,
             "risk_score": score,
@@ -1207,49 +1346,218 @@ async def toggle_notification(
 
 
 @router.message(F.text == "خرید اشتراک 💎")
-async def subscription_menu(message: Message) -> None:
+async def subscription_menu(
+    message: Message,
+    session_factory: SessionFactory,
+) -> None:
+    async with session_factory() as session:
+        plans = list(
+            await session.scalars(
+                select(SubscriptionPlan)
+                .where(SubscriptionPlan.is_active.is_(True))
+                .order_by(SubscriptionPlan.price, SubscriptionPlan.id)
+            )
+        )
+    if not plans:
+        await message.answer(
+            "در حال حاضر پلن فروشی فعالی تعریف نشده است. لطفاً با پشتیبانی تماس بگیرید."
+        )
+        return
     await message.answer(
         "پلن‌های اشتراک فارستار وارنر 💎\n\n"
-        "رایگان: پایش ۱ پیج\n"
-        "پریمیوم: پایش تا ۱۰ پیج\n"
-        "ویژه: پایش تا ۵۰ پیج\n\n"
-        "برای ارتباط با مدیر و دریافت جزئیات، پلن موردنظر را انتخاب کنید.",
-        reply_markup=subscription_keyboard(),
+        "کاربر رایگان می‌تواند ۱ پیج ثبت کند. برای افزایش ظرفیت، یک پلن را انتخاب کنید:",
+        reply_markup=purchase_plans_keyboard(plans),
     )
 
 
-@router.callback_query(F.data.startswith("subscription:request:"))
-async def request_subscription(
+@router.callback_query(F.data == "buy:list")
+async def purchase_plan_list(
     callback: CallbackQuery,
+    session_factory: SessionFactory,
+) -> None:
+    async with session_factory() as session:
+        plans = list(
+            await session.scalars(
+                select(SubscriptionPlan)
+                .where(SubscriptionPlan.is_active.is_(True))
+                .order_by(SubscriptionPlan.price, SubscriptionPlan.id)
+            )
+        )
+    if callback.message:
+        await callback.message.edit_text(
+            "یک پلن اشتراک را انتخاب کنید:",
+            reply_markup=purchase_plans_keyboard(plans),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("buy:plan:"))
+async def purchase_plan_details(
+    callback: CallbackQuery,
+    session_factory: SessionFactory,
+) -> None:
+    plan_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id)
+        payment = await session.get(PaymentConfig, 1)
+    if plan is None or not plan.is_active:
+        await callback.answer("این پلن دیگر فعال نیست.", show_alert=True)
+        return
+    price = format_count(plan.price)
+    text = (
+        f"پلن <b>{html.escape(plan.name)}</b> 💎\n\n"
+        f"مدت اعتبار: <b>{to_persian_digits(plan.duration_days)} روز</b>\n"
+        f"ظرفیت پایش: <b>{to_persian_digits(plan.target_limit)} پیج</b>\n"
+        f"مبلغ: <b>{price} تومان</b>\n\n"
+        "روش پرداخت را انتخاب کنید:"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=purchase_methods_keyboard(
+                plan.id,
+                payment.support_username if payment else None,
+                bool(payment and payment.card_number),
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("buy:card:"))
+async def begin_card_payment(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: SessionFactory,
+) -> None:
+    plan_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id)
+        payment = await session.get(PaymentConfig, 1)
+    if plan is None or not plan.is_active or payment is None or not payment.card_number:
+        await callback.answer("پرداخت کارت‌به‌کارت در دسترس نیست.", show_alert=True)
+        return
+    await state.update_data(purchase_plan_id=plan.id)
+    await state.set_state(PurchaseState.waiting_for_receipt)
+    card_number = html.escape(payment.card_number)
+    card_holder = html.escape(payment.card_holder or "ثبت نشده")
+    if callback.message:
+        await callback.message.answer(
+            "پرداخت کارت‌به‌کارت 💳\n\n"
+            f"مبلغ دقیق: <b>{format_count(plan.price)} تومان</b>\n"
+            f"شماره کارت: <code>{card_number}</code>\n"
+            f"به نام: <b>{card_holder}</b>\n\n"
+            "پس از پرداخت، تصویر واضح فیش را همین‌جا ارسال کنید. "
+            "هر فیش فقط یک‌بار قابل ثبت است و فعال‌سازی پس از بررسی دستی مدیر انجام می‌شود.",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(PurchaseState.waiting_for_receipt, F.photo | F.document)
+async def receive_payment_receipt(
+    message: Message,
+    state: FSMContext,
     db_user: User,
+    session_factory: SessionFactory,
     bot: Bot,
-    redis: Redis,
     settings: Settings,
 ) -> None:
-    plan_value = (callback.data or "").rsplit(":", 1)[1]
-    if plan_value not in {PlanTier.PREMIUM.value, PlanTier.VIP.value}:
-        await callback.answer("پلن انتخاب‌شده معتبر نیست.", show_alert=True)
+    data = await state.get_data()
+    plan_id = data.get("purchase_plan_id")
+    if not isinstance(plan_id, int):
+        await state.clear()
+        await message.answer("اطلاعات خرید منقضی شده است؛ دوباره پلن را انتخاب کنید.")
         return
 
-    request_key = f"farstar:subscription-request:{db_user.telegram_id}:{plan_value}"
-    accepted = await redis.set(request_key, "1", ex=3600, nx=True)
-    if not accepted:
-        await callback.answer(
-            "درخواست شما قبلاً ثبت شده است. لطفاً منتظر پاسخ مدیر بمانید.",
-            show_alert=True,
+    if message.photo:
+        media = message.photo[-1]
+        file_id = media.file_id
+        file_unique_id = media.file_unique_id
+        file_type = "photo"
+    elif message.document and (
+        (message.document.mime_type or "").startswith("image/")
+        or message.document.mime_type == "application/pdf"
+    ):
+        file_id = message.document.file_id
+        file_unique_id = message.document.file_unique_id
+        file_type = "document"
+    else:
+        await message.answer("فیش را به‌صورت تصویر یا فایل PDF ارسال کنید.")
+        return
+
+    try:
+        async with session_factory() as session:
+            plan = await session.get(SubscriptionPlan, plan_id)
+            if plan is None or not plan.is_active:
+                await state.clear()
+                await message.answer("پلن انتخاب‌شده دیگر فعال نیست.")
+                return
+            receipt = PaymentReceipt(
+                user_id=db_user.telegram_id,
+                plan_id=plan.id,
+                plan_name=plan.name,
+                duration_days=plan.duration_days,
+                target_limit=plan.target_limit,
+                amount=plan.price,
+                file_id=file_id,
+                file_unique_id=file_unique_id,
+                file_type=file_type,
+                status=ReceiptStatus.PENDING,
+            )
+            session.add(receipt)
+            await session.flush()
+            receipt_id = receipt.id
+            await session.commit()
+    except IntegrityError:
+        await state.clear()
+        await message.answer(
+            "این فایل قبلاً به‌عنوان فیش ثبت شده است و امکان استفاده دوباره از آن وجود ندارد."
         )
         return
 
-    plan = PlanTier(plan_value)
     username_text = f"@{html.escape(db_user.username)}" if db_user.username else "ندارد"
-    await bot.send_message(
-        settings.admin_telegram_id,
-        "درخواست جدید خرید اشتراک 💎\n\n"
-        f"شناسه کاربر: <code>{db_user.telegram_id}</code>\n"
+    caption = (
+        "فیش پرداخت جدید 🧾\n\n"
+        f"شماره فیش: <code>{to_persian_digits(receipt_id)}</code>\n"
+        f"شناسه کاربر: <code>{to_persian_digits(db_user.telegram_id)}</code>\n"
         f"نام کاربری: {username_text}\n"
-        f"پلن درخواستی: <b>{PLAN_NAMES[plan]}</b>",
+        f"پلن: <b>{html.escape(plan.name)}</b>\n"
+        f"مبلغ مورد انتظار: <b>{format_count(plan.price)} تومان</b>\n"
+        f"مدت: {to_persian_digits(plan.duration_days)} روز\n"
+        "وضعیت: در انتظار بررسی مدیر"
     )
-    await callback.answer("درخواست شما برای مدیر ارسال شد. ✅", show_alert=True)
+    markup = receipt_review_keyboard(receipt_id)
+    try:
+        if file_type == "photo":
+            await bot.send_photo(
+                settings.admin_telegram_id,
+                file_id,
+                caption=caption,
+                reply_markup=markup,
+            )
+        else:
+            await bot.send_document(
+                settings.admin_telegram_id,
+                file_id,
+                caption=caption,
+                reply_markup=markup,
+            )
+    except TelegramAPIError:
+        logger.exception(
+            "Could not deliver receipt %s to the administrator", receipt_id
+        )
+    await state.clear()
+    await message.answer(
+        "فیش شما ثبت و برای مدیر ارسال شد. پس از بررسی، نتیجه در همین ربات اعلام می‌شود. ✅",
+        reply_markup=main_menu_keyboard(is_admin=False),
+    )
+
+
+@router.message(PurchaseState.waiting_for_receipt)
+async def reject_invalid_receipt(message: Message) -> None:
+    await message.answer(
+        "لطفاً تصویر فیش یا فایل PDF را ارسال کنید؛ برای خروج «لغو عملیات» را بزنید."
+    )
 
 
 @router.message(F.text == "حساب کاربری 👤")
@@ -1265,22 +1573,36 @@ async def account_info(
                 TargetPage.user_id == db_user.telegram_id
             )
         )
-    validity = (
-        "فعال ✅"
-        if db_user.subscription_expiry > datetime.now(timezone.utc)
-        else "منقضی‌شده ❌"
-    )
+        subscription = await session.get(UserSubscription, db_user.telegram_id)
+    now = datetime.now(timezone.utc)
     is_admin = db_user.telegram_id == settings.admin_telegram_id
     role_text = "مدیر اصلی 🛡️" if is_admin else "کاربر"
+    if subscription is not None and subscription.expires_at > now:
+        plan_name = subscription.plan_name
+        target_limit = subscription.target_limit
+        validity = "فعال ✅"
+        expiry = format_datetime(subscription.expires_at)
+    elif is_admin or (
+        db_user.plan_tier != PlanTier.FREE and db_user.subscription_expiry > now
+    ):
+        plan_name = PLAN_NAMES[db_user.plan_tier]
+        target_limit = db_user.plan_tier.target_limit
+        validity = "فعال ✅"
+        expiry = format_datetime(db_user.subscription_expiry)
+    else:
+        plan_name = "رایگان"
+        target_limit = PlanTier.FREE.target_limit
+        validity = "فعال بدون انقضا ✅"
+        expiry = "بدون انقضا"
     await message.answer(
         "اطلاعات حساب کاربری 👤\n\n"
         f"شناسه تلگرام: <code>{to_persian_digits(db_user.telegram_id)}</code>\n"
         f"نقش: <b>{role_text}</b>\n"
-        f"پلن: <b>{PLAN_NAMES[db_user.plan_tier]}</b>\n"
+        f"پلن: <b>{html.escape(plan_name)}</b>\n"
         f"وضعیت اشتراک: {validity}\n"
-        f"تاریخ پایان: {format_datetime(db_user.subscription_expiry)}\n"
+        f"تاریخ پایان: {expiry}\n"
         f"تعداد پیج‌ها: {to_persian_digits(target_count or 0)} از "
-        f"{to_persian_digits(db_user.plan_tier.target_limit)}",
+        f"{to_persian_digits(target_limit)}",
         reply_markup=main_menu_keyboard(is_admin=is_admin),
     )
 

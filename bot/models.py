@@ -36,14 +36,20 @@ class PlanTier(str, enum.Enum):
     def target_limit(self) -> int:
         return {
             PlanTier.FREE: 1,
-            PlanTier.PREMIUM: 10,
-            PlanTier.VIP: 50,
+            PlanTier.PREMIUM: 100,
+            PlanTier.VIP: 500,
         }[self]
 
 
 class PageStatus(str, enum.Enum):
     ACTIVE = "Active"
     DEACTIVATED = "Deactivated"
+
+
+class ReceiptStatus(str, enum.Enum):
+    PENDING = "Pending"
+    APPROVED = "Approved"
+    REJECTED = "Rejected"
 
 
 class Base(DeclarativeBase):
@@ -207,3 +213,155 @@ class PageEvent(Base):
     )
 
     target_page: Mapped[TargetPage] = relationship(back_populates="events")
+
+
+class PageSnapshot(Base):
+    __tablename__ = "page_snapshots"
+
+    target_page_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("target_pages.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    profile_picture_key: Mapped[str | None] = mapped_column(String(1000))
+    profile_picture_url: Mapped[str | None] = mapped_column(String(2000))
+    full_name: Mapped[str | None] = mapped_column(String(255))
+    biography: Mapped[str | None] = mapped_column(String(2000))
+    follower_count: Mapped[int | None] = mapped_column(BigInteger)
+    following_count: Mapped[int | None] = mapped_column(BigInteger)
+    post_count: Mapped[int | None] = mapped_column(Integer)
+    is_private: Mapped[bool | None] = mapped_column(Boolean)
+    is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class RequiredChannel(Base):
+    __tablename__ = "required_channels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_identifier: Mapped[str] = mapped_column(
+        String(100), unique=True, nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(100), nullable=False)
+    join_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class SubscriptionPlan(Base):
+    __tablename__ = "subscription_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class UserSubscription(Base):
+    __tablename__ = "user_subscriptions"
+
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    plan_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("subscription_plans.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    plan_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    target_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class PaymentConfig(Base):
+    __tablename__ = "payment_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    support_username: Mapped[str | None] = mapped_column(String(64))
+    card_number: Mapped[str | None] = mapped_column(String(32))
+    card_holder: Mapped[str | None] = mapped_column(String(100))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class PaymentReceipt(Base):
+    __tablename__ = "payment_receipts"
+    __table_args__ = (
+        Index("ix_payment_receipts_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plan_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("subscription_plans.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    plan_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    file_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    file_unique_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, unique=True, index=True
+    )
+    file_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[ReceiptStatus] = mapped_column(
+        Enum(
+            ReceiptStatus,
+            name="receipt_status",
+            values_callable=lambda e: [item.value for item in e],
+        ),
+        nullable=False,
+        default=ReceiptStatus.PENDING,
+        index=True,
+    )
+    reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )

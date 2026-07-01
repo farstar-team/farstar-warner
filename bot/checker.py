@@ -10,23 +10,26 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
 from redis.exceptions import LockError
-from sqlalchemy import select
+from sqlalchemy import and_, case, func, select
 
 from bot.config import Settings
 from bot.database import SessionFactory
 from bot.models import (
     NotificationSettings,
     PageEvent,
+    PageSnapshot,
     PageStatus,
+    PlanTier,
     TargetPage,
     User,
+    UserSubscription,
     UserStatus,
 )
 
@@ -353,15 +356,54 @@ class InstagramChecker:
 
     async def _eligible_target_ids(self) -> list[int]:
         now = datetime.now(timezone.utc)
+        effective_limit = case(
+            (
+                and_(
+                    UserSubscription.expires_at.is_not(None),
+                    UserSubscription.expires_at > now,
+                ),
+                UserSubscription.target_limit,
+            ),
+            (
+                and_(
+                    User.plan_tier == PlanTier.VIP,
+                    User.subscription_expiry > now,
+                ),
+                PlanTier.VIP.target_limit,
+            ),
+            (
+                and_(
+                    User.plan_tier == PlanTier.PREMIUM,
+                    User.subscription_expiry > now,
+                ),
+                PlanTier.PREMIUM.target_limit,
+            ),
+            else_=PlanTier.FREE.target_limit,
+        )
+        ranked_targets = (
+            select(
+                TargetPage.id.label("target_id"),
+                func.row_number()
+                .over(
+                    partition_by=TargetPage.user_id,
+                    order_by=TargetPage.id,
+                )
+                .label("target_rank"),
+                effective_limit.label("target_limit"),
+            )
+            .join(User, User.telegram_id == TargetPage.user_id)
+            .outerjoin(
+                UserSubscription,
+                UserSubscription.user_id == User.telegram_id,
+            )
+            .where(User.status == UserStatus.ACTIVE)
+            .subquery()
+        )
         async with self.session_factory() as session:
             result = await session.scalars(
-                select(TargetPage.id)
-                .join(User, User.telegram_id == TargetPage.user_id)
-                .where(
-                    User.status == UserStatus.ACTIVE,
-                    User.subscription_expiry > now,
-                )
-                .order_by(TargetPage.id)
+                select(ranked_targets.c.target_id)
+                .where(ranked_targets.c.target_rank <= ranked_targets.c.target_limit)
+                .order_by(ranked_targets.c.target_id)
             )
             return list(result)
 
@@ -468,6 +510,42 @@ class InstagramChecker:
                             )
                         )
                 target.last_known_id = result.profile_id
+
+                snapshot = await session.get(PageSnapshot, target.id)
+                picture_key = self._profile_picture_key(result.profile_picture_url)
+                if snapshot is None:
+                    snapshot = PageSnapshot(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                    )
+                    session.add(snapshot)
+                elif (
+                    picture_key
+                    and snapshot.profile_picture_key
+                    and picture_key != snapshot.profile_picture_key
+                ):
+                    session.add(
+                        PageEvent(
+                            target_page_id=target.id,
+                            user_id=target.user_id,
+                            event_type="profile_picture_changed",
+                            description="تصویر پروفایل پیج تغییر کرد.",
+                        )
+                    )
+                    notifications.append(
+                        "عکس پروفایل پیج تغییر کرد! 🖼️\n\n"
+                        f"پیج: <b>@{html.escape(target.instagram_username)}</b>"
+                    )
+                if picture_key:
+                    snapshot.profile_picture_key = picture_key
+                    snapshot.profile_picture_url = result.profile_picture_url
+                snapshot.full_name = self._truncate(result.full_name, 255)
+                snapshot.biography = self._truncate(result.biography, 2000)
+                snapshot.follower_count = result.follower_count
+                snapshot.following_count = result.following_count
+                snapshot.post_count = result.post_count
+                snapshot.is_private = result.is_private
+                snapshot.is_verified = result.is_verified
 
             escaped_current = html.escape(target.instagram_username)
             escaped_previous = html.escape(previous_username)
@@ -579,6 +657,19 @@ class InstagramChecker:
         if isinstance(value, str) and value.isdigit():
             return int(value)
         return None
+
+    @staticmethod
+    def _profile_picture_key(value: str | None) -> str | None:
+        if not value:
+            return None
+        parsed = urlsplit(value)
+        return parsed.path or None
+
+    @staticmethod
+    def _truncate(value: str | None, limit: int) -> str | None:
+        if value is None:
+            return None
+        return value[:limit]
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> int | None:

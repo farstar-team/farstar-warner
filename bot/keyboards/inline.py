@@ -3,7 +3,13 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from bot.models import NotificationSettings, PageStatus, TargetPage
+from bot.models import (
+    NotificationSettings,
+    RequiredChannel,
+    SubscriptionPlan,
+    PageStatus,
+    TargetPage,
+)
 
 
 def _enabled_icon(enabled: bool) -> str:
@@ -247,6 +253,157 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def required_channels_keyboard(
+    channels: list[RequiredChannel],
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"عضویت در {channel.title} 📢", url=channel.join_url
+            )
+        ]
+        for channel in channels
+    ]
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="✅ بررسی دوباره عضویت",
+                callback_data="membership:check",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def purchase_plans_keyboard(plans: list[SubscriptionPlan]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for plan in plans:
+        price = f"{plan.price:,}".replace(",", "٬")
+        builder.button(
+            text=f"◈ {plan.name} — {price} تومان",
+            callback_data=f"buy:plan:{plan.id}",
+        )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def purchase_methods_keyboard(
+    plan_id: int,
+    support_username: str | None,
+    card_enabled: bool,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if card_enabled:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="💳 پرداخت کارت‌به‌کارت",
+                    callback_data=f"buy:card:{plan_id}",
+                )
+            ]
+        )
+    if support_username:
+        username = support_username.lstrip("@")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="👤 ارتباط با پشتیبانی",
+                    url=f"https://t.me/{username}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="↩️ بازگشت", callback_data="buy:list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def receipt_review_keyboard(receipt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ تأیید فیش و فعال‌سازی",
+                    callback_data=f"receipt:approve:{receipt_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ رد فیش",
+                    callback_data=f"receipt:reject:{receipt_id}",
+                )
+            ],
+        ]
+    )
+
+
+def admin_channels_keyboard(
+    channels: list[RequiredChannel],
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for channel in channels:
+        builder.button(
+            text=f"🗑 حذف {channel.title}",
+            callback_data=f"admin:channel:delete:{channel.id}",
+        )
+    builder.adjust(1)
+    builder.row(
+        InlineKeyboardButton(
+            text="➕ افزودن کانال اجباری",
+            callback_data="admin:channel:add",
+        )
+    )
+    builder.row(InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home"))
+    return builder.as_markup()
+
+
+def admin_plans_keyboard(plans: list[SubscriptionPlan]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for plan in plans:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"✏️ {plan.name}",
+                    callback_data=f"admin:planedit:{plan.id}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑",
+                    callback_data=f"admin:plandelete:{plan.id}",
+                ),
+            ]
+        )
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="➕ افزودن پلن",
+                    callback_data="admin:planadd",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payment_config_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ تغییر آیدی پشتیبانی",
+                    callback_data="admin:payment:support",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 تغییر مشخصات کارت",
+                    callback_data="admin:payment:card",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
+        ]
+    )
+
+
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -260,6 +417,30 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="◈ وضعیت اتصال اینستاگرام",
                     callback_data="admin:instagram_health",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📢 کانال‌های عضویت اجباری",
+                    callback_data="admin:channels",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💎 مدیریت پلن‌های اشتراک",
+                    callback_data="admin:plans",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💳 تنظیمات پرداخت",
+                    callback_data="admin:payment",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧾 فیش‌های در انتظار",
+                    callback_data="admin:receipts",
                 )
             ],
             [InlineKeyboardButton(text="آمار سیستم 📈", callback_data="admin:stats")],

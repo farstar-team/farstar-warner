@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import html
+import logging
 from datetime import datetime, timedelta, timezone
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -11,18 +14,40 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from redis.asyncio import Redis
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from bot.checker import CheckOutcome, InstagramChecker
 from bot.config import Settings
 from bot.database import SessionFactory
 from bot.handlers.user import AddPageState
-from bot.keyboards.inline import admin_panel_keyboard, admin_plan_keyboard
+from bot.keyboards.inline import (
+    admin_channels_keyboard,
+    admin_panel_keyboard,
+    admin_plan_keyboard,
+    admin_plans_keyboard,
+    payment_config_keyboard,
+    receipt_review_keyboard,
+)
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
-from bot.models import PageStatus, PlanTier, TargetPage, User, UserStatus
+from bot.models import (
+    PageEvent,
+    PageStatus,
+    PaymentConfig,
+    PaymentReceipt,
+    ReceiptStatus,
+    RequiredChannel,
+    SubscriptionPlan,
+    TargetPage,
+    User,
+    UserStatus,
+    UserSubscription,
+    PlanTier,
+)
 from bot.profile_preview import PreviewOutcome, ProfilePreviewService
 
 
 router = Router(name="admin")
+logger = logging.getLogger(__name__)
 PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 PLAN_NAMES = {
     PlanTier.FREE: "رایگان",
@@ -39,6 +64,25 @@ class AdminRenewState(StatesGroup):
 
 class AdminScheduleState(StatesGroup):
     waiting_for_interval = State()
+
+
+class AdminChannelState(StatesGroup):
+    waiting_for_identifier = State()
+    waiting_for_title = State()
+    waiting_for_url = State()
+
+
+class AdminPlanEditorState(StatesGroup):
+    waiting_for_name = State()
+    waiting_for_days = State()
+    waiting_for_price = State()
+    waiting_for_limit = State()
+
+
+class AdminPaymentState(StatesGroup):
+    waiting_for_support = State()
+    waiting_for_card_number = State()
+    waiting_for_card_holder = State()
 
 
 def _digits(value: object) -> str:
@@ -65,6 +109,16 @@ async def _reject_callback(callback: CallbackQuery, settings: Settings) -> bool:
         AdminRenewState.choosing_plan,
         AdminRenewState.waiting_for_days,
         AdminScheduleState.waiting_for_interval,
+        AdminChannelState.waiting_for_identifier,
+        AdminChannelState.waiting_for_title,
+        AdminChannelState.waiting_for_url,
+        AdminPlanEditorState.waiting_for_name,
+        AdminPlanEditorState.waiting_for_days,
+        AdminPlanEditorState.waiting_for_price,
+        AdminPlanEditorState.waiting_for_limit,
+        AdminPaymentState.waiting_for_support,
+        AdminPaymentState.waiting_for_card_number,
+        AdminPaymentState.waiting_for_card_holder,
     ),
     F.text == "لغو عملیات ↩️",
 )
@@ -93,6 +147,709 @@ async def admin_panel(message: Message, settings: Settings, state: FSMContext) -
         "پنل مدیریت اصلی فارستار وارنر 🛡️\n\nیک گزینه را انتخاب کنید:",
         reply_markup=admin_panel_keyboard(),
     )
+
+
+@router.callback_query(F.data == "admin:home")
+async def admin_home(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            "پنل مدیریت اصلی فارستار وارنر 🛡️\n\nیک گزینه را انتخاب کنید:",
+            reply_markup=admin_panel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:channels")
+async def admin_channels(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    async with session_factory() as session:
+        channels = list(
+            await session.scalars(select(RequiredChannel).order_by(RequiredChannel.id))
+        )
+    lines = ["کانال‌های عضویت اجباری 📢", ""]
+    if channels:
+        lines.extend(
+            f"• {channel.title} — <code>{channel.chat_identifier}</code>"
+            for channel in channels
+        )
+    else:
+        lines.append("هنوز کانالی ثبت نشده است.")
+    if callback.message:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=admin_channels_keyboard(channels),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:channel:add")
+async def begin_channel_add(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.set_state(AdminChannelState.waiting_for_identifier)
+    if callback.message:
+        await callback.message.answer(
+            "شناسه کانال را ارسال کنید. برای کانال عمومی <code>@channel</code> "
+            "و برای کانال خصوصی شناسه عددی مانند <code>-1001234567890</code> بفرستید.\n\n"
+            "ربات باید در کانال مدیر باشد.",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminChannelState.waiting_for_identifier)
+async def receive_channel_identifier(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    identifier = (message.text or "").strip()
+    valid = (
+        identifier.startswith("@")
+        and 2 <= len(identifier) <= 100
+        and identifier[1:].replace("_", "a").isalnum()
+    ) or (identifier.startswith("-100") and identifier[1:].isdigit())
+    if not valid:
+        await message.answer("شناسه کانال معتبر نیست؛ دوباره ارسال کنید.")
+        return
+    await state.update_data(channel_identifier=identifier)
+    await state.set_state(AdminChannelState.waiting_for_title)
+    await message.answer(
+        "عنوانی که کاربر ببیند را ارسال کنید؛ مانند «کانال رسمی فارستار»."
+    )
+
+
+@router.message(AdminChannelState.waiting_for_title)
+async def receive_channel_title(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    title = (message.text or "").strip()
+    if not 2 <= len(title) <= 100:
+        await message.answer("عنوان باید بین ۲ تا ۱۰۰ نویسه باشد.")
+        return
+    await state.update_data(channel_title=title)
+    await state.set_state(AdminChannelState.waiting_for_url)
+    await message.answer(
+        "لینک عضویت کانال را ارسال کنید؛ مانند <code>https://t.me/channel</code> "
+        "یا لینک دعوت خصوصی."
+    )
+
+
+@router.message(AdminChannelState.waiting_for_url)
+async def finish_channel_add(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    join_url = (message.text or "").strip()
+    if not join_url.startswith("https://t.me/") or len(join_url) > 500:
+        await message.answer("لینک باید با https://t.me/ شروع شود.")
+        return
+    data = await state.get_data()
+    try:
+        async with session_factory() as session:
+            session.add(
+                RequiredChannel(
+                    chat_identifier=data["channel_identifier"],
+                    title=data["channel_title"],
+                    join_url=join_url,
+                )
+            )
+            await session.commit()
+    except IntegrityError:
+        await message.answer("این کانال قبلاً ثبت شده است.")
+        return
+    await state.clear()
+    await message.answer(
+        "کانال اجباری ثبت شد. ✅",
+        reply_markup=main_menu_keyboard(is_admin=True),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:channel:delete:"))
+async def delete_required_channel(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    channel_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        channel = await session.get(RequiredChannel, channel_id)
+        if channel is not None:
+            await session.delete(channel)
+            await session.commit()
+    await callback.answer("کانال حذف شد. ✅", show_alert=True)
+    if callback.message:
+        await callback.message.edit_text(
+            "کانال حذف شد. برای مشاهده فهرست به پنل بازگردید.",
+            reply_markup=admin_panel_keyboard(),
+        )
+
+
+async def _show_admin_plans(
+    callback: CallbackQuery,
+    session_factory: SessionFactory,
+) -> None:
+    async with session_factory() as session:
+        plans = list(
+            await session.scalars(
+                select(SubscriptionPlan).order_by(
+                    SubscriptionPlan.price, SubscriptionPlan.id
+                )
+            )
+        )
+    lines = ["مدیریت پلن‌های اشتراک 💎", ""]
+    if plans:
+        for plan in plans:
+            state_text = "فعال" if plan.is_active else "غیرفعال"
+            lines.append(
+                f"• <b>{plan.name}</b> — {_digits(plan.duration_days)} روز — "
+                f"{_digits(f'{plan.price:,}')} تومان — {_digits(plan.target_limit)} پیج — {state_text}"
+            )
+    else:
+        lines.append("هنوز پلنی تعریف نشده است.")
+    if callback.message:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=admin_plans_keyboard(plans),
+        )
+
+
+@router.callback_query(F.data == "admin:plans")
+async def admin_plans(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await _show_admin_plans(callback, session_factory)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:planadd")
+async def begin_plan_add(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.clear()
+    await state.update_data(plan_edit_id=None)
+    await state.set_state(AdminPlanEditorState.waiting_for_name)
+    if callback.message:
+        await callback.message.answer(
+            "نام پلن را ارسال کنید؛ مانند «پریمیوم یک‌ماهه».",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:planedit:"))
+async def begin_plan_edit(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    plan_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id)
+    if plan is None:
+        await callback.answer("پلن پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(plan_edit_id=plan.id)
+    await state.set_state(AdminPlanEditorState.waiting_for_name)
+    if callback.message:
+        await callback.message.answer(
+            f"ویرایش پلن <b>{plan.name}</b>\n\nنام جدید پلن را ارسال کنید:",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminPlanEditorState.waiting_for_name)
+async def receive_plan_name(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    name = (message.text or "").strip()
+    if not 2 <= len(name) <= 80:
+        await message.answer("نام پلن باید بین ۲ تا ۸۰ نویسه باشد.")
+        return
+    await state.update_data(plan_name=name)
+    await state.set_state(AdminPlanEditorState.waiting_for_days)
+    await message.answer("مدت پلن را به روز وارد کنید؛ عددی بین ۱ تا ۳۶۵۰.")
+
+
+@router.message(AdminPlanEditorState.waiting_for_days)
+async def receive_plan_days(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        days = int((message.text or "").strip())
+        if not 1 <= days <= 3650:
+            raise ValueError
+    except ValueError:
+        await message.answer("تعداد روز باید عددی بین ۱ تا ۳۶۵۰ باشد.")
+        return
+    await state.update_data(plan_days=days)
+    await state.set_state(AdminPlanEditorState.waiting_for_price)
+    await message.answer("قیمت پلن را به تومان و فقط به‌صورت عدد وارد کنید.")
+
+
+@router.message(AdminPlanEditorState.waiting_for_price)
+async def receive_plan_price(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        price = int((message.text or "").replace(",", "").strip())
+        if not 0 <= price <= 10_000_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer("قیمت معتبر نیست؛ فقط عدد تومان را وارد کنید.")
+        return
+    await state.update_data(plan_price=price)
+    await state.set_state(AdminPlanEditorState.waiting_for_limit)
+    await message.answer(
+        "حداکثر تعداد پیج این پلن را وارد کنید؛ برای Premium عدد ۱۰۰ پیشنهاد می‌شود."
+    )
+
+
+@router.message(AdminPlanEditorState.waiting_for_limit)
+async def finish_plan_editor(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        target_limit = int((message.text or "").strip())
+        if not 1 <= target_limit <= 10000:
+            raise ValueError
+    except ValueError:
+        await message.answer("ظرفیت باید عددی بین ۱ تا ۱۰۰۰۰ باشد.")
+        return
+    data = await state.get_data()
+    try:
+        async with session_factory() as session:
+            plan_id = data.get("plan_edit_id")
+            plan = await session.get(SubscriptionPlan, plan_id) if plan_id else None
+            if plan is None:
+                plan = SubscriptionPlan(name=data["plan_name"])
+                session.add(plan)
+            plan.name = data["plan_name"]
+            plan.duration_days = data["plan_days"]
+            plan.price = data["plan_price"]
+            plan.target_limit = target_limit
+            plan.is_active = True
+            await session.commit()
+    except IntegrityError:
+        await message.answer("پلنی با این نام از قبل وجود دارد.")
+        return
+    await state.clear()
+    await message.answer(
+        "پلن با موفقیت ذخیره شد. ✅",
+        reply_markup=main_menu_keyboard(is_admin=True),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:plandelete:"))
+async def delete_plan(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    plan_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id)
+        if plan is not None:
+            await session.delete(plan)
+            await session.commit()
+    await callback.answer("پلن حذف شد. ✅", show_alert=True)
+    if callback.message:
+        await callback.message.edit_text(
+            "پلن حذف شد.", reply_markup=admin_panel_keyboard()
+        )
+
+
+@router.callback_query(F.data == "admin:payment")
+async def admin_payment_config(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    async with session_factory() as session:
+        payment = await session.get(PaymentConfig, 1)
+    support = (
+        html.escape(payment.support_username)
+        if payment and payment.support_username
+        else "ثبت نشده"
+    )
+    card = (
+        html.escape(payment.card_number)
+        if payment and payment.card_number
+        else "ثبت نشده"
+    )
+    holder = (
+        html.escape(payment.card_holder)
+        if payment and payment.card_holder
+        else "ثبت نشده"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            "تنظیمات پرداخت 💳\n\n"
+            f"آیدی پشتیبانی: <b>{support}</b>\n"
+            f"شماره کارت: <code>{card}</code>\n"
+            f"نام صاحب کارت: <b>{holder}</b>",
+            reply_markup=payment_config_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:payment:support")
+async def begin_support_edit(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.set_state(AdminPaymentState.waiting_for_support)
+    if callback.message:
+        await callback.message.answer(
+            "آیدی پشتیبانی را با @ ارسال کنید.", reply_markup=cancel_keyboard()
+        )
+    await callback.answer()
+
+
+@router.message(AdminPaymentState.waiting_for_support)
+async def finish_support_edit(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    username = (message.text or "").strip()
+    if (
+        not username.startswith("@")
+        or not 2 <= len(username) <= 64
+        or not username[1:].replace("_", "a").isalnum()
+    ):
+        await message.answer("آیدی معتبر نیست؛ نمونه: @support")
+        return
+    async with session_factory() as session:
+        payment = await session.get(PaymentConfig, 1)
+        if payment is None:
+            payment = PaymentConfig(id=1)
+            session.add(payment)
+        payment.support_username = username
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        "آیدی پشتیبانی ذخیره شد. ✅", reply_markup=main_menu_keyboard(is_admin=True)
+    )
+
+
+@router.callback_query(F.data == "admin:payment:card")
+async def begin_card_edit(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.set_state(AdminPaymentState.waiting_for_card_number)
+    if callback.message:
+        await callback.message.answer(
+            "شماره کارت را فقط به‌صورت عدد ارسال کنید.", reply_markup=cancel_keyboard()
+        )
+    await callback.answer()
+
+
+@router.message(AdminPaymentState.waiting_for_card_number)
+async def receive_card_number(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    card = (message.text or "").replace(" ", "").replace("-", "")
+    if not card.isdigit() or not 16 <= len(card) <= 19:
+        await message.answer("شماره کارت باید ۱۶ تا ۱۹ رقم باشد.")
+        return
+    await state.update_data(payment_card_number=card)
+    await state.set_state(AdminPaymentState.waiting_for_card_holder)
+    await message.answer("نام و نام خانوادگی صاحب کارت را ارسال کنید.")
+
+
+@router.message(AdminPaymentState.waiting_for_card_holder)
+async def finish_card_edit(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    holder = (message.text or "").strip()
+    if not 2 <= len(holder) <= 100:
+        await message.answer("نام صاحب کارت معتبر نیست.")
+        return
+    data = await state.get_data()
+    async with session_factory() as session:
+        payment = await session.get(PaymentConfig, 1)
+        if payment is None:
+            payment = PaymentConfig(id=1)
+            session.add(payment)
+        payment.card_number = data["payment_card_number"]
+        payment.card_holder = holder
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        "مشخصات کارت ذخیره شد. ✅", reply_markup=main_menu_keyboard(is_admin=True)
+    )
+
+
+@router.callback_query(F.data == "admin:receipts")
+async def pending_receipts(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+    bot: Bot,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    async with session_factory() as session:
+        receipts = list(
+            await session.scalars(
+                select(PaymentReceipt)
+                .where(PaymentReceipt.status == ReceiptStatus.PENDING)
+                .order_by(PaymentReceipt.created_at, PaymentReceipt.id)
+                .limit(20)
+            )
+        )
+    if not receipts:
+        await callback.answer("فیش در انتظاری وجود ندارد.", show_alert=True)
+        return
+    await callback.answer(f"{_digits(len(receipts))} فیش در انتظار است.")
+    for receipt in receipts:
+        caption = (
+            f"فیش شماره <code>{_digits(receipt.id)}</code> 🧾\n"
+            f"کاربر: <code>{_digits(receipt.user_id)}</code>\n"
+            f"پلن: <b>{html.escape(receipt.plan_name)}</b>\n"
+            f"مبلغ: <b>{_digits(f'{receipt.amount:,}')} تومان</b>"
+        )
+        try:
+            if receipt.file_type == "photo":
+                await bot.send_photo(
+                    callback.from_user.id,
+                    receipt.file_id,
+                    caption=caption,
+                    reply_markup=receipt_review_keyboard(receipt.id),
+                )
+            else:
+                await bot.send_document(
+                    callback.from_user.id,
+                    receipt.file_id,
+                    caption=caption,
+                    reply_markup=receipt_review_keyboard(receipt.id),
+                )
+        except TelegramAPIError:
+            await bot.send_message(
+                callback.from_user.id,
+                caption + "\n\nفایل فیش دیگر در دسترس تلگرام نیست.",
+            )
+
+
+async def _finalize_receipt_message(
+    callback: CallbackQuery,
+    result_text: str,
+) -> None:
+    if callback.message is None:
+        return
+    try:
+        if callback.message.caption is not None:
+            await callback.message.edit_caption(
+                caption=f"{callback.message.caption}\n\n{result_text}",
+                reply_markup=None,
+            )
+        else:
+            await callback.message.edit_text(result_text, reply_markup=None)
+    except TelegramAPIError:
+        await callback.message.answer(result_text)
+
+
+@router.callback_query(F.data.startswith("receipt:approve:"))
+async def approve_receipt(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+    bot: Bot,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    receipt_id = int((callback.data or "").rsplit(":", 1)[1])
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        receipt = await session.scalar(
+            select(PaymentReceipt)
+            .where(PaymentReceipt.id == receipt_id)
+            .with_for_update()
+        )
+        if receipt is None:
+            await callback.answer("فیش پیدا نشد.", show_alert=True)
+            return
+        if receipt.status != ReceiptStatus.PENDING:
+            await callback.answer("این فیش قبلاً بررسی شده است.", show_alert=True)
+            return
+        user = await session.scalar(
+            select(User).where(User.telegram_id == receipt.user_id).with_for_update()
+        )
+        if user is None:
+            await callback.answer("حساب کاربر پیدا نشد.", show_alert=True)
+            return
+        subscription = await session.get(UserSubscription, user.telegram_id)
+        current_expiry = (
+            subscription.expires_at
+            if subscription is not None and subscription.expires_at > now
+            else now
+        )
+        new_expiry = current_expiry + timedelta(days=receipt.duration_days)
+        if subscription is None:
+            subscription = UserSubscription(
+                user_id=user.telegram_id,
+                plan_name=receipt.plan_name,
+                target_limit=receipt.target_limit,
+                starts_at=now,
+                expires_at=new_expiry,
+            )
+            session.add(subscription)
+        subscription.plan_id = receipt.plan_id
+        subscription.plan_name = receipt.plan_name
+        subscription.target_limit = receipt.target_limit
+        subscription.starts_at = now
+        subscription.expires_at = new_expiry
+        user.status = UserStatus.ACTIVE
+        user.plan_tier = (
+            PlanTier.PREMIUM if receipt.target_limit <= 100 else PlanTier.VIP
+        )
+        user.subscription_expiry = new_expiry
+        receipt.status = ReceiptStatus.APPROVED
+        receipt.reviewed_by = callback.from_user.id
+        receipt.reviewed_at = now
+        await session.commit()
+        recipient_id = user.telegram_id
+        plan_name = receipt.plan_name
+        duration_days = receipt.duration_days
+
+    try:
+        await bot.send_message(
+            recipient_id,
+            "فیش پرداخت شما تأیید شد. ✅\n\n"
+            f"پلن فعال: <b>{html.escape(plan_name)}</b>\n"
+            f"مدت افزوده‌شده: {_digits(duration_days)} روز\n"
+            f"تاریخ پایان: {_digits(new_expiry.strftime('%Y/%m/%d - %H:%M'))} به وقت جهانی",
+        )
+    except TelegramAPIError:
+        logger.exception(
+            "Could not notify user %s about receipt approval", recipient_id
+        )
+    await _finalize_receipt_message(callback, "✅ فیش تأیید و اشتراک فعال شد.")
+    await callback.answer("اشتراک کاربر فعال شد. ✅", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("receipt:reject:"))
+async def reject_receipt(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+    bot: Bot,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    receipt_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        receipt = await session.scalar(
+            select(PaymentReceipt)
+            .where(PaymentReceipt.id == receipt_id)
+            .with_for_update()
+        )
+        if receipt is None:
+            await callback.answer("فیش پیدا نشد.", show_alert=True)
+            return
+        if receipt.status != ReceiptStatus.PENDING:
+            await callback.answer("این فیش قبلاً بررسی شده است.", show_alert=True)
+            return
+        receipt.status = ReceiptStatus.REJECTED
+        receipt.reviewed_by = callback.from_user.id
+        receipt.reviewed_at = datetime.now(timezone.utc)
+        recipient_id = receipt.user_id
+        await session.commit()
+
+    try:
+        await bot.send_message(
+            recipient_id,
+            "فیش پرداخت شما تأیید نشد. ❌\n\n"
+            "لطفاً مبلغ، شماره مقصد و خوانابودن فیش را بررسی کنید یا با پشتیبانی تماس بگیرید.",
+        )
+    except TelegramAPIError:
+        logger.exception(
+            "Could not notify user %s about receipt rejection", recipient_id
+        )
+    await _finalize_receipt_message(callback, "❌ فیش توسط مدیر رد شد.")
+    await callback.answer("فیش رد شد.", show_alert=True)
 
 
 @router.callback_query(F.data == "admin:add_target")
@@ -218,6 +975,26 @@ async def system_stats(
             .select_from(TargetPage)
             .where(TargetPage.last_known_status == PageStatus.DEACTIVATED)
         )
+        active_plans = await session.scalar(
+            select(func.count())
+            .select_from(SubscriptionPlan)
+            .where(SubscriptionPlan.is_active.is_(True))
+        )
+        pending_receipt_count = await session.scalar(
+            select(func.count())
+            .select_from(PaymentReceipt)
+            .where(PaymentReceipt.status == ReceiptStatus.PENDING)
+        )
+        events_24h = await session.scalar(
+            select(func.count())
+            .select_from(PageEvent)
+            .where(PageEvent.created_at >= now - timedelta(hours=24))
+        )
+        required_channels = await session.scalar(
+            select(func.count())
+            .select_from(RequiredChannel)
+            .where(RequiredChannel.is_active.is_(True))
+        )
 
     text = (
         "آمار سیستم 📈\n\n"
@@ -226,7 +1003,11 @@ async def system_stats(
         f"اشتراک‌های معتبر: {_digits(valid_subscriptions or 0)}\n\n"
         f"کل پیج‌ها: {_digits(total_pages or 0)}\n"
         f"پیج‌های فعال: {_digits(active_pages or 0)}\n"
-        f"پیج‌های دی‌اکتیو: {_digits(deactivated_pages or 0)}"
+        f"پیج‌های دی‌اکتیو: {_digits(deactivated_pages or 0)}\n"
+        f"رخدادهای ۲۴ ساعت اخیر: {_digits(events_24h or 0)}\n\n"
+        f"پلن‌های فروش فعال: {_digits(active_plans or 0)}\n"
+        f"فیش‌های در انتظار: {_digits(pending_receipt_count or 0)}\n"
+        f"کانال‌های عضویت اجباری: {_digits(required_channels or 0)}"
     )
     if callback.message:
         await callback.message.edit_text(text, reply_markup=admin_panel_keyboard())
@@ -342,6 +1123,21 @@ async def finish_renew_subscription(
         user.plan_tier = plan
         user.status = UserStatus.ACTIVE
         new_expiry = user.subscription_expiry
+        subscription = await session.get(UserSubscription, user.telegram_id)
+        if subscription is None:
+            subscription = UserSubscription(
+                user_id=user.telegram_id,
+                plan_name=PLAN_NAMES[plan],
+                target_limit=plan.target_limit,
+                starts_at=now,
+                expires_at=new_expiry,
+            )
+            session.add(subscription)
+        subscription.plan_id = None
+        subscription.plan_name = PLAN_NAMES[plan]
+        subscription.target_limit = plan.target_limit
+        subscription.starts_at = now
+        subscription.expires_at = new_expiry
         await session.commit()
 
     await state.clear()

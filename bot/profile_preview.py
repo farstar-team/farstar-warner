@@ -5,7 +5,6 @@ import io
 import json
 import logging
 import re
-import textwrap
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
@@ -448,12 +447,19 @@ class ProfilePreviewService:
             profile.biography
             or "Biography is not exposed by the public Instagram surface."
         )
-        wrapped = textwrap.wrap(biography, width=48)[:4]
+        wrapped = cls._wrap_for_width(draw, biography, small, 800)[:4]
         y = 1010
         for line in wrapped:
-            draw.text(
-                (135, y), cls._display(line), font=small, fill="#ffffff", anchor="la"
-            )
+            if re.search(r"[\u0600-\u06ff]", line):
+                cls._draw_rtl_words(draw, line, 940, y, small, "#ffffff")
+            else:
+                draw.text(
+                    (135, y),
+                    line,
+                    font=small,
+                    fill="#ffffff",
+                    anchor="la",
+                )
             y += 48
 
         verified = "VERIFIED PROFILE" if profile.is_verified else "NOT VERIFIED"
@@ -472,13 +478,14 @@ class ProfilePreviewService:
     @staticmethod
     def _font(size: int, *, bold: bool) -> ImageFont.FreeTypeFont:
         names = (
-            "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"
-            if bold
-            else "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
-            "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
             if bold
             else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "C:/Windows/Fonts/tahomabd.ttf" if bold else "C:/Windows/Fonts/tahoma.ttf",
+            "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
         )
         for name in names:
             if Path(name).exists():
@@ -510,6 +517,53 @@ class ProfilePreviewService:
         if fallback:
             return fallback
         return "UNKNOWN"
+
+    @classmethod
+    def _wrap_for_width(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        value: str,
+        font: ImageFont.FreeTypeFont,
+        max_width: int,
+    ) -> list[str]:
+        lines: list[str] = []
+        for paragraph in value.splitlines() or [value]:
+            words = paragraph.split()
+            if not words:
+                lines.append("")
+                continue
+            current = words[0]
+            for word in words[1:]:
+                candidate = f"{current} {word}"
+                rendered = cls._display(candidate)
+                box = draw.textbbox((0, 0), rendered, font=font)
+                if box[2] - box[0] <= max_width:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+            lines.append(current)
+        return lines
+
+    @classmethod
+    def _draw_rtl_words(
+        cls,
+        draw: ImageDraw.ImageDraw,
+        value: str,
+        right: int,
+        y: int,
+        font: ImageFont.FreeTypeFont,
+        fill: str,
+    ) -> None:
+        space_box = draw.textbbox((0, 0), " ", font=font)
+        space_width = max(space_box[2] - space_box[0], font.size // 3)
+        cursor = right
+        for word in value.split():
+            rendered = cls._rtl(word)
+            box = draw.textbbox((0, 0), rendered, font=font)
+            width = box[2] - box[0]
+            draw.text((cursor, y), rendered, font=font, fill=fill, anchor="ra")
+            cursor -= width + space_width
 
     @classmethod
     def _avatar(
