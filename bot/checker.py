@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
+from collections.abc import Awaitable, Callable
 
 import httpx
 from aiogram import Bot
@@ -21,7 +22,14 @@ from sqlalchemy import select
 
 from bot.config import Settings
 from bot.database import SessionFactory
-from bot.models import NotificationSettings, PageStatus, TargetPage, User, UserStatus
+from bot.models import (
+    NotificationSettings,
+    PageEvent,
+    PageStatus,
+    TargetPage,
+    User,
+    UserStatus,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +73,8 @@ class ProfileResult:
 class InstagramChecker:
     LOCK_KEY = "farstar:checker:lock"
     STATUS_COOLDOWN_KEY = "farstar:checker:status-cooldown"
+    ACCESS_ALERT_KEY = "farstar:checker:access-alert"
+    DEACTIVATION_STREAK_PREFIX = "farstar:checker:deactivation-streak:"
     LOCK_TIMEOUT_SECONDS = 120
 
     def __init__(
@@ -90,6 +100,14 @@ class InstagramChecker:
         )
         self._rate_limited = asyncio.Event()
         self._lock_lost = asyncio.Event()
+        self._browser_probe: Callable[[str], Awaitable[ProfileResult]] | None = None
+
+    def set_browser_probe(
+        self,
+        probe: Callable[[str], Awaitable[ProfileResult]],
+    ) -> None:
+        """Attach the rendered public-page fallback after both services exist."""
+        self._browser_probe = probe
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -120,7 +138,7 @@ class InstagramChecker:
             response = await self._client.get(url, headers=headers)
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             logger.warning("Instagram request failed for %s: %s", username, exc)
-            return ProfileResult(CheckOutcome.UNKNOWN)
+            return await self._browser_fallback(username)
 
         status_code = response.status_code
         if status_code == 429:
@@ -135,6 +153,12 @@ class InstagramChecker:
             return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
         if status_code == 200:
             profile_id = self._extract_first(PROFILE_ID_PATTERNS, response.text)
+            if self._looks_like_login_wall(response.text, profile_id):
+                logger.info("Instagram returned a login surface for %s", username)
+                return await self._browser_fallback(
+                    username,
+                    http_status=status_code,
+                )
             return ProfileResult(
                 CheckOutcome.ACTIVE,
                 canonical_username=username,
@@ -147,7 +171,74 @@ class InstagramChecker:
             status_code,
             username,
         )
-        return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+        return await self._browser_fallback(username, http_status=status_code)
+
+    async def _browser_fallback(
+        self,
+        username: str,
+        *,
+        http_status: int | None = None,
+    ) -> ProfileResult:
+        """Use rendered public content only when the lightweight probe is inconclusive."""
+        if self._browser_probe is None:
+            return ProfileResult(CheckOutcome.UNKNOWN, http_status=http_status)
+        try:
+            result = await self._browser_probe(username)
+        except Exception:
+            logger.exception("Rendered public probe failed for %s", username)
+            return ProfileResult(CheckOutcome.UNKNOWN, http_status=http_status)
+        if result.http_status is None and http_status is not None:
+            result = ProfileResult(
+                outcome=result.outcome,
+                canonical_username=result.canonical_username,
+                profile_id=result.profile_id,
+                retry_after=result.retry_after,
+                http_status=http_status,
+            )
+        if result.outcome == CheckOutcome.UNKNOWN:
+            await self._alert_access_issue(username, http_status)
+        return result
+
+    @staticmethod
+    def _looks_like_login_wall(value: str, profile_id: str | None) -> bool:
+        if profile_id:
+            return False
+        lowered = value.lower()
+        login_markers = (
+            'id="loginform"',
+            "accounts/login/?next=",
+            "log in • instagram",
+            '"login_required"',
+        )
+        profile_markers = (
+            "view full profile on instagram",
+            "profile picture",
+        )
+        return any(marker in lowered for marker in login_markers) and not any(
+            marker in lowered for marker in profile_markers
+        )
+
+    async def _alert_access_issue(
+        self,
+        username: str,
+        http_status: int | None,
+    ) -> None:
+        should_alert = await self.redis.set(
+            self.ACCESS_ALERT_KEY,
+            "1",
+            ex=3600,
+            nx=True,
+        )
+        if not should_alert:
+            return
+        status_text = str(http_status) if http_status is not None else "بدون پاسخ"
+        await self._notify(
+            self.settings.admin_telegram_id,
+            "دسترسی عمومی اینستاگرام پاسخ قطعی نداد. ⚠️\n\n"
+            f"نمونه پیج: <b>@{html.escape(username)}</b>\n"
+            f"کد HTTP: <code>{status_text}</code>\n"
+            "وضعیت پیج‌ها تغییر نکرد. لطفاً بخش «وضعیت اتصال اینستاگرام» را بررسی کنید.",
+        )
 
     async def run(self) -> None:
         if await self.redis.exists(self.STATUS_COOLDOWN_KEY):
@@ -251,6 +342,23 @@ class InstagramChecker:
             await self._activate_cooldown(result.retry_after)
             return
 
+        streak_key = f"{self.DEACTIVATION_STREAK_PREFIX}{target_id}"
+        if result.outcome == CheckOutcome.DEACTIVATED:
+            streak = await self.redis.incr(streak_key)
+            if streak == 1:
+                await self.redis.expire(streak_key, 86400)
+            if streak < self.settings.deactivation_confirmations:
+                logger.info(
+                    "Waiting for deactivation confirmation %s/%s for target %s",
+                    streak,
+                    self.settings.deactivation_confirmations,
+                    target_id,
+                )
+                return
+            await self.redis.delete(streak_key)
+        else:
+            await self.redis.delete(streak_key)
+
         notifications: list[str] = []
         recipient_id: int | None = None
         async with self.session_factory() as session:
@@ -291,29 +399,51 @@ class InstagramChecker:
             if (
                 previous_status == PageStatus.DEACTIVATED
                 and new_status == PageStatus.ACTIVE
-                and settings.notify_activation
             ):
-                notifications.append(
-                    f"پیج فعال شد! 🎉\n\nپیج: <b>@{escaped_current}</b>"
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="activated",
+                        description="پیج از وضعیت غیرفعال به فعال تغییر کرد.",
+                    )
                 )
+                if settings.notify_activation:
+                    notifications.append(
+                        f"پیج فعال شد! 🎉\n\nپیج: <b>@{escaped_current}</b>"
+                    )
             elif (
                 previous_status == PageStatus.ACTIVE
                 and new_status == PageStatus.DEACTIVATED
-                and settings.notify_deactivation
             ):
-                notifications.append(
-                    f"پیج دی‌اکتیو شد! ⚠️\n\nپیج: <b>@{escaped_current}</b>"
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="deactivated",
+                        description="پیج از وضعیت فعال به غیرفعال تغییر کرد.",
+                    )
                 )
+                if settings.notify_deactivation:
+                    notifications.append(
+                        f"پیج دی‌اکتیو شد! ⚠️\n\nپیج: <b>@{escaped_current}</b>"
+                    )
 
-            if (
-                canonical_username.lower() != previous_username.lower()
-                and settings.notify_username_change
-            ):
-                notifications.append(
-                    "نام کاربری پیج تغییر کرد! 🔄\n\n"
-                    f"نام قبلی: <b>@{escaped_previous}</b>\n"
-                    f"نام جدید: <b>@{escaped_current}</b>"
+            if canonical_username.lower() != previous_username.lower():
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="username_changed",
+                        description=f"نام کاربری از @{previous_username} به @{canonical_username} تغییر کرد.",
+                    )
                 )
+                if settings.notify_username_change:
+                    notifications.append(
+                        "نام کاربری پیج تغییر کرد! 🔄\n\n"
+                        f"نام قبلی: <b>@{escaped_previous}</b>\n"
+                        f"نام جدید: <b>@{escaped_current}</b>"
+                    )
 
             recipient_id = target.user_id
             await session.commit()

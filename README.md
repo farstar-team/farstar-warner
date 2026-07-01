@@ -19,16 +19,17 @@
 ### امکانات
 
 - رابط کاربری کاملاً فارسی با `aiogram 3`
-- پایش ناهمگام پیج‌های عمومی با `HTTPX`
+- پایش دومرحله‌ای پیج‌های عمومی با `HTTPX` و Chromium به‌عنوان مسیر تأیید نتیجه نامشخص
 - تشخیص تغییر وضعیت فعال و دی‌اکتیو
 - تنظیم جداگانه اعلان‌ها برای هر پیج
 - نمایش زنده عکس پروفایل، تعداد دنبال‌کننده، پست‌ها و عمومی یا خصوصی‌بودن پیج
 - نمایش بیوگرافی پیج عمومی در صورتی که نمای embed آن را ارائه کند
-- ساخت کارت تصویری اختصاصی هنگام ثبت پیج برای تأیید نام، عکس، آمار و بیوگرافی قابل‌دسترسی
+- ساخت کارت تصویری انگلیسی با طراحی شیشه‌ای هنگام ثبت پیج برای تأیید نام، عکس، آمار و بیوگرافی قابل‌دسترسی
 - امکان ثبت نام کاربری غیرفعال برای کاربرانی که منتظر فعال‌شدن آن هستند
 - پلن رایگان با ۱ پیج، پریمیوم با ۱۰ پیج و ویژه با ۵۰ پیج
 - شناسایی خودکار مدیر اصلی با پلن ویژه، منوی اختصاصی و اعتبار مدیریتی
-- پنل مدیریت برای مشاهده آمار، تمدید اشتراک، تغییر فاصله و اجرای بررسی فوری
+- پنل مدیریت برای افزودن پیج مدیر، مشاهده سلامت اتصال عمومی، آمار، تمدید اشتراک، تغییر فاصله و اجرای بررسی فوری
+- مرکز امنیت هر پیج با ۱۰ ابزار: بررسی فوری، امتیاز هشدار، ممیزی عمومی، اثرانگشت هویت، خط مبنا، تاریخچه رخداد، گزارش حادثه، تست اعلان، سلامت پایش و تصویر شواهد
 - PostgreSQL برای نگهداری کاربران، پیج‌ها و تنظیمات
 - Redis برای وضعیت‌های موقت ربات، قفل توزیع‌شده و کنترل محدودیت درخواست
 - زمان‌بندی بررسی‌ها با APScheduler
@@ -46,7 +47,9 @@ flowchart LR
     B --> P[("PostgreSQL")]
     B --> R[("Redis")]
     S["APScheduler"] --> C["InstagramChecker"]
-    C --> I["صفحه عمومی اینستاگرام"]
+    C --> H["HTTP public embed"]
+    H -->|"نتیجه نامشخص"| X["Chromium public render"]
+    X --> I["صفحه عمومی اینستاگرام"]
     C --> P
     C --> R
     C --> B
@@ -204,6 +207,8 @@ https://www.instagram.com/instagram/
 
 پس از انتخاب هر پیج، دکمه `مشاهده اطلاعات زنده پیج 🔎` در دسترس است. ربات در صورت دسترسی، عکس پروفایل، تعداد دنبال‌کننده، پست، عمومی یا خصوصی‌بودن، وضعیت تأیید و اطلاعات تکمیلی پیج عمومی را ارسال می‌کند.
 
+از دکمه `مرکز امنیت و شواهد پیج` نیز می‌توان ۱۰ ابزار دفاعی و گزارش‌گیری را اجرا کرد. خط مبنای هویت در Redis ذخیره می‌شود و اثر فعلی نام، بیوگرافی، تصویر، نوع پیج و نشان تأیید را با آن مقایسه می‌کند.
+
 هنگام افزودن پیج، ربات ابتدا آدرس `/embed/` را بدون ورود به حساب بررسی می‌کند:
 
 - اگر پیج فعال باشد، Chromium نمای عمومی را رندر می‌کند و ربات یک کارت تصویری اختصاصی برای تأیید کاربر می‌فرستد. پیج تنها پس از انتخاب «بله، همین پیج ثبت شود» ذخیره می‌شود.
@@ -224,6 +229,8 @@ https://www.instagram.com/instagram/
 - تمدید اشتراک کاربر و انتخاب پلن جدید
 - تغییر فاصله بررسی چکر بین ۳۰ تا ۸۶۴۰۰ ثانیه
 - قراردادن بررسی فوری همه پیج‌ها در صف اجرا
+- افزودن پیج به حساب پایش مدیر با همان جریان تأیید تصویری کاربران
+- مشاهده وضعیت Chromium، endpoint عمومی، cooldown و حالت ورود/عدم ورود
 
 حساب مدیر اصلی هنگام شروع برنامه به‌صورت خودکار فعال، روی پلن ویژه و با منوی اختصاصی ثبت می‌شود.
 
@@ -231,10 +238,10 @@ https://www.instagram.com/instagram/
 
 ### منطق پایش
 
-چکر برای هر پیج عمومی یک درخواست HTTPS ارسال می‌کند:
+چکر ابتدا برای هر پیج یک درخواست سبک HTTPS ارسال می‌کند. اگر نتیجه قطعی نباشد، همان نمای عمومی با Chromium رندر می‌شود:
 
 - انتقال وضعیت از دی‌اکتیو به فعال، اعلان `پیج فعال شد! 🎉` ایجاد می‌کند.
-- انتقال وضعیت از فعال به دی‌اکتیو، اعلان `پیج دی‌اکتیو شد! ⚠️` ایجاد می‌کند.
+- انتقال وضعیت از فعال به دی‌اکتیو پس از دو پاسخ قطعی متوالی، اعلان `پیج دی‌اکتیو شد! ⚠️` ایجاد می‌کند.
 - اولین بررسی فقط وضعیت پایه را ثبت می‌کند و اعلان تغییر وضعیت نمی‌فرستد.
 - پاسخ‌های ورود اجباری، چالش امنیتی، خطاهای شبکه و خطاهای موقت به‌عنوان وضعیت نامشخص در نظر گرفته می‌شوند و وضعیت ذخیره‌شده را تغییر نمی‌دهند.
 - در پاسخ `429` همه بررسی‌ها برای مدت مشخصی متوقف می‌شوند تا فشار بیشتری به سرویس وارد نشود.
@@ -263,6 +270,7 @@ https://www.instagram.com/instagram/
 | `REDIS_PASSWORD` | بله | — | رمز Redis |
 | `CHECK_INTERVAL_SECONDS` | خیر | `300` | فاصله اولیه بررسی‌ها؛ حداقل ۳۰ ثانیه |
 | `CHECK_CONCURRENCY` | خیر | `8` | تعداد بررسی هم‌زمان؛ بین ۱ تا ۵۰ |
+| `DEACTIVATION_CONFIRMATIONS` | خیر | `2` | تعداد پاسخ قطعی متوالی پیش از ثبت دی‌اکتیوشدن |
 | `CHECK_JITTER_MIN_SECONDS` | خیر | `0.5` | کمترین تأخیر تصادفی |
 | `CHECK_JITTER_MAX_SECONDS` | خیر | `3.0` | بیشترین تأخیر تصادفی |
 | `INSTAGRAM_BASE_URL` | خیر | `https://www.instagram.com` | نشانی پایه صفحات عمومی |
@@ -349,13 +357,14 @@ Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram p
 ### Main features
 
 - Asynchronous Telegram UI with aiogram 3
-- Public-profile checks with HTTPX
+- Two-stage public-profile checks with HTTPX and a rendered Chromium fallback for inconclusive responses
 - Activation, deactivation, and username-change notifications
 - On-demand profile card with photo, follower count, post count, privacy, verification, and biography when exposed by the public embed
 - Confirmation before saving active profiles and an explicit waiting-list path for inactive usernames
 - Per-profile notification settings
 - Free, Premium, and VIP target limits
-- Restricted administrator panel
+- Restricted administrator panel with admin target onboarding and public-access health diagnostics
+- Ten defensive per-profile tools for identity baselines, audit evidence, history, risk scoring, test alerts, health, and incident reports
 - Automatic primary-administrator provisioning with a dedicated menu
 - PostgreSQL persistence and Redis coordination
 - APScheduler background checks with jitter, bounded concurrency, distributed locking, and HTTP 429 cooldown
@@ -394,6 +403,6 @@ Open the bot and send `/start`. The configured administrator can access the rest
 
 ### Operational note
 
-Instagram can change public page behavior or apply temporary access restrictions at any time. Login redirects, challenge pages, network errors, and temporary server failures are treated as unknown results and do not overwrite the last known profile state. A `429` response activates a status-check-only Redis cooldown; profile previews use a separate cache and cannot pause monitoring.
+Instagram can change public page behavior or apply temporary access restrictions at any time. Login redirects, challenge pages, network errors, and temporary server failures are treated as unknown results and do not overwrite the last known profile state. Inconclusive HTTP results are verified through a rendered public page, and deactivation requires consecutive definitive responses. A `429` response activates a status-check-only Redis cooldown; profile previews use a separate cache and cannot pause monitoring.
 
 Use the software only for public profiles and in accordance with applicable law and platform terms.

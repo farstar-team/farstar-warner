@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import hashlib
+import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -26,12 +28,14 @@ from bot.keyboards.inline import (
     page_details_keyboard,
     pages_keyboard,
     registration_confirmation_keyboard,
+    security_tools_keyboard,
     settings_pages_keyboard,
     subscription_keyboard,
 )
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import (
     NotificationSettings,
+    PageEvent,
     PageStatus,
     PlanTier,
     TargetPage,
@@ -168,6 +172,86 @@ async def _load_pages(
             .order_by(TargetPage.created_at, TargetPage.id)
         )
         return list(result)
+
+
+async def _owned_page(
+    session_factory: SessionFactory,
+    user_id: int,
+    page_id: int,
+) -> TargetPage | None:
+    async with session_factory() as session:
+        return await session.scalar(
+            select(TargetPage).where(
+                TargetPage.id == page_id,
+                TargetPage.user_id == user_id,
+            )
+        )
+
+
+def _profile_fingerprint(details: EmbedProfile) -> tuple[str, dict[str, object]]:
+    identity: dict[str, object] = {
+        "username": details.username.lower(),
+        "full_name": details.full_name,
+        "biography": details.biography,
+        "profile_picture_url": details.profile_picture_url,
+        "is_private": details.is_private,
+        "is_verified": details.is_verified,
+    }
+    payload = json.dumps(
+        identity,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16].upper(), identity
+
+
+def _risk_score(
+    page: TargetPage,
+    details: EmbedProfile,
+    *,
+    baseline_exists: bool,
+    baseline_changed: bool,
+    interval_seconds: int,
+) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    if page.last_known_status == PageStatus.DEACTIVATED:
+        score += 70
+        reasons.append("وضعیت ذخیره‌شده پیج غیرفعال است")
+    if details.outcome != PreviewOutcome.ACTIVE:
+        score += 20
+        reasons.append("اطلاعات زنده عمومی در دسترس نیست")
+    else:
+        if not details.is_verified:
+            score += 5
+            reasons.append("پیج نشان تأیید عمومی ندارد")
+        if not details.biography:
+            score += 5
+            reasons.append("بیوگرافی در نمای عمومی دیده نشد")
+        if details.is_private is False:
+            score += 5
+            reasons.append("پیج عمومی است و سطح افشای بیشتری دارد")
+    if not baseline_exists:
+        score += 10
+        reasons.append("خط مبنای هویت ثبت نشده است")
+    elif baseline_changed:
+        score += 45
+        reasons.append("اثرانگشت هویت با خط مبنا تفاوت دارد")
+
+    if page.last_checked_at is None:
+        score += 10
+        reasons.append("هنوز بررسی زمان‌بندی‌شده ثبت نشده است")
+    else:
+        checked_at = page.last_checked_at
+        if checked_at.tzinfo is None:
+            checked_at = checked_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - checked_at).total_seconds() > max(
+            interval_seconds * 3, 300
+        ):
+            score += 15
+            reasons.append("آخرین بررسی از بازه مورد انتظار قدیمی‌تر است")
+    return min(score, 100), reasons or ["نشانه هشدار قابل‌توجهی دیده نشد"]
 
 
 def _add_guard_message(user: User, target_count: int) -> str | None:
@@ -308,9 +392,13 @@ async def add_page(
     await message.answer("در حال بررسی پیج و ساخت تصویر تأیید… لطفاً کمی صبر کنید.")
     status = await checker.fetch_profile(username)
     if status.outcome == CheckOutcome.ACTIVE:
-        preview = await profile_preview.inspect(username, use_cache=False)
+        preview = await profile_preview.inspect(username)
         if preview.outcome != PreviewOutcome.ACTIVE:
-            preview = EmbedProfile(PreviewOutcome.ACTIVE, username=username)
+            await message.answer(
+                "پیج فعال به نظر می‌رسد، اما تصویر و مشخصات عمومی آن برای تأیید دریافت نشد. "
+                "برای جلوگیری از ثبت پیج اشتباه، کمی بعد دوباره تلاش کنید."
+            )
+            return
         card = await profile_preview.render_card(preview)
         await state.update_data(
             pending_username=username,
@@ -420,6 +508,22 @@ async def confirm_page_registration(
             await session.flush()
             session.add(
                 NotificationSettings(user_id=user.telegram_id, target_page_id=target.id)
+            )
+            session.add(
+                PageEvent(
+                    target_page_id=target.id,
+                    user_id=user.telegram_id,
+                    event_type=(
+                        "registered_active"
+                        if page_status == PageStatus.ACTIVE
+                        else "registered_inactive"
+                    ),
+                    description=(
+                        "پیج فعال پس از تأیید کاربر ثبت شد."
+                        if page_status == PageStatus.ACTIVE
+                        else "نام کاربری غیرفعال برای انتظار فعال‌شدن ثبت شد."
+                    ),
+                )
             )
             await session.commit()
     except (IntegrityError, ValueError):
@@ -585,6 +689,304 @@ async def live_profile_details(
         )
     except TelegramAPIError:
         await callback.message.answer(caption)
+
+
+@router.callback_query(F.data.startswith("security:view:"))
+async def security_tools_menu(
+    callback: CallbackQuery,
+    db_user: User,
+    session_factory: SessionFactory,
+) -> None:
+    page_id = int((callback.data or "").rsplit(":", 1)[1])
+    page = await _owned_page(session_factory, db_user.telegram_id, page_id)
+    if page is None:
+        await callback.answer("این پیج پیدا نشد.", show_alert=True)
+        return
+    text = (
+        f"مرکز امنیت پیج <b>@{html.escape(page.instagram_username)}</b> 🛡️\n\n"
+        "بررسی زنده، امتیاز هشدار، ممیزی نمای عمومی، اثرانگشت هویت، "
+        "خط مبنا، تاریخچه رخداد، گزارش حادثه، تست اعلان، سلامت پایش و تصویر شواهد در دسترس است."
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text, reply_markup=security_tools_keyboard(page.id)
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("sec:"))
+async def run_security_tool(
+    callback: CallbackQuery,
+    db_user: User,
+    session_factory: SessionFactory,
+    checker: InstagramChecker,
+    profile_preview: ProfilePreviewService,
+    redis: Redis,
+    settings: Settings,
+) -> None:
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    action, page_id = parts[1], int(parts[2])
+    page = await _owned_page(session_factory, db_user.telegram_id, page_id)
+    if page is None:
+        await callback.answer("این پیج پیدا نشد.", show_alert=True)
+        return
+    if callback.message is None:
+        await callback.answer("نمایش نتیجه ممکن نیست.", show_alert=True)
+        return
+
+    await callback.answer("در حال اجرای بررسی…")
+    username = html.escape(page.instagram_username)
+    keyboard = security_tools_keyboard(page.id)
+
+    if action == "check":
+        result = await checker.fetch_profile(page.instagram_username)
+        current_names = {
+            CheckOutcome.ACTIVE: "فعال و قابل مشاهده ✅",
+            CheckOutcome.DEACTIVATED: "غیرفعال یا نام کاربری تغییر کرده ⚠️",
+            CheckOutcome.RATE_LIMITED: "محدودیت موقت درخواست ⚠️",
+            CheckOutcome.UNKNOWN: "نامشخص؛ وضعیت ذخیره‌شده تغییر نکرد",
+        }
+        await callback.message.answer(
+            f"بررسی فوری <b>@{username}</b>\n\n"
+            f"نتیجه زنده: <b>{current_names[result.outcome]}</b>\n"
+            f"کد HTTP: <code>{to_persian_digits(result.http_status) if result.http_status else 'ثبت نشد'}</code>\n"
+            f"وضعیت ذخیره‌شده: {PAGE_STATUS_NAMES[page.last_known_status]}",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "history":
+        async with session_factory() as session:
+            events = list(
+                await session.scalars(
+                    select(PageEvent)
+                    .where(
+                        PageEvent.target_page_id == page.id,
+                        PageEvent.user_id == db_user.telegram_id,
+                    )
+                    .order_by(PageEvent.created_at.desc(), PageEvent.id.desc())
+                    .limit(10)
+                )
+            )
+        lines = [f"تاریخچه رخدادهای <b>@{username}</b> 🧾", ""]
+        if events:
+            for event in events:
+                lines.append(
+                    f"• {format_datetime(event.created_at)}\n  {html.escape(event.description)}"
+                )
+        else:
+            lines.append("هنوز رخدادی ثبت نشده است.")
+        await callback.message.answer("\n".join(lines), reply_markup=keyboard)
+        return
+
+    if action == "testalert":
+        async with session_factory() as session:
+            session.add(
+                PageEvent(
+                    target_page_id=page.id,
+                    user_id=db_user.telegram_id,
+                    event_type="alert_test",
+                    description="آزمون دستی کانال اعلان با موفقیت اجرا شد.",
+                )
+            )
+            await session.commit()
+        await callback.message.answer(
+            f"این یک اعلان آزمایشی برای پیج <b>@{username}</b> است. 🔔\n\n"
+            "کانال ارسال اعلان ربات سالم است.",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "health":
+        stored_interval = await redis.get("farstar:checker:interval")
+        interval = int(stored_interval or settings.check_interval_seconds)
+        preview_ttl = await redis.ttl(
+            f"{profile_preview.CACHE_PREFIX}{page.instagram_username.lower()}"
+        )
+        cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
+        await callback.message.answer(
+            f"سلامت پایش <b>@{username}</b> 💠\n\n"
+            f"آخرین بررسی قطعی: {format_datetime(page.last_checked_at)}\n"
+            f"فاصله زمان‌بندی: {to_persian_digits(interval)} ثانیه\n"
+            f"کش اطلاعات زنده: {'فعال' if preview_ttl > 0 else 'غیرفعال'}"
+            + (f" — {to_persian_digits(preview_ttl)} ثانیه" if preview_ttl > 0 else "")
+            + "\n"
+            f"توقف موقت چکر: {'فعال' if cooldown_ttl > 0 else 'غیرفعال'}"
+            + (
+                f" — {to_persian_digits(cooldown_ttl)} ثانیه"
+                if cooldown_ttl > 0
+                else ""
+            )
+            + "\nحالت دسترسی: نمای عمومی بدون ورود",
+            reply_markup=keyboard,
+        )
+        return
+
+    details = await profile_preview.inspect(page.instagram_username, use_cache=False)
+    if details.outcome != PreviewOutcome.ACTIVE and action in {
+        "fingerprint",
+        "baseline",
+        "audit",
+    }:
+        await callback.message.answer(
+            f"اطلاعات عمومی <b>@{username}</b> برای اجرای این ابزار در دسترس نیست. "
+            "این نتیجه «نامشخص» است و به‌تنهایی به معنی دی‌اکتیوشدن پیج نیست.",
+            reply_markup=keyboard,
+        )
+        return
+
+    digest: str | None = None
+    identity: dict[str, object] = {}
+    if details.outcome == PreviewOutcome.ACTIVE:
+        digest, identity = _profile_fingerprint(details)
+    baseline_key = f"farstar:security:baseline:{db_user.telegram_id}:{page.id}"
+    baseline_raw = await redis.get(baseline_key)
+    baseline: dict[str, object] | None = None
+    if baseline_raw:
+        try:
+            parsed = json.loads(baseline_raw)
+            if isinstance(parsed, dict):
+                baseline = parsed
+        except json.JSONDecodeError:
+            await redis.delete(baseline_key)
+    baseline_digest = str(baseline.get("digest")) if baseline else None
+
+    if action == "fingerprint":
+        assert digest is not None
+        comparison = (
+            "خط مبنا ثبت نشده است"
+            if baseline_digest is None
+            else "مطابق خط مبنا ✅"
+            if baseline_digest == digest
+            else "با خط مبنا متفاوت است ⚠️"
+        )
+        await callback.message.answer(
+            f"اثرانگشت هویت <b>@{username}</b> 🧬\n\n"
+            f"اثر فعلی: <code>{digest}</code>\n"
+            f"مقایسه: <b>{comparison}</b>\n\n"
+            "اثر از نام کاربری، نام نمایشی، بیوگرافی، تصویر پروفایل، نوع پیج و نشان تأیید ساخته می‌شود.",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "baseline":
+        assert digest is not None
+        baseline_payload = {
+            "digest": digest,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "identity": identity,
+        }
+        await redis.set(
+            baseline_key,
+            json.dumps(baseline_payload, ensure_ascii=False, separators=(",", ":")),
+        )
+        async with session_factory() as session:
+            session.add(
+                PageEvent(
+                    target_page_id=page.id,
+                    user_id=db_user.telegram_id,
+                    event_type="baseline_saved",
+                    description=f"خط مبنای هویت با اثر {digest} ذخیره شد.",
+                )
+            )
+            await session.commit()
+        await callback.message.answer(
+            f"خط مبنای هویت <b>@{username}</b> ذخیره شد. ✅\n"
+            f"اثر مبنا: <code>{digest}</code>",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "audit":
+        await callback.message.answer(
+            f"ممیزی نمای عمومی <b>@{username}</b> 🔍\n\n"
+            f"نام نمایشی: <b>{html.escape(details.full_name or 'ثبت نشده')}</b>\n"
+            f"نوع پیج: <b>{'خصوصی 🔒' if details.is_private else 'عمومی 🌐'}</b>\n"
+            f"نشان تأیید: <b>{'دارد ✅' if details.is_verified else 'ندارد'}</b>\n"
+            f"تصویر پروفایل: <b>{'قابل مشاهده' if details.profile_picture_url else 'دیده نشد'}</b>\n"
+            f"بیوگرافی: <b>{'قابل مشاهده' if details.biography else 'دیده نشد'}</b>\n"
+            f"دنبال‌کننده: <b>{format_count(details.follower_count)}</b>\n"
+            f"پست: <b>{format_count(details.post_count)}</b>",
+            reply_markup=keyboard,
+        )
+        return
+
+    stored_interval = await redis.get("farstar:checker:interval")
+    interval = int(stored_interval or settings.check_interval_seconds)
+    score, reasons = _risk_score(
+        page,
+        details,
+        baseline_exists=baseline_digest is not None,
+        baseline_changed=(
+            digest is not None
+            and baseline_digest is not None
+            and baseline_digest != digest
+        ),
+        interval_seconds=interval,
+    )
+    if action == "score":
+        reasons_text = "\n".join(f"• {html.escape(reason)}" for reason in reasons)
+        await callback.message.answer(
+            f"امتیاز هشدار <b>@{username}</b>: <b>{to_persian_digits(score)} از ۱۰۰</b>\n\n"
+            f"{reasons_text}\n\n"
+            "این امتیاز یک شاخص عملیاتی تقریبی است و جایگزین بررسی تخصصی امنیتی نیست.",
+            reply_markup=keyboard,
+        )
+        return
+
+    if action == "report":
+        async with session_factory() as session:
+            events = list(
+                await session.scalars(
+                    select(PageEvent)
+                    .where(PageEvent.target_page_id == page.id)
+                    .order_by(PageEvent.created_at.desc(), PageEvent.id.desc())
+                    .limit(20)
+                )
+            )
+        report = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "page": {
+                "username": page.instagram_username,
+                "stored_status": page.last_known_status.value
+                if page.last_known_status
+                else None,
+                "last_checked_at": page.last_checked_at.isoformat()
+                if page.last_checked_at
+                else None,
+            },
+            "public_profile": identity
+            | {
+                "followers": details.follower_count,
+                "posts": details.post_count,
+            },
+            "identity_fingerprint": digest,
+            "baseline_fingerprint": baseline_digest,
+            "risk_score": score,
+            "risk_reasons": reasons,
+            "events": [
+                {
+                    "type": event.event_type,
+                    "description": event.description,
+                    "created_at": event.created_at.isoformat(),
+                }
+                for event in events
+            ],
+        }
+        payload = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+        await callback.message.answer_document(
+            BufferedInputFile(
+                payload, filename=f"farstar-incident-{page.instagram_username}.json"
+            ),
+            caption=f"گزارش امنیتی پیج <b>@{username}</b> آماده شد. 📄",
+            reply_markup=keyboard,
+        )
+        return
+
+    await callback.message.answer("این ابزار شناخته نشد.", reply_markup=keyboard)
 
 
 @router.callback_query(F.data.startswith("page:delete:"))

@@ -145,6 +145,11 @@ class TargetPage(Base):
         passive_deletes=True,
         uselist=False,
     )
+    events: Mapped[list[PageEvent]] = relationship(
+        back_populates="target_page",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class NotificationSettings(Base):
@@ -174,3 +179,31 @@ class NotificationSettings(Base):
     target_page: Mapped[TargetPage] = relationship(
         back_populates="notification_settings"
     )
+
+
+class PageEvent(Base):
+    __tablename__ = "page_events"
+    __table_args__ = (
+        Index("ix_page_events_target_created", "target_page_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_page_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("target_pages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+    target_page: Mapped[TargetPage] = relationship(back_populates="events")

@@ -34,6 +34,7 @@ class Settings(BaseSettings):
 
     check_interval_seconds: int = Field(default=300, ge=30, le=86400)
     check_concurrency: int = Field(default=8, ge=1, le=50)
+    deactivation_confirmations: int = Field(default=2, ge=1, le=5)
     check_jitter_min_seconds: float = Field(default=0.5, ge=0, le=30)
     check_jitter_max_seconds: float = Field(default=3.0, ge=0, le=60)
     instagram_base_url: str = "https://www.instagram.com"

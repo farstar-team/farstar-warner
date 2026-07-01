@@ -12,11 +12,14 @@ from apscheduler.triggers.interval import IntervalTrigger
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 
+from bot.checker import CheckOutcome, InstagramChecker
 from bot.config import Settings
 from bot.database import SessionFactory
+from bot.handlers.user import AddPageState
 from bot.keyboards.inline import admin_panel_keyboard, admin_plan_keyboard
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import PageStatus, PlanTier, TargetPage, User, UserStatus
+from bot.profile_preview import ProfilePreviewService
 
 
 router = Router(name="admin")
@@ -90,6 +93,71 @@ async def admin_panel(message: Message, settings: Settings, state: FSMContext) -
         "پنل مدیریت اصلی فارستار وارنر 🛡️\n\nیک گزینه را انتخاب کنید:",
         reply_markup=admin_panel_keyboard(),
     )
+
+
+@router.callback_query(F.data == "admin:add_target")
+async def begin_admin_add_target(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.set_state(AddPageState.waiting_for_username)
+    if callback.message:
+        await callback.message.answer(
+            "نام کاربری یا لینک پیج اینستاگرام را ارسال کنید.\n\n"
+            "پیج پس از تأیید تصویری در حساب پایش مدیر ثبت می‌شود.",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:instagram_health")
+async def instagram_connection_health(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+    profile_preview: ProfilePreviewService,
+    redis: Redis,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await callback.answer("در حال آزمایش مسیر عمومی اینستاگرام…")
+    browser_ok, browser_version = await profile_preview.browser_health()
+    result = await checker.fetch_profile("instagram")
+    cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
+
+    outcome_names = {
+        CheckOutcome.ACTIVE: "پاسخ معتبر دریافت شد ✅",
+        CheckOutcome.DEACTIVATED: "پاسخ ۴۰۴ دریافت شد",
+        CheckOutcome.RATE_LIMITED: "محدودیت درخواست فعال است ⚠️",
+        CheckOutcome.UNKNOWN: "پاسخ قطعی دریافت نشد ⚠️",
+    }
+    browser_text = (
+        f"فعال ✅ — نسخه {browser_version or 'نامشخص'}"
+        if browser_ok
+        else "غیرفعال یا در دسترس نیست ❌"
+    )
+    cooldown_text = (
+        f"فعال — {_digits(cooldown_ttl)} ثانیه باقی‌مانده"
+        if cooldown_ttl > 0
+        else "غیرفعال ✅"
+    )
+    http_text = _digits(result.http_status) if result.http_status else "ثبت نشد"
+    text = (
+        "وضعیت اتصال اینستاگرام 🌐\n\n"
+        "حالت دسترسی: <b>نمای عمومی بدون ورود</b>\n"
+        "وضعیت ورود: <b>وارد نشده</b>\n"
+        "ذخیره رمز یا کوکی: <b>غیرفعال</b>\n"
+        f"Chromium: <b>{browser_text}</b>\n"
+        f"نتیجه تست: <b>{outcome_names[result.outcome]}</b>\n"
+        f"کد HTTP: <code>{http_text}</code>\n"
+        f"توقف موقت چکر: <b>{cooldown_text}</b>\n\n"
+        "پاسخ نامشخص هیچ‌گاه وضعیت پیج را به دی‌اکتیو تغییر نمی‌دهد."
+    )
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=admin_panel_keyboard())
 
 
 @router.callback_query(F.data == "admin:stats")

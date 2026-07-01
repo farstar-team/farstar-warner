@@ -117,6 +117,7 @@ async def run() -> None:
     )
     checker = InstagramChecker(bot, session_factory, redis, settings)
     profile_preview = ProfilePreviewService(redis, settings)
+    checker.set_browser_probe(profile_preview.probe_status)
 
     try:
         await wait_for_dependencies(engine, redis)

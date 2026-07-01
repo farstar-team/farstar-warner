@@ -49,9 +49,67 @@ def page_details_keyboard(page_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="◈ مرکز امنیت و شواهد پیج",
+                    callback_data=f"security:view:{page_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🗑 حذف پیج", callback_data=f"page:delete:{page_id}"
                 ),
                 InlineKeyboardButton(text="↩️ بازگشت", callback_data="page:list"),
+            ],
+        ]
+    )
+
+
+def security_tools_keyboard(page_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="◈ بررسی فوری وضعیت", callback_data=f"sec:check:{page_id}"
+                ),
+                InlineKeyboardButton(
+                    text="◈ امتیاز هشدار", callback_data=f"sec:score:{page_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◈ ممیزی نمای عمومی", callback_data=f"sec:audit:{page_id}"
+                ),
+                InlineKeyboardButton(
+                    text="◈ اثرانگشت هویت", callback_data=f"sec:fingerprint:{page_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◈ ذخیره خط مبنا", callback_data=f"sec:baseline:{page_id}"
+                ),
+                InlineKeyboardButton(
+                    text="◈ تاریخچه رخدادها", callback_data=f"sec:history:{page_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◈ گزارش حادثه", callback_data=f"sec:report:{page_id}"
+                ),
+                InlineKeyboardButton(
+                    text="◈ تست اعلان", callback_data=f"sec:testalert:{page_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◈ سلامت پایش", callback_data=f"sec:health:{page_id}"
+                ),
+                InlineKeyboardButton(
+                    text="◈ تصویر شواهد", callback_data=f"profile:details:{page_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ بازگشت به پیج", callback_data=f"page:view:{page_id}"
+                )
             ],
         ]
     )
@@ -160,6 +218,18 @@ def subscription_keyboard() -> InlineKeyboardMarkup:
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="◈ افزودن پیج پایش ادمین",
+                    callback_data="admin:add_target",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="◈ وضعیت اتصال اینستاگرام",
+                    callback_data="admin:instagram_health",
+                )
+            ],
             [InlineKeyboardButton(text="آمار سیستم 📈", callback_data="admin:stats")],
             [
                 InlineKeyboardButton(

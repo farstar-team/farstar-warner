@@ -13,7 +13,7 @@ from pathlib import Path
 import arabic_reshaper
 import httpx
 from bidi.algorithm import get_display
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from playwright.async_api import (
     Browser,
     Playwright,
@@ -22,12 +22,11 @@ from playwright.async_api import (
 )
 from redis.asyncio import Redis
 
-from bot.checker import USER_AGENTS
+from bot.checker import CheckOutcome, ProfileResult, USER_AGENTS
 from bot.config import Settings
 
 
 logger = logging.getLogger(__name__)
-PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
 
 class PreviewOutcome(str, Enum):
@@ -74,6 +73,27 @@ class ProfilePreviewService:
             await self._playwright.stop()
             self._playwright = None
         await self._http.aclose()
+
+    async def browser_health(self) -> tuple[bool, str | None]:
+        try:
+            browser = await self._ensure_browser()
+            return browser.is_connected(), browser.version
+        except Exception as exc:
+            logger.warning("Chromium health check failed: %s", exc)
+            return False, None
+
+    async def probe_status(self, username: str) -> ProfileResult:
+        """Resolve an inconclusive HTTP check through the rendered public embed."""
+        profile = await self.inspect(username, use_cache=False)
+        if profile.outcome == PreviewOutcome.ACTIVE:
+            return ProfileResult(
+                CheckOutcome.ACTIVE,
+                canonical_username=profile.username,
+                http_status=200,
+            )
+        if profile.outcome == PreviewOutcome.DEACTIVATED:
+            return ProfileResult(CheckOutcome.DEACTIVATED, http_status=404)
+        return ProfileResult(CheckOutcome.UNKNOWN)
 
     async def inspect(self, username: str, *, use_cache: bool = True) -> EmbedProfile:
         cache_key = f"{self.CACHE_PREFIX}{username.lower()}"
@@ -257,39 +277,61 @@ class ProfilePreviewService:
     @classmethod
     def _draw_card(cls, profile: EmbedProfile, avatar_bytes: bytes | None) -> bytes:
         width, height = 1080, 1350
-        image = Image.new("RGB", (width, height), "#080b17")
+        image = Image.new("RGB", (width, height), "#070914")
         pixels = image.load()
         for y in range(height):
-            ratio = y / height
-            color = (
-                int(10 + 30 * ratio),
-                int(13 + 10 * ratio),
-                int(28 + 40 * ratio),
-            )
             for x in range(width):
-                pixels[x, y] = color
+                vertical = y / height
+                diagonal = (x + y) / (width + height)
+                pixels[x, y] = (
+                    int(7 + 13 * vertical + 10 * diagonal),
+                    int(9 + 10 * vertical),
+                    int(20 + 38 * diagonal),
+                )
+
+        glow = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        glow_draw = ImageDraw.Draw(glow)
+        glow_draw.ellipse((-210, -180, 500, 520), fill=(225, 48, 145, 105))
+        glow_draw.ellipse((680, 120, 1330, 770), fill=(92, 71, 255, 105))
+        glow_draw.ellipse((190, 940, 850, 1570), fill=(22, 194, 255, 65))
+        glow = glow.filter(ImageFilter.GaussianBlur(115))
+        image = Image.alpha_composite(image.convert("RGBA"), glow).convert("RGB")
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle(
-            (55, 45, 1025, 1305), radius=55, fill="#11162a", outline="#7148ff", width=5
+            (55, 45, 1025, 1305),
+            radius=55,
+            fill="#111526",
+            outline="#8b72ff",
+            width=3,
+        )
+        draw.rounded_rectangle(
+            (78, 68, 1002, 1282), radius=42, outline="#2a3152", width=2
         )
 
         regular = cls._font(42, bold=False)
         bold = cls._font(55, bold=True)
         title_font = cls._font(64, bold=True)
         small = cls._font(34, bold=False)
+        tiny = cls._font(27, bold=False)
+        draw.text((105, 100), "FARSTAR", font=title_font, fill="#ffffff", anchor="la")
         draw.text(
-            (540, 85), "FARSTAR WARNER", font=title_font, fill="#ffffff", anchor="ma"
+            (105, 164),
+            "PROFILE INTELLIGENCE",
+            font=tiny,
+            fill="#aeb5d8",
+            anchor="la",
         )
-        draw.text(
-            (540, 160),
-            cls._rtl("تأیید پیج اینستاگرام"),
-            font=regular,
-            fill="#b8b9ff",
-            anchor="ma",
+        draw.rounded_rectangle(
+            (755, 104, 950, 164), radius=30, fill="#19283a", outline="#35ddb7", width=2
         )
+        draw.ellipse((782, 124, 802, 144), fill="#35ddb7")
+        draw.text((820, 134), "LIVE DATA", font=tiny, fill="#dffff7", anchor="lm")
 
+        draw.ellipse((375, 208, 705, 538), fill="#e1306c")
+        draw.ellipse((384, 217, 696, 529), fill="#833ab4")
+        draw.ellipse((394, 227, 686, 519), fill="#fcb045")
         avatar = cls._avatar(avatar_bytes, profile.username, 280, bold)
-        image.paste(avatar, (400, 225), avatar)
+        image.paste(avatar, (400, 233), avatar)
         draw.text(
             (540, 545), f"@{profile.username}", font=bold, fill="#ffffff", anchor="ma"
         )
@@ -305,15 +347,19 @@ class ProfilePreviewService:
         stats = (
             (
                 cls._number(profile.follower_count, profile.follower_display),
-                "دنبال‌کننده",
+                "FOLLOWERS",
             ),
-            (cls._number(profile.post_count), "پست"),
-            ("خصوصی" if profile.is_private else "عمومی", "نوع پیج"),
+            (cls._number(profile.post_count), "POSTS"),
+            ("PRIVATE" if profile.is_private else "PUBLIC", "VISIBILITY"),
         )
         for index, (value, label) in enumerate(stats):
             left = 95 + index * 315
             draw.rounded_rectangle(
-                (left, 700, left + 275, 855), radius=25, fill="#1c2240"
+                (left, 700, left + 275, 855),
+                radius=25,
+                fill="#1b2139",
+                outline="#343d64",
+                width=2,
             )
             draw.text(
                 (left + 137, 735),
@@ -324,30 +370,40 @@ class ProfilePreviewService:
             )
             draw.text(
                 (left + 137, 805),
-                cls._rtl(label),
+                label,
                 font=small,
                 fill="#a9aac3",
                 anchor="ma",
             )
 
-        draw.rounded_rectangle((95, 905, 985, 1175), radius=30, fill="#181d35")
-        draw.text(
-            (940, 940), cls._rtl("بیوگرافی"), font=regular, fill="#b8b9ff", anchor="ra"
+        draw.rounded_rectangle(
+            (95, 905, 985, 1175),
+            radius=30,
+            fill="#181d32",
+            outline="#343d64",
+            width=2,
         )
+        draw.text((135, 948), "PUBLIC BIO", font=regular, fill="#b8b9ff", anchor="la")
         biography = (
-            profile.biography or "بیوگرافی در نمای عمومی اینستاگرام ارائه نشده است."
+            profile.biography
+            or "Biography is not exposed by the public Instagram surface."
         )
         wrapped = textwrap.wrap(biography, width=48)[:4]
         y = 1010
         for line in wrapped:
             draw.text(
-                (940, y), cls._display(line), font=small, fill="#ffffff", anchor="ra"
+                (135, y), cls._display(line), font=small, fill="#ffffff", anchor="la"
             )
             y += 48
 
-        verified = "تأییدشده" if profile.is_verified else "بدون نشان تأیید"
+        verified = "VERIFIED PROFILE" if profile.is_verified else "NOT VERIFIED"
+        draw.text((105, 1225), verified, font=tiny, fill="#65d6ff", anchor="la")
         draw.text(
-            (540, 1225), cls._rtl(verified), font=small, fill="#65d6ff", anchor="ma"
+            (975, 1225),
+            "PUBLIC SURFACE  •  NO LOGIN",
+            font=tiny,
+            fill="#8f96b7",
+            anchor="ra",
         )
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=92, optimize=True)
@@ -389,11 +445,11 @@ class ProfilePreviewService:
             elif value >= 10_000:
                 compact = f"{value / 1_000:.1f}K"
             else:
-                compact = f"{value:,}".replace(",", "٬")
-            return compact.replace(".0", "").translate(PERSIAN_DIGITS)
+                compact = f"{value:,}"
+            return compact.replace(".0", "")
         if fallback:
-            return fallback.translate(PERSIAN_DIGITS)
-        return "نامشخص"
+            return fallback
+        return "UNKNOWN"
 
     @classmethod
     def _avatar(
