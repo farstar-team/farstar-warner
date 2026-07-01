@@ -197,6 +197,9 @@ EOF
 fi
 
 log "Installing the Farstar server management command..."
+if [[ -d "${PROJECT_DIR}/.git" ]]; then
+  git -C "${PROJECT_DIR}" config core.fileMode false
+fi
 "${SUDO[@]}" mkdir -p "${INSTANCE_DIR}"
 CURRENT_ENV_TARGET="$(readlink -f -- "${ENV_FILE}" 2>/dev/null || true)"
 if [[ "${CURRENT_ENV_TARGET}" != "${MAIN_INSTANCE_ENV}" ]]; then

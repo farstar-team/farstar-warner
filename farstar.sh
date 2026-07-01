@@ -292,8 +292,12 @@ update_application() {
   log "Updating Farstar Warner from ${REPOSITORY_URL}"
   command -v git >/dev/null 2>&1 || fail "git is not installed."
   [[ -d "${APP_DIR}/.git" ]] || fail "${APP_DIR} is not a Git checkout. Clone ${REPOSITORY_URL} to enable updates."
+  # The installer makes the manager executable. Ignore executable-bit-only
+  # differences while continuing to protect real local content changes.
+  git -C "${APP_DIR}" config core.fileMode false
   if [[ -n "$(git -C "${APP_DIR}" status --porcelain --untracked-files=no)" ]]; then
-    fail "The application has local tracked changes. Commit or discard them before updating."
+    git -C "${APP_DIR}" status --short --untracked-files=no >&2
+    fail "The application has local tracked content changes. Commit or stash them before updating."
   fi
 
   local running_instances=()
