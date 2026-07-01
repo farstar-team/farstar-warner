@@ -22,7 +22,7 @@ ENV PATH="/opt/venv/bin:${PATH}" \
 COPY --from=builder /opt/venv /opt/venv
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends chromium fonts-noto-core \
+    && apt-get install -y --no-install-recommends ca-certificates chromium curl fonts-noto-core \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 farstar \
     && useradd --system --uid 10001 --gid farstar --home-dir /app --shell /usr/sbin/nologin farstar

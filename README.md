@@ -19,7 +19,7 @@
 ### امکانات
 
 - رابط کاربری کاملاً فارسی با `aiogram 3`
-- پایش دومرحله‌ای پیج‌های عمومی با `HTTPX` و Chromium به‌عنوان مسیر تأیید نتیجه نامشخص
+- پایش وضعیت با اجرای ناهمگام `curl` و Web Profile API دقیقاً با هدرهای تست‌شده روی سرور
 - تشخیص تغییر وضعیت فعال و دی‌اکتیو
 - تنظیم جداگانه اعلان‌ها برای هر پیج
 - نمایش زنده عکس پروفایل، تعداد دنبال‌کننده، پست‌ها و عمومی یا خصوصی‌بودن پیج
@@ -48,9 +48,10 @@ flowchart LR
     B --> P[("PostgreSQL")]
     B --> R[("Redis")]
     S["APScheduler"] --> C["InstagramChecker"]
-    C --> H["HTTP public embed"]
-    H -->|"نتیجه نامشخص"| X["Chromium public render"]
-    X --> I["صفحه عمومی اینستاگرام"]
+    C --> H["curl / Web Profile API"]
+    B --> X["Chromium اختیاری برای پیش‌نمایش"]
+    H --> I["صفحه عمومی اینستاگرام"]
+    X --> I
     C --> P
     C --> R
     C --> B
@@ -242,7 +243,7 @@ https://www.instagram.com/instagram/
 
 ### منطق پایش
 
-چکر ابتدا برای هر پیج یک درخواست سبک HTTPS ارسال می‌کند. اگر نتیجه قطعی نباشد، همان نمای عمومی با Chromium رندر می‌شود:
+چکر برای هر پیج همان درخواست curl تست‌شده را به Web Profile API اجرا می‌کند. curl داخل کانتینر نصب است و بدون shell، رمز، Session یا grep اجرا می‌شود:
 
 - انتقال وضعیت از دی‌اکتیو به فعال، اعلان `پیج فعال شد! 🎉` ایجاد می‌کند.
 - انتقال وضعیت از فعال به دی‌اکتیو پس از دو پاسخ قطعی متوالی، اعلان `پیج دی‌اکتیو شد! ⚠️` ایجاد می‌کند.
@@ -362,7 +363,7 @@ Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram p
 ### Main features
 
 - Asynchronous Telegram UI with aiogram 3
-- Two-stage public-profile checks with HTTPX and a rendered Chromium fallback for inconclusive responses
+- Asynchronous curl-based Web Profile API checks using the server-validated headers
 - Activation, deactivation, and username-change notifications
 - On-demand profile card with photo, follower count, post count, privacy, verification, and biography when exposed by the public embed
 - Confirmation before saving active profiles and an explicit waiting-list path for inactive usernames

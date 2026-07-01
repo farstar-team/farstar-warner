@@ -1,119 +1,605 @@
-import httpx
+from __future__ import annotations
+
+import asyncio
+import html
+import json
 import logging
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from bot.models import TargetPage, User
+import random
+from contextlib import suppress
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from enum import Enum
+from urllib.parse import quote
+
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
+from redis.asyncio import Redis
+from redis.asyncio.lock import Lock
+from redis.exceptions import LockError
+from sqlalchemy import select
+
+from bot.config import Settings
+from bot.database import SessionFactory
+from bot.models import (
+    NotificationSettings,
+    PageEvent,
+    PageStatus,
+    TargetPage,
+    User,
+    UserStatus,
+)
+
 
 logger = logging.getLogger(__name__)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "X-IG-App-ID": "936619743392459",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://www.instagram.com",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin"
-}
+USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+)
+WEB_PROFILE_APP_ID = "936619743392459"
 
-async def check_single_instagram_page(username: str) -> dict:
-    """درخواست ناهمگام به ای‌پ‌آی وب اینستاگرام با پروتکل HTTP/2"""
-    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-    custom_headers = HEADERS.copy()
-    custom_headers["Referer"] = f"https://www.instagram.com/{username}/"
-    
-    async with httpx.AsyncClient(http2=True, follow_redirects=False, timeout=15.0) as client:
+
+class CheckOutcome(str, Enum):
+    ACTIVE = "active"
+    DEACTIVATED = "deactivated"
+    UNKNOWN = "unknown"
+    RATE_LIMITED = "rate_limited"
+
+
+@dataclass(slots=True, frozen=True)
+class ProfileResult:
+    outcome: CheckOutcome
+    canonical_username: str | None = None
+    profile_id: str | None = None
+    full_name: str | None = None
+    biography: str | None = None
+    profile_picture_url: str | None = None
+    follower_count: int | None = None
+    following_count: int | None = None
+    post_count: int | None = None
+    is_private: bool | None = None
+    is_verified: bool = False
+    retry_after: int | None = None
+    http_status: int | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class CurlResponse:
+    status_code: int | None
+    body: bytes
+    error: str | None = None
+    return_code: int = 0
+
+
+class InstagramChecker:
+    LOCK_KEY = "farstar:checker:lock"
+    STATUS_COOLDOWN_KEY = "farstar:checker:status-cooldown"
+    ACCESS_ALERT_KEY = "farstar:checker:access-alert"
+    DEACTIVATION_STREAK_PREFIX = "farstar:checker:deactivation-streak:"
+    LOCK_TIMEOUT_SECONDS = 120
+    MAX_RESPONSE_BYTES = 8_000_000
+    CURL_EXECUTABLE = "curl"
+
+    def __init__(
+        self,
+        bot: Bot,
+        session_factory: SessionFactory,
+        redis: Redis,
+        settings: Settings,
+    ) -> None:
+        self.bot = bot
+        self.session_factory = session_factory
+        self.redis = redis
+        self.settings = settings
+        self._rate_limited = asyncio.Event()
+        self._lock_lost = asyncio.Event()
+
+    def set_browser_probe(self, probe: object) -> None:
+        """Retain startup compatibility; monitoring uses the curl transport only."""
+        del probe
+
+    async def close(self) -> None:
+        """The curl transport has no persistent client to close."""
+
+    async def fetch_profile(self, username: str) -> ProfileResult:
+        await asyncio.sleep(
+            random.uniform(
+                self.settings.check_jitter_min_seconds,
+                self.settings.check_jitter_max_seconds,
+            )
+        )
+        response = await self._execute_curl(username)
+        if response.status_code is None:
+            logger.warning(
+                "Instagram curl request failed for %s (code %s): %s",
+                username,
+                response.return_code,
+                response.error or "unknown error",
+            )
+            await self._alert_access_issue(username, None, response.error)
+            return ProfileResult(CheckOutcome.UNKNOWN)
+
+        status_code = response.status_code
+        if status_code == 429:
+            return ProfileResult(
+                CheckOutcome.RATE_LIMITED,
+                http_status=status_code,
+            )
+        if status_code == 404:
+            return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
+        if status_code != 200:
+            logger.info(
+                "Instagram Web Profile API returned HTTP %s for %s",
+                status_code,
+                username,
+            )
+            await self._alert_access_issue(username, status_code)
+            return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+
+        result = self._parse_profile_response(response.body, username, status_code)
+        if result is None:
+            await self._alert_access_issue(
+                username,
+                status_code,
+                "پاسخ JSON معتبر نبود",
+            )
+            return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+        return result
+
+    async def _execute_curl(self, username: str) -> CurlResponse:
+        safe_username = quote(username.strip(), safe="")
+        url = (
+            f"{self.settings.instagram_base_url}"
+            f"/api/v1/users/web_profile_info/?username={safe_username}"
+        )
+        request_timeout = self.settings.instagram_request_timeout_seconds
+        command = (
+            self.CURL_EXECUTABLE,
+            "-sS",
+            "-A",
+            USER_AGENTS[0],
+            "-H",
+            f"X-IG-App-ID: {WEB_PROFILE_APP_ID}",
+            "--connect-timeout",
+            str(min(request_timeout, 10.0)),
+            "--max-time",
+            str(request_timeout),
+            "--write-out",
+            "\n%{http_code}",
+            url,
+        )
         try:
-            response = await client.get(url, headers=custom_headers)
-            
-            if response.status_code == 200:
-                data = response.json()
-                user_data = data.get("data", {}).get("user")
-                if not user_data:
-                    return {"status": "deactivated"}
-                
-                return {
-                    "status": "active",
-                    "id": user_data.get("id"),
-                    "full_name": user_data.get("full_name"),
-                    "followers": user_data.get("edge_followed_by", {}).get("count", 0),
-                    "following": user_data.get("edge_follow", {}).get("count", 0),
-                    "posts": user_data.get("edge_owner_to_timeline_media", {}).get("count", 0),
-                }
-            elif response.status_code == 404:
-                return {"status": "deactivated"}
-            else:
-                logger.warning(f"Unexpected status {response.status_code} for {username}")
-                return {"status": "error", "code": response.status_code}
-                
-        except Exception as e:
-            logger.error(f"Error checking {username}: {str(e)}")
-            return {"status": "error", "msg": str(e)}
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except (FileNotFoundError, OSError) as exc:
+            return CurlResponse(None, b"", str(exc), 127)
 
-async def run_monitoring_cycle(session_factory, bot: Bot):
-    """بررسی تمام پیج‌های سیستم و ارسال اعلان‌های تغییرات به زبان فارسی"""
-    async with session_factory() as session:
-        result = await session.execute(select(TargetPage))
-        pages = result.scalars().all()
-        
-        for page in pages:
-            res = await check_single_instagram_page(page.instagram_username)
-            
-            if res["status"] == "error":
-                continue
-                
-            # سناریوی اول: پیج دی‌اکتیو شده است
-            if res["status"] == "deactivated":
-                if page.last_known_status != "deactivated":
-                    page.last_known_status = "deactivated"
-                    await session.commit()
-                    
-                    alert_text = f"⚠️ **اعلان مانیتورینگ Farstar**\n\nپیج اینستاگرامی **@{page.instagram_username}** دی‌اکتیو یا حذف شده است! 🔴"
-                    try:
-                        await bot.send_message(page.user_id, alert_text, parse_mode="Markdown")
-                    except Exception:
-                        pass
-                        
-            # سناریوی دوم: پیج فعال و آنلاین است
-            elif res["status"] == "active":
-                # الف) پیج قبلاً دی‌اکتیو بوده و الان فعال شده
-                if page.last_known_status == "deactivated":
-                    page.last_known_status = "active"
-                    alert_text = f"🎉 **اعلان مانیتورینگ Farstar**\n\nپیج **@{page.instagram_username}** دوباره فعال و اکتیو شد! 🟢"
-                    try:
-                        await bot.send_message(page.user_id, alert_text, parse_mode="Markdown")
-                    except Exception:
-                        pass
-                
-                # ب) بررسی تغییرات آمار پیج (فالوور، پست و نام)
-                changes = []
-                if page.follower_count and res["followers"] != page.follower_count:
-                    diff = res["followers"] - page.follower_count
-                    sign = "+" if diff > 0 else ""
-                    changes.append(f"👥 تغییر فالوور: {page.follower_count} ➡️ {res['followers']} ({sign}{diff})")
-                    
-                if page.post_count and res["posts"] != page.post_count:
-                    changes.append(f"📸 تعداد پست‌ها: {page.post_count} ➡️ {res['posts']}")
-                    
-                if page.full_name and res["full_name"] != page.full_name:
-                    changes.append(f"🔄 تغییر نام اصلی: {page.full_name} ➡️ {res['full_name']}")
-                
-                # بروزرسانی مقادیر جدید در دیتابیس
-                page.last_known_status = "active"
-                page.instagram_id = res["id"]
-                page.follower_count = res["followers"]
-                page.following_count = res["following"]
-                page.post_count = res["posts"]
-                page.full_name = res["full_name"]
-                await session.commit()
-                
-                # ارسال گزارش تغییرات آماری در صورت وجود
-                if changes:
-                    changes_str = "\n".join(changes)
-                    report_text = f"📊 **بروزرسانی پیج @{page.instagram_username}**\n\n{changes_str}"
-                    try:
-                        await bot.send_message(page.user_id, report_text, parse_mode="Markdown")
-                    except Exception:
-                        pass
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=request_timeout + 5,
+            )
+        except TimeoutError:
+            process.kill()
+            with suppress(Exception):
+                await process.communicate()
+            return CurlResponse(None, b"", "curl execution timed out", 28)
+
+        error = stderr.decode("utf-8", errors="replace").strip() or None
+        if process.returncode != 0:
+            return CurlResponse(None, b"", error, process.returncode or 1)
+        if len(stdout) > self.MAX_RESPONSE_BYTES:
+            return CurlResponse(None, b"", "response exceeded safety limit", 63)
+
+        body, separator, status_bytes = stdout.rpartition(b"\n")
+        if not separator or not status_bytes.isdigit():
+            return CurlResponse(None, b"", "curl did not return an HTTP status", 1)
+        return CurlResponse(int(status_bytes), body, error, process.returncode or 0)
+
+    @classmethod
+    def _parse_profile_response(
+        cls,
+        body: bytes,
+        requested_username: str,
+        status_code: int,
+    ) -> ProfileResult | None:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        user_data = data.get("user") if isinstance(data, dict) else None
+        if not isinstance(user_data, dict):
+            return None
+
+        raw_profile_id = user_data.get("id")
+        raw_username = user_data.get("username")
+        profile_id = str(raw_profile_id).strip() if raw_profile_id else ""
+        canonical_username = (
+            str(raw_username).strip().lower()
+            if raw_username
+            else requested_username.lower()
+        )
+        if not profile_id.isdigit() or not canonical_username:
+            return None
+
+        return ProfileResult(
+            outcome=CheckOutcome.ACTIVE,
+            canonical_username=canonical_username,
+            profile_id=profile_id,
+            full_name=cls._optional_text(user_data.get("full_name")),
+            biography=cls._optional_text(user_data.get("biography")),
+            profile_picture_url=cls._optional_text(
+                user_data.get("profile_pic_url_hd") or user_data.get("profile_pic_url")
+            ),
+            follower_count=cls._edge_count(user_data, "edge_followed_by"),
+            following_count=cls._edge_count(user_data, "edge_follow"),
+            post_count=cls._edge_count(
+                user_data,
+                "edge_owner_to_timeline_media",
+            ),
+            is_private=(
+                user_data.get("is_private")
+                if isinstance(user_data.get("is_private"), bool)
+                else None
+            ),
+            is_verified=bool(user_data.get("is_verified", False)),
+            http_status=status_code,
+        )
+
+    async def _alert_access_issue(
+        self,
+        username: str,
+        http_status: int | None,
+        detail: str | None = None,
+    ) -> None:
+        should_alert = await self.redis.set(
+            self.ACCESS_ALERT_KEY,
+            "1",
+            ex=3600,
+            nx=True,
+        )
+        if not should_alert:
+            return
+        status_text = str(http_status) if http_status is not None else "بدون پاسخ"
+        detail_text = html.escape(detail or "ثبت نشده")
+        await self._notify(
+            self.settings.admin_telegram_id,
+            "دسترسی Web Profile اینستاگرام پاسخ قطعی نداد. ⚠️\n\n"
+            f"نمونه پیج: <b>@{html.escape(username)}</b>\n"
+            f"کد HTTP: <code>{status_text}</code>\n"
+            f"جزئیات: <code>{detail_text}</code>\n"
+            "وضعیت ذخیره‌شده پیج‌ها تغییر نکرد.",
+        )
+
+    async def run(self) -> None:
+        if await self.redis.exists(self.STATUS_COOLDOWN_KEY):
+            logger.info("Checker skipped because the Instagram cooldown is active")
+            return
+
+        lock = self.redis.lock(
+            self.LOCK_KEY,
+            timeout=self.LOCK_TIMEOUT_SECONDS,
+            blocking_timeout=0,
+        )
+        acquired = await lock.acquire(blocking=False)
+        if not acquired:
+            logger.info("Checker skipped because another instance holds the lock")
+            return
+
+        self._lock_lost.clear()
+        renewal_task = asyncio.create_task(self._renew_lock(lock))
+        try:
+            self._rate_limited.clear()
+            target_ids = await self._eligible_target_ids()
+            if not target_ids:
+                return
+
+            queue: asyncio.Queue[int | None] = asyncio.Queue()
+            for target_id in target_ids:
+                queue.put_nowait(target_id)
+
+            worker_count = min(self.settings.check_concurrency, len(target_ids))
+            for _ in range(worker_count):
+                queue.put_nowait(None)
+            workers = [
+                asyncio.create_task(self._worker(queue)) for _ in range(worker_count)
+            ]
+            await asyncio.gather(*workers)
+        except Exception:
+            logger.exception("Unexpected checker cycle failure")
+        finally:
+            renewal_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewal_task
+            try:
+                await lock.release()
+            except LockError:
+                logger.warning("Checker lock expired before it could be released")
+
+    async def _renew_lock(self, lock: Lock) -> None:
+        while True:
+            await asyncio.sleep(self.LOCK_TIMEOUT_SECONDS / 3)
+            try:
+                await lock.extend(self.LOCK_TIMEOUT_SECONDS, replace_ttl=True)
+            except LockError:
+                self._lock_lost.set()
+                logger.error("Checker lost its distributed lock; stopping this cycle")
+                return
+            except Exception:
+                self._lock_lost.set()
+                logger.exception("Checker could not renew its distributed lock")
+                return
+
+    async def _worker(self, queue: asyncio.Queue[int | None]) -> None:
+        while True:
+            target_id = await queue.get()
+            try:
+                if target_id is None:
+                    return
+                if self._rate_limited.is_set() or self._lock_lost.is_set():
+                    continue
+                await self._check_target(target_id)
+            except Exception:
+                logger.exception("Failed to process target %s", target_id)
+            finally:
+                queue.task_done()
+
+    async def _eligible_target_ids(self) -> list[int]:
+        now = datetime.now(timezone.utc)
+        async with self.session_factory() as session:
+            result = await session.scalars(
+                select(TargetPage.id)
+                .join(User, User.telegram_id == TargetPage.user_id)
+                .where(
+                    User.status == UserStatus.ACTIVE,
+                    User.subscription_expiry > now,
+                )
+                .order_by(TargetPage.id)
+            )
+            return list(result)
+
+    async def _check_target(self, target_id: int) -> None:
+        async with self.session_factory() as session:
+            snapshot = await session.get(TargetPage, target_id)
+            if snapshot is None:
+                return
+            username = snapshot.instagram_username
+
+        result = await self.fetch_profile(username)
+        if result.outcome == CheckOutcome.UNKNOWN:
+            return
+        if result.outcome == CheckOutcome.RATE_LIMITED:
+            self._rate_limited.set()
+            await self._activate_cooldown(result.retry_after)
+            return
+
+        streak_key = f"{self.DEACTIVATION_STREAK_PREFIX}{target_id}"
+        if result.outcome == CheckOutcome.DEACTIVATED:
+            streak = await self.redis.incr(streak_key)
+            if streak == 1:
+                await self.redis.expire(streak_key, 86400)
+            if streak < self.settings.deactivation_confirmations:
+                logger.info(
+                    "Waiting for deactivation confirmation %s/%s for target %s",
+                    streak,
+                    self.settings.deactivation_confirmations,
+                    target_id,
+                )
+                return
+            await self.redis.delete(streak_key)
+        else:
+            await self.redis.delete(streak_key)
+
+        notifications: list[str] = []
+        recipient_id: int | None = None
+        async with self.session_factory() as session:
+            target = await session.scalar(
+                select(TargetPage).where(TargetPage.id == target_id).with_for_update()
+            )
+            if target is None:
+                return
+
+            notification_settings = await session.get(
+                NotificationSettings,
+                (target.user_id, target.id),
+            )
+            if notification_settings is None:
+                notification_settings = NotificationSettings(
+                    user_id=target.user_id,
+                    target_page_id=target.id,
+                )
+                session.add(notification_settings)
+                await session.flush()
+
+            previous_status = target.last_known_status
+            previous_username = target.instagram_username
+            previous_profile_id = target.last_known_id
+            new_status = (
+                PageStatus.ACTIVE
+                if result.outcome == CheckOutcome.ACTIVE
+                else PageStatus.DEACTIVATED
+            )
+
+            target.last_known_status = new_status
+            target.last_checked_at = datetime.now(timezone.utc)
+            username_changed = False
+            identity_changed = False
+
+            if result.outcome == CheckOutcome.ACTIVE and result.profile_id:
+                canonical_username = (
+                    result.canonical_username or previous_username
+                ).lower()
+                same_identity = bool(
+                    previous_profile_id and previous_profile_id == result.profile_id
+                )
+                identity_changed = bool(
+                    previous_profile_id and previous_profile_id != result.profile_id
+                )
+                if canonical_username != previous_username.lower() and (
+                    same_identity or not previous_profile_id
+                ):
+                    conflict = await session.scalar(
+                        select(TargetPage.id).where(
+                            TargetPage.user_id == target.user_id,
+                            TargetPage.instagram_username == canonical_username,
+                            TargetPage.id != target.id,
+                        )
+                    )
+                    if conflict is None:
+                        target.instagram_username = canonical_username
+                        username_changed = same_identity
+                    else:
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="username_conflict",
+                                description=(
+                                    f"نام کاربری جدید @{canonical_username} از قبل "
+                                    "در فهرست کاربر ثبت شده بود."
+                                ),
+                            )
+                        )
+                target.last_known_id = result.profile_id
+
+            escaped_current = html.escape(target.instagram_username)
+            escaped_previous = html.escape(previous_username)
+            if (
+                previous_status == PageStatus.DEACTIVATED
+                and new_status == PageStatus.ACTIVE
+            ):
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="activated",
+                        description="پیج از وضعیت غیرفعال به فعال تغییر کرد.",
+                    )
+                )
+                if notification_settings.notify_activation:
+                    notifications.append(
+                        f"پیج فعال شد! 🎉\n\nپیج: <b>@{escaped_current}</b>"
+                    )
+            elif (
+                previous_status == PageStatus.ACTIVE
+                and new_status == PageStatus.DEACTIVATED
+            ):
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="deactivated",
+                        description="پیج از وضعیت فعال به غیرفعال تغییر کرد.",
+                    )
+                )
+                if notification_settings.notify_deactivation:
+                    notifications.append(
+                        f"پیج دی‌اکتیو شد! ⚠️\n\nپیج: <b>@{escaped_current}</b>"
+                    )
+
+            if username_changed:
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="username_changed",
+                        description=(
+                            f"نام کاربری از @{previous_username} "
+                            f"به @{target.instagram_username} تغییر کرد."
+                        ),
+                    )
+                )
+                if notification_settings.notify_username_change:
+                    notifications.append(
+                        "نام کاربری پیج تغییر کرد! 🔄\n\n"
+                        f"نام قبلی: <b>@{escaped_previous}</b>\n"
+                        f"نام جدید: <b>@{escaped_current}</b>"
+                    )
+
+            if identity_changed:
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="identity_changed",
+                        description=(
+                            f"شناسه یکتای پیج از {previous_profile_id} "
+                            f"به {result.profile_id} تغییر کرد."
+                        ),
+                    )
+                )
+                if notification_settings.notify_username_change:
+                    notifications.append(
+                        "هویت پیج تغییر کرده است! ⚠️\n\n"
+                        f"پیج: <b>@{escaped_current}</b>\n"
+                        "شناسه یکتای اینستاگرام با مقدار قبلی مطابقت ندارد."
+                    )
+
+            recipient_id = target.user_id
+            await session.commit()
+
+        if recipient_id is not None:
+            for notification in notifications:
+                await self._notify(recipient_id, notification)
+
+    async def _notify(self, telegram_id: int, message: str) -> None:
+        try:
+            await self.bot.send_message(telegram_id, message)
+        except TelegramAPIError as exc:
+            logger.warning(
+                "Telegram notification failed for user %s: %s",
+                telegram_id,
+                exc,
+            )
+
+    @staticmethod
+    def _optional_text(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @staticmethod
+    def _edge_count(user_data: dict[object, object], field: str) -> int | None:
+        edge = user_data.get(field)
+        if not isinstance(edge, dict):
+            return None
+        value = edge.get("count")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    @staticmethod
+    def _parse_retry_after(value: str | None) -> int | None:
+        if not value:
+            return None
+        if value.isdigit():
+            return int(value)
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    async def _activate_cooldown(self, requested_seconds: int | None) -> int:
+        cooldown = requested_seconds or self.settings.rate_limit_cooldown_seconds
+        cooldown = max(60, min(cooldown, 86400))
+        await self.redis.set(self.STATUS_COOLDOWN_KEY, str(cooldown), ex=cooldown)
+        logger.warning(
+            "Instagram rate limit detected; pausing checks for %s seconds",
+            cooldown,
+        )
+        return cooldown
