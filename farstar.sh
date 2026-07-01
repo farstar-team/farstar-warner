@@ -159,6 +159,31 @@ build_image() {
   "${DOCKER[@]}" build --tag farstar-warner:latest "${APP_DIR}"
 }
 
+source_version() {
+  local version_file="${APP_DIR}/bot/version.py"
+  [[ -f "${version_file}" ]] || { printf 'unknown'; return; }
+  sed -nE 's/^APP_VERSION = "([^"]+)"/\1/p' "${version_file}" | head -n 1
+}
+
+show_version() {
+  log "Farstar Warner version"
+  printf 'Source version: %s\n' "$(source_version)"
+  local env_file instance container_version found=false
+  while IFS= read -r env_file; do
+    found=true
+    instance="$(basename -- "${env_file}" .env)"
+    if [[ -n "$(compose "${instance}" ps --status running -q bot-app 2>/dev/null || true)" ]]; then
+      container_version="$(compose "${instance}" exec -T bot-app python -c 'from bot.version import APP_VERSION; print(APP_VERSION)' 2>/dev/null || printf 'legacy')"
+    else
+      container_version="stopped"
+    fi
+    printf '  %-32s %s\n' "${instance}" "${container_version}"
+  done < <("${SUDO[@]}" find "${INSTANCE_DIR}" -maxdepth 1 -type f -name '*.env' -print 2>/dev/null | sort)
+  if [[ "${found}" == "false" ]]; then
+    printf '  No instances are configured.\n'
+  fi
+}
+
 add_instance() {
   log "Add and install a new bot instance"
   local instance=""
@@ -315,7 +340,7 @@ update_application() {
   for instance in "${running_instances[@]}"; do
     compose "${instance}" up -d --no-build --force-recreate bot-app
   done
-  log "Update completed. Running bot instances were recreated."
+  log "Update completed. Version $(source_version) is active; running bot instances were recreated."
 }
 
 remove_instance() {
@@ -391,6 +416,7 @@ doctor() {
   printf 'Application directory: %s\n' "${APP_DIR}"
   printf 'Instance directory:    %s\n' "${INSTANCE_DIR}"
   printf 'Repository:            %s\n' "${REPOSITORY_URL}"
+  printf 'Application version:   %s\n' "$(source_version)"
   printf 'Docker:                %s\n' "$("${DOCKER[@]}" version --format '{{.Server.Version}}')"
   printf 'Docker Compose:        %s\n' "$("${DOCKER[@]}" compose version --short)"
   printf '\nContainer resource snapshot:\n'
@@ -418,6 +444,7 @@ Commands:
   restore INSTANCE     Restore a PostgreSQL SQL backup
   remove INSTANCE      Remove an instance, optionally including its data
   doctor               Show Docker and resource diagnostics
+  version              Show source and running bot versions
   help                 Show this help
 EOF
 }
@@ -440,6 +467,7 @@ interactive_menu() {
     printf '11) Restore PostgreSQL\n'
     printf '12) Remove a bot instance\n'
     printf '13) System diagnostics\n'
+    printf '14) Show application version\n'
     printf ' 0) Exit\n\n'
     local choice
     read -r -p "Choose an option: " choice
@@ -457,6 +485,7 @@ interactive_menu() {
       11) list_instances; prompt_instance; restore_instance "${SELECTED_INSTANCE}" ;;
       12) list_instances; prompt_instance; remove_instance "${SELECTED_INSTANCE}" ;;
       13) doctor ;;
+      14) show_version ;;
       0) return ;;
       *) printf 'Invalid option.\n' ;;
     esac
@@ -488,6 +517,7 @@ main() {
     restore) [[ $# -ge 2 ]] || fail "An instance name is required."; restore_instance "$2" ;;
     remove) [[ $# -ge 2 ]] || fail "An instance name is required."; remove_instance "$2" ;;
     doctor) doctor ;;
+    version) show_version ;;
     *) usage; fail "Unknown command: ${command}" ;;
   esac
 }

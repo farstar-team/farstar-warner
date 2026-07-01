@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.types import BotCommand, BotCommandScopeChat
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -21,6 +22,7 @@ from bot.database import SessionFactory, create_database, initialize_database
 from bot.handlers import admin, user
 from bot.models import PlanTier, User, UserStatus
 from bot.profile_preview import ProfilePreviewService
+from bot.version import APP_VERSION, RELEASE_REDIS_KEY, version_message
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,7 @@ async def configure_commands(bot: Bot, settings: Settings) -> None:
     public_commands = [
         BotCommand(command="start", description="شروع کار با ربات"),
         BotCommand(command="help", description="راهنمای استفاده"),
+        BotCommand(command="version", description="نمایش نسخه فعال ربات"),
     ]
     await bot.set_my_commands(public_commands)
     await bot.set_my_commands(
@@ -60,6 +63,25 @@ async def configure_commands(bot: Bot, settings: Settings) -> None:
         ],
         scope=BotCommandScopeChat(chat_id=settings.admin_telegram_id),
     )
+
+
+async def notify_admin_about_release(
+    bot: Bot,
+    redis: Redis,
+    settings: Settings,
+) -> None:
+    notified_version = await redis.get(RELEASE_REDIS_KEY)
+    if notified_version == APP_VERSION:
+        return
+    try:
+        await bot.send_message(
+            settings.admin_telegram_id,
+            version_message(activated=True),
+        )
+    except TelegramAPIError as exc:
+        logger.warning("Could not send release notification to admin: %s", exc)
+        return
+    await redis.set(RELEASE_REDIS_KEY, APP_VERSION)
 
 
 async def ensure_primary_admin(
@@ -125,6 +147,7 @@ async def run() -> None:
         await ensure_primary_admin(session_factory, settings)
         await bot.delete_webhook(drop_pending_updates=False)
         await configure_commands(bot, settings)
+        await notify_admin_about_release(bot, redis, settings)
 
         stored_interval = await redis.get("farstar:checker:interval")
         try:
@@ -150,7 +173,9 @@ async def run() -> None:
         dispatcher.include_router(user.router)
 
         logger.info(
-            "Farstar Warner started with a %s-second check interval", check_interval
+            "Farstar Warner %s started with a %s-second check interval",
+            APP_VERSION,
+            check_interval,
         )
         await dispatcher.start_polling(
             bot,

@@ -43,6 +43,7 @@ from bot.models import (
     UserStatus,
 )
 from bot.profile_preview import EmbedProfile, PreviewOutcome, ProfilePreviewService
+from bot.version import APP_VERSION, version_message
 
 
 router = Router(name="user")
@@ -269,11 +270,17 @@ def _add_guard_message(user: User, target_count: int) -> str | None:
 async def start(message: Message, db_user: User, settings: Settings) -> None:
     await message.answer(
         "سلام! به فارستار وارنر خوش آمدید. 🌟\n\n"
-        "از اینجا می‌توانید وضعیت پیج‌های عمومی اینستاگرام را پایش کنید و هنگام تغییر وضعیت اعلان بگیرید.",
+        "از اینجا می‌توانید وضعیت پیج‌های عمومی اینستاگرام را پایش کنید و هنگام تغییر وضعیت اعلان بگیرید.\n\n"
+        f"نسخه فعال: <code>{APP_VERSION}</code>",
         reply_markup=main_menu_keyboard(
             is_admin=db_user.telegram_id == settings.admin_telegram_id
         ),
     )
+
+
+@router.message(Command("version"))
+async def version_command(message: Message) -> None:
+    await message.answer(version_message())
 
 
 @router.message(Command("help"))

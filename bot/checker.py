@@ -4,13 +4,11 @@ import asyncio
 import html
 import logging
 import random
-import re
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
-from collections.abc import Awaitable, Callable
 
 import httpx
 from aiogram import Bot
@@ -36,22 +34,10 @@ logger = logging.getLogger(__name__)
 
 USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/18.5 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36",
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
 
-PROFILE_ID_PATTERNS = (
-    re.compile(r'"profile_id"\s*:\s*"?(\d{3,30})"?', re.I),
-    re.compile(r'"user_id"\s*:\s*"?(\d{3,30})"?', re.I),
-    re.compile(r"&quot;profile_id&quot;\s*:\s*&quot;?(\d{3,30})", re.I),
-)
+WEB_PROFILE_APP_ID = "936619743392459"
 
 
 class CheckOutcome(str, Enum):
@@ -100,14 +86,13 @@ class InstagramChecker:
         )
         self._rate_limited = asyncio.Event()
         self._lock_lost = asyncio.Event()
-        self._browser_probe: Callable[[str], Awaitable[ProfileResult]] | None = None
 
     def set_browser_probe(
         self,
-        probe: Callable[[str], Awaitable[ProfileResult]],
+        probe: object,
     ) -> None:
-        """Attach the rendered public-page fallback after both services exist."""
-        self._browser_probe = probe
+        """Keep startup compatibility; status monitoring intentionally uses the API."""
+        del probe
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -120,25 +105,21 @@ class InstagramChecker:
             )
         )
         headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": random.choice(
-                ("en-US,en;q=0.9", "en-GB,en;q=0.8", "en;q=0.9")
-            ),
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Upgrade-Insecure-Requests": "1",
+            "User-Agent": USER_AGENTS[0],
+            "X-IG-App-ID": WEB_PROFILE_APP_ID,
         }
-        url = f"{self.settings.instagram_base_url}/{username}/embed/"
+        url = f"{self.settings.instagram_base_url}/api/v1/users/web_profile_info/"
 
         try:
-            response = await self._client.get(url, headers=headers)
+            response = await self._client.get(
+                url,
+                params={"username": username},
+                headers=headers,
+            )
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             logger.warning("Instagram request failed for %s: %s", username, exc)
-            return await self._browser_fallback(username)
+            await self._alert_access_issue(username, None)
+            return ProfileResult(CheckOutcome.UNKNOWN)
 
         status_code = response.status_code
         if status_code == 429:
@@ -152,71 +133,50 @@ class InstagramChecker:
         if status_code == 404:
             return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
         if status_code == 200:
-            profile_id = self._extract_first(PROFILE_ID_PATTERNS, response.text)
-            if self._looks_like_login_wall(response.text, profile_id):
-                logger.info("Instagram returned a login surface for %s", username)
-                return await self._browser_fallback(
-                    username,
-                    http_status=status_code,
+            try:
+                payload = response.json()
+            except ValueError:
+                logger.warning("Instagram returned invalid JSON for %s", username)
+                await self._alert_access_issue(username, status_code)
+                return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+
+            if not isinstance(payload, dict):
+                await self._alert_access_issue(username, status_code)
+                return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+            data = payload.get("data")
+            user_data = data.get("user") if isinstance(data, dict) else None
+            if not isinstance(user_data, dict):
+                logger.warning(
+                    "Instagram JSON did not contain data.user for %s", username
                 )
+                await self._alert_access_issue(username, status_code)
+                return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+
+            raw_profile_id = user_data.get("id")
+            raw_username = user_data.get("username")
+            profile_id = str(raw_profile_id).strip() if raw_profile_id else ""
+            canonical_username = (
+                str(raw_username).strip().lower() if raw_username else username.lower()
+            )
+            if not profile_id.isdigit() or not canonical_username:
+                logger.warning("Instagram JSON identity was invalid for %s", username)
+                await self._alert_access_issue(username, status_code)
+                return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+
             return ProfileResult(
                 CheckOutcome.ACTIVE,
-                canonical_username=username,
+                canonical_username=canonical_username,
                 profile_id=profile_id,
                 http_status=status_code,
             )
 
         logger.info(
-            "Instagram embed endpoint returned HTTP %s for %s",
+            "Instagram Web Profile API returned HTTP %s for %s",
             status_code,
             username,
         )
-        return await self._browser_fallback(username, http_status=status_code)
-
-    async def _browser_fallback(
-        self,
-        username: str,
-        *,
-        http_status: int | None = None,
-    ) -> ProfileResult:
-        """Use rendered public content only when the lightweight probe is inconclusive."""
-        if self._browser_probe is None:
-            return ProfileResult(CheckOutcome.UNKNOWN, http_status=http_status)
-        try:
-            result = await self._browser_probe(username)
-        except Exception:
-            logger.exception("Rendered public probe failed for %s", username)
-            return ProfileResult(CheckOutcome.UNKNOWN, http_status=http_status)
-        if result.http_status is None and http_status is not None:
-            result = ProfileResult(
-                outcome=result.outcome,
-                canonical_username=result.canonical_username,
-                profile_id=result.profile_id,
-                retry_after=result.retry_after,
-                http_status=http_status,
-            )
-        if result.outcome == CheckOutcome.UNKNOWN:
-            await self._alert_access_issue(username, http_status)
-        return result
-
-    @staticmethod
-    def _looks_like_login_wall(value: str, profile_id: str | None) -> bool:
-        if profile_id:
-            return False
-        lowered = value.lower()
-        login_markers = (
-            'id="loginform"',
-            "accounts/login/?next=",
-            "log in • instagram",
-            '"login_required"',
-        )
-        profile_markers = (
-            "view full profile on instagram",
-            "profile picture",
-        )
-        return any(marker in lowered for marker in login_markers) and not any(
-            marker in lowered for marker in profile_markers
-        )
+        await self._alert_access_issue(username, status_code)
+        return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
 
     async def _alert_access_issue(
         self,
@@ -380,19 +340,54 @@ class InstagramChecker:
 
             previous_status = target.last_known_status
             previous_username = target.instagram_username
+            previous_profile_id = target.last_known_id
             new_status = (
                 PageStatus.ACTIVE
                 if result.outcome == CheckOutcome.ACTIVE
                 else PageStatus.DEACTIVATED
             )
             canonical_username = result.canonical_username or previous_username
+            canonical_username = canonical_username.lower()
+            username_differs = canonical_username != previous_username.lower()
+            identity_matches = bool(
+                previous_profile_id
+                and result.profile_id
+                and previous_profile_id == result.profile_id
+            )
+            identity_changed = bool(
+                previous_profile_id
+                and result.profile_id
+                and previous_profile_id != result.profile_id
+            )
+            username_changed = username_differs and identity_matches
 
             target.last_known_status = new_status
             target.last_checked_at = datetime.now(timezone.utc)
-            if result.profile_id:
+            if result.outcome == CheckOutcome.ACTIVE and result.profile_id:
+                if username_differs and (identity_matches or not previous_profile_id):
+                    conflicting_target = await session.scalar(
+                        select(TargetPage.id).where(
+                            TargetPage.user_id == target.user_id,
+                            TargetPage.instagram_username == canonical_username,
+                            TargetPage.id != target.id,
+                        )
+                    )
+                    if conflicting_target is None:
+                        target.instagram_username = canonical_username
+                    else:
+                        username_changed = False
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="username_conflict",
+                                description=(
+                                    f"نام کاربری جدید @{canonical_username} از قبل "
+                                    "در فهرست کاربر ثبت شده بود."
+                                ),
+                            )
+                        )
                 target.last_known_id = result.profile_id
-            if canonical_username.lower() != previous_username.lower():
-                target.instagram_username = canonical_username
 
             escaped_current = html.escape(target.instagram_username)
             escaped_previous = html.escape(previous_username)
@@ -429,7 +424,7 @@ class InstagramChecker:
                         f"پیج دی‌اکتیو شد! ⚠️\n\nپیج: <b>@{escaped_current}</b>"
                     )
 
-            if canonical_username.lower() != previous_username.lower():
+            if username_changed:
                 session.add(
                     PageEvent(
                         target_page_id=target.id,
@@ -443,6 +438,25 @@ class InstagramChecker:
                         "نام کاربری پیج تغییر کرد! 🔄\n\n"
                         f"نام قبلی: <b>@{escaped_previous}</b>\n"
                         f"نام جدید: <b>@{escaped_current}</b>"
+                    )
+
+            if identity_changed:
+                session.add(
+                    PageEvent(
+                        target_page_id=target.id,
+                        user_id=target.user_id,
+                        event_type="identity_changed",
+                        description=(
+                            f"شناسه یکتای پیج از {previous_profile_id} "
+                            f"به {result.profile_id} تغییر کرد."
+                        ),
+                    )
+                )
+                if settings.notify_username_change:
+                    notifications.append(
+                        "هویت پیج تغییر کرده است! ⚠️\n\n"
+                        f"پیج: <b>@{escaped_current}</b>\n"
+                        "شناسه یکتای اینستاگرام با مقدار قبلی مطابقت ندارد."
                     )
 
             recipient_id = target.user_id
@@ -459,14 +473,6 @@ class InstagramChecker:
             logger.warning(
                 "Telegram notification failed for user %s: %s", telegram_id, exc
             )
-
-    @staticmethod
-    def _extract_first(patterns: tuple[re.Pattern[str], ...], value: str) -> str | None:
-        for pattern in patterns:
-            match = pattern.search(value)
-            if match:
-                return match.group(1)
-        return None
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> int | None:
