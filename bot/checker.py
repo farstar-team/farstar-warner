@@ -11,6 +11,7 @@ from email.utils import parsedate_to_datetime
 from enum import Enum
 from urllib.parse import quote, urlsplit
 
+import httpx
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from redis.asyncio import Redis
@@ -40,6 +41,16 @@ USER_AGENTS = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 )
 WEB_PROFILE_APP_ID = "936619743392459"
+INSTAGRAM_REQUIRED_HEADERS = {
+    "User-Agent": USER_AGENTS[0],
+    "X-IG-App-ID": WEB_PROFILE_APP_ID,
+}
+INSTAGRAM_BROWSER_HEADERS = {
+    **INSTAGRAM_REQUIRED_HEADERS,
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.instagram.com/",
+}
 
 
 class CheckOutcome(str, Enum):
@@ -73,6 +84,7 @@ class CurlResponse:
     body: bytes
     error: str | None = None
     return_code: int = 0
+    transport: str = "unknown"
 
 
 class InstagramChecker:
@@ -103,13 +115,20 @@ class InstagramChecker:
         self.settings = settings
         self._rate_limited = asyncio.Event()
         self._lock_lost = asyncio.Event()
+        self._http = httpx.AsyncClient(
+            http2=True,
+            follow_redirects=False,
+            timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
+            headers=INSTAGRAM_BROWSER_HEADERS,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
 
     def set_browser_probe(self, probe: object) -> None:
         """Retain startup compatibility; monitoring uses the curl transport only."""
         del probe
 
     async def close(self) -> None:
-        """The curl transport has no persistent client to close."""
+        await self._http.aclose()
 
     async def fetch_profile(
         self,
@@ -134,7 +153,7 @@ class InstagramChecker:
         acquired = await profile_lock.acquire()
         if not acquired:
             if force_refresh:
-                response = await self._execute_curl(normalized_username)
+                response = await self._execute_profile_request(normalized_username)
                 result = await self._profile_result_from_response(
                     response,
                     normalized_username,
@@ -152,7 +171,7 @@ class InstagramChecker:
                 )
                 if cached is not None:
                     return replace(cached, from_cache=True)
-            response = await self._execute_curl(normalized_username)
+            response = await self._execute_profile_request(normalized_username)
             result = await self._profile_result_from_response(
                 response,
                 normalized_username,
@@ -182,8 +201,9 @@ class InstagramChecker:
     ) -> ProfileResult:
         if response.status_code is None and not response.body:
             logger.warning(
-                "Instagram curl request failed for %s (code %s): %s",
+                "Instagram profile request failed for %s via %s (code %s): %s",
                 username,
+                response.transport,
                 response.return_code,
                 response.error or "unknown error",
             )
@@ -205,7 +225,7 @@ class InstagramChecker:
             await self._alert_access_issue(
                 username,
                 status_code,
-                "Instagram returned HTTP 429 to the curl transport",
+                f"Instagram returned HTTP 429 via {response.transport}",
             )
             return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
         if status_code != 200:
@@ -214,7 +234,7 @@ class InstagramChecker:
                 status_code,
                 username,
             )
-            await self._alert_access_issue(username, status_code)
+            await self._alert_access_issue(username, status_code, response.transport)
             return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
         await self._alert_access_issue(
             username,
@@ -287,10 +307,91 @@ class InstagramChecker:
                 return replace(stale, from_cache=True)
         return fallback or ProfileResult(CheckOutcome.UNKNOWN)
 
+    async def _execute_profile_request(self, username: str) -> CurlResponse:
+        last_response: CurlResponse | None = None
+        for attempt in range(1, self.CURL_ATTEMPTS + 1):
+            http_response = await self._execute_http2_once(username)
+            if self._response_is_authoritative(http_response, username):
+                return http_response
+            last_response = http_response
+
+            curl_http2_response = await self._execute_curl_once(
+                username,
+                force_http2=True,
+            )
+            if self._response_is_authoritative(curl_http2_response, username):
+                return curl_http2_response
+            if (
+                curl_http2_response.return_code != 2
+                or "the installed libcurl version doesn't support" not in (
+                    curl_http2_response.error or ""
+                ).lower()
+            ):
+                last_response = curl_http2_response
+
+            curl_response = await self._execute_curl_once(
+                username,
+                force_http2=False,
+            )
+            if self._response_is_authoritative(curl_response, username):
+                return curl_response
+            last_response = curl_response
+
+            if attempt < self.CURL_ATTEMPTS:
+                await asyncio.sleep(0.45 * attempt)
+
+        return last_response or CurlResponse(
+            None,
+            b"",
+            "Instagram request transports did not run",
+            1,
+            "none",
+        )
+
+    async def _execute_http2_once(self, username: str) -> CurlResponse:
+        safe_username = quote(username.strip(), safe="")
+        url = (
+            f"{self.settings.instagram_base_url}"
+            f"/api/v1/users/web_profile_info/?username={safe_username}"
+        )
+        try:
+            response = await self._http.get(url)
+        except httpx.HTTPError as exc:
+            return CurlResponse(None, b"", str(exc), 1, "httpx-http2")
+        if len(response.content) > self.MAX_RESPONSE_BYTES:
+            return CurlResponse(
+                response.status_code,
+                b"",
+                "response exceeded safety limit",
+                63,
+                f"httpx-{response.http_version}",
+            )
+        return CurlResponse(
+            response.status_code,
+            response.content,
+            f"httpx {response.http_version}",
+            0,
+            f"httpx-{response.http_version}",
+        )
+
+    def _response_is_authoritative(
+        self,
+        response: CurlResponse,
+        username: str,
+    ) -> bool:
+        if response.status_code == 404:
+            return True
+        if response.status_code != 200:
+            return False
+        return (
+            self._parse_profile_response(response.body, username, 200) is not None
+            or self._body_indicates_deactivated(response.body)
+        )
+
     async def _execute_curl(self, username: str) -> CurlResponse:
         last_response: CurlResponse | None = None
         for attempt in range(1, self.CURL_ATTEMPTS + 1):
-            response = await self._execute_curl_once(username)
+            response = await self._execute_curl_once(username, force_http2=False)
             if response.status_code in {200, 404} and response.body:
                 return response
             if response.status_code == 404:
@@ -300,7 +401,12 @@ class InstagramChecker:
                 await asyncio.sleep(0.4 * attempt)
         return last_response or CurlResponse(None, b"", "curl did not run", 1)
 
-    async def _execute_curl_once(self, username: str) -> CurlResponse:
+    async def _execute_curl_once(
+        self,
+        username: str,
+        *,
+        force_http2: bool,
+    ) -> CurlResponse:
         safe_username = quote(username.strip(), safe="")
         url = (
             f"{self.settings.instagram_base_url}"
@@ -311,14 +417,17 @@ class InstagramChecker:
         command = (
             self.CURL_EXECUTABLE,
             "-s",
+            "--http2",
             "-A",
             USER_AGENTS[0],
-            url,
             "-H",
             f"X-IG-App-ID: {WEB_PROFILE_APP_ID}",
             "--write-out",
             status_marker,
+            url,
         )
+        if not force_http2:
+            command = tuple(part for part in command if part != "--http2")
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -326,7 +435,7 @@ class InstagramChecker:
                 stderr=asyncio.subprocess.PIPE,
             )
         except (FileNotFoundError, OSError) as exc:
-            return CurlResponse(None, b"", str(exc), 127)
+            return CurlResponse(None, b"", str(exc), 127, "curl")
 
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -337,20 +446,50 @@ class InstagramChecker:
             process.kill()
             with suppress(Exception):
                 await process.communicate()
-            return CurlResponse(None, b"", "curl execution timed out", 28)
+            return CurlResponse(
+                None,
+                b"",
+                "curl execution timed out",
+                28,
+                "curl-http2" if force_http2 else "curl",
+            )
 
         error = stderr.decode("utf-8", errors="replace").strip() or None
         if process.returncode != 0:
-            return CurlResponse(None, b"", error, process.returncode or 1)
+            return CurlResponse(
+                None,
+                b"",
+                error,
+                process.returncode or 1,
+                "curl-http2" if force_http2 else "curl",
+            )
         if len(stdout) > self.MAX_RESPONSE_BYTES:
-            return CurlResponse(None, b"", "response exceeded safety limit", 63)
+            return CurlResponse(
+                None,
+                b"",
+                "response exceeded safety limit",
+                63,
+                "curl-http2" if force_http2 else "curl",
+            )
 
         marker = b"\n__FARSTAR_HTTP_STATUS__:"
         body, separator, status_bytes = stdout.rpartition(marker)
         status_bytes = status_bytes.strip()
         if not separator or not status_bytes.isdigit():
-            return CurlResponse(None, b"", "curl did not return an HTTP status", 1)
-        return CurlResponse(int(status_bytes), body, error, process.returncode or 0)
+            return CurlResponse(
+                None,
+                b"",
+                "curl did not return an HTTP status",
+                1,
+                "curl-http2" if force_http2 else "curl",
+            )
+        return CurlResponse(
+            int(status_bytes),
+            body,
+            error,
+            process.returncode or 0,
+            "curl-http2" if force_http2 else "curl",
+        )
 
     @classmethod
     def _parse_profile_response(
@@ -480,8 +619,7 @@ class InstagramChecker:
             for target_id in target_ids:
                 queue.put_nowait(target_id)
 
-            # Instagram requests are deliberately serialized by the global gate.
-            # A single scheduler worker prevents queued background workers from
+            # A single scheduler worker prevents queued background requests from
             # starving interactive profile requests.
             worker_count = 1
             for _ in range(worker_count):
