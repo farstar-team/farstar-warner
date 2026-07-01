@@ -43,6 +43,7 @@ class EmbedProfile:
     biography: str | None = None
     profile_picture_url: str | None = None
     follower_count: int | None = None
+    following_count: int | None = None
     follower_display: str | None = None
     post_count: int | None = None
     is_private: bool | None = None

@@ -135,11 +135,8 @@ def registration_confirmation_keyboard(
     *,
     inactive: bool = False,
     profile_url: str | None = None,
+    allow_status_choice: bool = False,
 ) -> InlineKeyboardMarkup:
-    confirm_text = (
-        "⏳ ثبت به‌عنوان پیج غیرفعال" if inactive else "✅ بله، همین پیج ثبت شود"
-    )
-    status = "inactive" if inactive else "active"
     rows: list[list[InlineKeyboardButton]] = []
     if profile_url:
         rows.append(
@@ -150,20 +147,42 @@ def registration_confirmation_keyboard(
                 )
             ]
         )
-    rows.extend(
-        [
+    if allow_status_choice:
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton(
+                        text="✅ پیج فعال است؛ ثبت شود",
+                        callback_data="register:confirm:active",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="⏳ پیج فعلاً غیرفعال است",
+                        callback_data="register:confirm:inactive",
+                    )
+                ],
+            ]
+        )
+    else:
+        confirm_text = (
+            "⏳ ثبت به‌عنوان پیج غیرفعال" if inactive else "✅ بله، همین پیج ثبت شود"
+        )
+        status = "inactive" if inactive else "active"
+        rows.append(
             [
                 InlineKeyboardButton(
                     text=confirm_text,
                     callback_data=f"register:confirm:{status}",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="❌ خیر، لغو ثبت",
-                    callback_data="register:cancel",
-                )
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="❌ این پیج نیست؛ لغو",
+                callback_data="register:cancel",
+            )
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)

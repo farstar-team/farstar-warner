@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,6 @@ from typing import Any
 from urllib.parse import urlparse
 
 from aiogram import BaseMiddleware, Bot, F, Router
-from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,7 +19,7 @@ from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
-from bot.checker import CheckOutcome, InstagramChecker
+from bot.checker import CheckOutcome, InstagramChecker, ProfileResult
 from bot.config import Settings
 from bot.database import SessionFactory
 from bot.keyboards.inline import (
@@ -47,6 +47,7 @@ from bot.version import APP_VERSION, version_message
 
 
 router = Router(name="user")
+logger = logging.getLogger(__name__)
 
 PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_](?:[A-Za-z0-9._]{0,28}[A-Za-z0-9_])?$")
@@ -142,6 +143,25 @@ def format_datetime(value: datetime | None) -> str:
         return "ثبت نشده"
     utc_value = value.astimezone(timezone.utc)
     return to_persian_digits(utc_value.strftime("%Y/%m/%d - %H:%M")) + " به وقت جهانی"
+
+
+def profile_result_to_embed(
+    result: ProfileResult,
+    requested_username: str,
+) -> EmbedProfile:
+    return EmbedProfile(
+        outcome=PreviewOutcome.ACTIVE,
+        username=result.canonical_username or requested_username,
+        full_name=result.full_name,
+        biography=result.biography,
+        profile_picture_url=result.profile_picture_url,
+        follower_count=result.follower_count,
+        following_count=result.following_count,
+        post_count=result.post_count,
+        is_private=result.is_private,
+        is_verified=result.is_verified,
+        diagnostic="web_profile_api",
+    )
 
 
 def normalize_instagram_username(raw_value: str) -> str | None:
@@ -399,40 +419,37 @@ async def add_page(
     await message.answer("در حال بررسی پیج و ساخت تصویر تأیید… لطفاً کمی صبر کنید.")
     status = await checker.fetch_profile(username)
     if status.outcome == CheckOutcome.ACTIVE:
-        preview = await profile_preview.inspect(username)
-        preview_is_complete = preview.outcome == PreviewOutcome.ACTIVE
-        if preview.outcome != PreviewOutcome.ACTIVE:
-            diagnostic = preview.diagnostic
-            preview = EmbedProfile(
-                PreviewOutcome.ACTIVE,
-                username=username,
-                full_name="Public profile confirmed",
-                diagnostic=diagnostic,
-            )
-        card = await profile_preview.render_card(preview)
+        confirmed_username = status.canonical_username or username
+        preview = profile_result_to_embed(status, confirmed_username)
         await state.update_data(
-            pending_username=username,
+            pending_username=confirmed_username,
             pending_status=PageStatus.ACTIVE.value,
             pending_profile_id=status.profile_id,
         )
         await state.set_state(AddPageState.waiting_for_confirmation)
         caption = (
-            f"پیج <b>@{html.escape(username)}</b> پیدا شد و مشخصات عمومی آن در تصویر آمده است.\n\n"
+            f"{_profile_details_caption(preview)}\n\n"
             "آیا همین پیج را می‌خواهید پایش کنید؟"
-            if preview_is_complete
-            else (
-                f"فعال‌بودن پیج <b>@{html.escape(username)}</b> از پاسخ عمومی اینستاگرام تأیید شد، "
-                "اما اینستاگرام جزئیات تصویر و آمار را به Chromium سرور نداد.\n\n"
-                "برای اطمینان، پیج را با دکمه زیر مستقیماً باز کنید. در صورت درست‌بودن نام کاربری، ثبت را تأیید کنید."
+        )
+        keyboard = registration_confirmation_keyboard(
+            profile_url=f"https://www.instagram.com/{confirmed_username}/"
+        )
+        try:
+            card = await profile_preview.render_card(preview)
+            await message.answer_photo(
+                BufferedInputFile(
+                    card,
+                    filename=f"farstar-{confirmed_username}.jpg",
+                ),
+                caption=caption,
+                reply_markup=keyboard,
             )
-        )
-        await message.answer_photo(
-            BufferedInputFile(card, filename=f"farstar-{username}.jpg"),
-            caption=caption,
-            reply_markup=registration_confirmation_keyboard(
-                profile_url=f"https://www.instagram.com/{username}/"
-            ),
-        )
+        except Exception:
+            logger.exception(
+                "Could not render or send registration card for %s",
+                confirmed_username,
+            )
+            await message.answer(caption, reply_markup=keyboard)
         return
 
     if status.outcome == CheckOutcome.DEACTIVATED:
@@ -445,17 +462,32 @@ async def add_page(
         await message.answer(
             f"پیج <b>@{html.escape(username)}</b> اکنون پیدا نشد. ممکن است دی‌اکتیو، حذف یا نام کاربری آن تغییر کرده باشد.\n\n"
             "اگر منتظر فعال‌شدن این نام کاربری هستید، می‌توانید آن را به‌صورت غیرفعال ثبت کنید.",
-            reply_markup=registration_confirmation_keyboard(inactive=True),
+            reply_markup=registration_confirmation_keyboard(
+                inactive=True,
+                profile_url=f"https://www.instagram.com/{username}/",
+            ),
         )
         return
 
-    if status.outcome == CheckOutcome.RATE_LIMITED:
-        await message.answer(
-            "بررسی وضعیت اینستاگرام موقتاً محدود شده است. نام کاربری ثبت نشد؛ کمی بعد دوباره تلاش کنید."
-        )
-        return
+    await state.update_data(
+        pending_username=username,
+        pending_status="Unknown",
+        pending_profile_id=None,
+    )
+    await state.set_state(AddPageState.waiting_for_confirmation)
+    reason = (
+        "اینستاگرام موقتاً تعداد درخواست‌ها را محدود کرده است."
+        if status.outcome == CheckOutcome.RATE_LIMITED
+        else "اینستاگرام در این لحظه پاسخ قطعی نداد."
+    )
     await message.answer(
-        "در حال حاضر پاسخ قابل‌اعتمادی از اینستاگرام دریافت نشد. برای جلوگیری از ثبت اشتباه، کمی بعد دوباره تلاش کنید."
+        f"{reason}\n\n"
+        f"نام کاربری: <b>@{html.escape(username)}</b>\n"
+        "اگر پیج را می‌شناسید، وضعیت درست را انتخاب کنید. برای پیج دی‌اکتیو می‌توانید گزینه انتظار فعال‌شدن را بزنید.",
+        reply_markup=registration_confirmation_keyboard(
+            profile_url=f"https://www.instagram.com/{username}/",
+            allow_status_choice=True,
+        ),
     )
 
 
@@ -474,10 +506,14 @@ async def confirm_page_registration(
     username = data.get("pending_username")
     stored_status = data.get("pending_status")
     requested_status = (callback.data or "").rsplit(":", 1)[1]
-    expected_status = (
-        "inactive" if stored_status == PageStatus.DEACTIVATED.value else "active"
-    )
-    if not isinstance(username, str) or requested_status != expected_status:
+    if stored_status == "Unknown":
+        status_is_valid = requested_status in {"active", "inactive"}
+    else:
+        expected_status = (
+            "inactive" if stored_status == PageStatus.DEACTIVATED.value else "active"
+        )
+        status_is_valid = requested_status == expected_status
+    if not isinstance(username, str) or not status_is_valid:
         await state.clear()
         await callback.answer(
             "درخواست ثبت معتبر نیست. دوباره تلاش کنید.", show_alert=True
@@ -515,7 +551,11 @@ async def confirm_page_registration(
                 await state.clear()
                 await callback.answer("این پیج قبلاً ثبت شده است.", show_alert=True)
                 return
-            page_status = PageStatus(stored_status)
+            page_status = (
+                PageStatus.ACTIVE
+                if requested_status == "active"
+                else PageStatus.DEACTIVATED
+            )
             target = TargetPage(
                 instagram_username=username,
                 user_id=user.telegram_id,
@@ -551,11 +591,7 @@ async def confirm_page_registration(
         return
 
     await state.clear()
-    status_text = (
-        "فعال"
-        if stored_status == PageStatus.ACTIVE.value
-        else "غیرفعال و منتظر فعال‌شدن"
-    )
+    status_text = "فعال" if requested_status == "active" else "غیرفعال و منتظر فعال‌شدن"
     if callback.message:
         await callback.message.answer(
             f"پیج <b>@{html.escape(username)}</b> با وضعیت «{status_text}» ثبت شد. ✅",
@@ -624,8 +660,10 @@ def _profile_details_caption(details: EmbedProfile) -> str:
     full_name = html.escape(details.full_name or "ثبت نشده")
     if details.is_private:
         privacy = "خصوصی 🔒"
-    else:
+    elif details.is_private is False:
         privacy = "عمومی 🌐"
+    else:
+        privacy = "نامشخص"
     verified = "تأییدشده ✅" if details.is_verified else "تأییدنشده"
     follower_text = (
         to_persian_digits(details.follower_display)
@@ -639,6 +677,7 @@ def _profile_details_caption(details: EmbedProfile) -> str:
         f"نوع پیج: <b>{privacy}</b>",
         f"وضعیت تأیید: {verified}",
         f"تعداد دنبال‌کننده: <b>{follower_text}</b>",
+        f"تعداد دنبال‌شونده: <b>{format_count(details.following_count)}</b>",
         f"تعداد پست: <b>{format_count(details.post_count)}</b>",
     ]
     if details.biography:
@@ -648,7 +687,7 @@ def _profile_details_caption(details: EmbedProfile) -> str:
         lines.extend(("", f"بیوگرافی:\n{html.escape(biography)}"))
     else:
         lines.extend(("", "بیوگرافی در نمای عمومی اینستاگرام ارائه نشده است."))
-    lines.extend(("", "اطلاعات از نمای عمومی و بدون ورود به حساب دریافت شد."))
+    lines.extend(("", "اطلاعات از رابط وب اینستاگرام و بدون ورود به حساب دریافت شد."))
     return "\n".join(lines)
 
 
@@ -676,37 +715,34 @@ async def live_profile_details(
         return
 
     await callback.answer("در حال دریافت اطلاعات زنده…")
-    details = await profile_preview.inspect(page.instagram_username)
-    if details.outcome == PreviewOutcome.DEACTIVATED:
+    status = await checker.fetch_profile(page.instagram_username)
+    if status.outcome == CheckOutcome.ACTIVE:
+        details = profile_result_to_embed(status, page.instagram_username)
+    elif status.outcome == CheckOutcome.DEACTIVATED:
         await callback.message.answer(
             f"پیج <b>@{html.escape(page.instagram_username)}</b> در حال حاضر در دسترس نیست یا دی‌اکتیو شده است."
         )
         return
-    if details.outcome != PreviewOutcome.ACTIVE:
-        status = await checker.fetch_profile(page.instagram_username)
-        if status.outcome == CheckOutcome.ACTIVE:
+    else:
+        details = await profile_preview.inspect(page.instagram_username)
+        if details.outcome != PreviewOutcome.ACTIVE:
             await callback.message.answer(
-                f"پیج <b>@{html.escape(page.instagram_username)}</b> فعال است، اما ساخت تصویر زنده این بار انجام نشد. کمی بعد دوباره تلاش کنید."
+                "دریافت اطلاعات زنده این پیج فعلاً ممکن نیست. وضعیت ذخیره‌شده تغییر نکرد."
             )
             return
-        if status.outcome == CheckOutcome.DEACTIVATED:
-            await callback.message.answer(
-                f"پیج <b>@{html.escape(page.instagram_username)}</b> اکنون در دسترس نیست."
-            )
-            return
-        await callback.message.answer(
-            "دریافت اطلاعات زنده این پیج فعلاً ممکن نیست. کمی بعد دوباره تلاش کنید."
-        )
-        return
 
     caption = _profile_details_caption(details)
-    card = await profile_preview.render_card(details)
     try:
+        card = await profile_preview.render_card(details)
         await callback.message.answer_photo(
             BufferedInputFile(card, filename=f"farstar-{page.instagram_username}.jpg"),
             caption=caption,
         )
-    except TelegramAPIError:
+    except Exception:
+        logger.exception(
+            "Could not render or send live profile card for %s",
+            page.instagram_username,
+        )
         await callback.message.answer(caption)
 
 

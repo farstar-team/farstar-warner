@@ -52,6 +52,14 @@ class ProfileResult:
     outcome: CheckOutcome
     canonical_username: str | None = None
     profile_id: str | None = None
+    full_name: str | None = None
+    biography: str | None = None
+    profile_picture_url: str | None = None
+    follower_count: int | None = None
+    following_count: int | None = None
+    post_count: int | None = None
+    is_private: bool | None = None
+    is_verified: bool = False
     retry_after: int | None = None
     http_status: int | None = None
 
@@ -167,6 +175,24 @@ class InstagramChecker:
                 CheckOutcome.ACTIVE,
                 canonical_username=canonical_username,
                 profile_id=profile_id,
+                full_name=self._optional_text(user_data.get("full_name")),
+                biography=self._optional_text(user_data.get("biography")),
+                profile_picture_url=self._optional_text(
+                    user_data.get("profile_pic_url_hd")
+                    or user_data.get("profile_pic_url")
+                ),
+                follower_count=self._edge_count(user_data, "edge_followed_by"),
+                following_count=self._edge_count(user_data, "edge_follow"),
+                post_count=self._edge_count(
+                    user_data,
+                    "edge_owner_to_timeline_media",
+                ),
+                is_private=(
+                    user_data.get("is_private")
+                    if isinstance(user_data.get("is_private"), bool)
+                    else None
+                ),
+                is_verified=bool(user_data.get("is_verified", False)),
                 http_status=status_code,
             )
 
@@ -473,6 +499,27 @@ class InstagramChecker:
             logger.warning(
                 "Telegram notification failed for user %s: %s", telegram_id, exc
             )
+
+    @staticmethod
+    def _optional_text(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @staticmethod
+    def _edge_count(user_data: dict[object, object], field: str) -> int | None:
+        edge = user_data.get(field)
+        if not isinstance(edge, dict):
+            return None
+        value = edge.get("count")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> int | None:
