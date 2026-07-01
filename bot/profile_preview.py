@@ -395,9 +395,15 @@ class ProfilePreviewService:
             (540, 545), f"@{profile.username}", font=bold, fill="#ffffff", anchor="ma"
         )
         if profile.full_name:
+            full_name = cls._ellipsize_for_width(
+                draw,
+                profile.full_name,
+                regular,
+                830,
+            )
             draw.text(
                 (540, 615),
-                cls._display(profile.full_name),
+                cls._display(full_name),
                 font=regular,
                 fill="#d8d9e8",
                 anchor="ma",
@@ -447,11 +453,29 @@ class ProfilePreviewService:
             profile.biography
             or "Biography is not exposed by the public Instagram surface."
         )
-        wrapped = cls._wrap_for_width(draw, biography, small, 800)[:4]
+        biography_was_truncated = len(biography.strip()) > 260
+        biography = cls._clip_text(biography, 260)
+        wrapped = cls._wrap_for_width(draw, biography, small, 800)
+        if len(wrapped) > 3:
+            wrapped = wrapped[:3]
+            biography_was_truncated = True
+        if wrapped and biography_was_truncated:
+            wrapped[-1] = cls._ellipsize_for_width(
+                draw,
+                f"{wrapped[-1]}...",
+                small,
+                800,
+            )
         y = 1010
         for line in wrapped:
             if re.search(r"[\u0600-\u06ff]", line):
-                cls._draw_rtl_words(draw, line, 940, y, small, "#ffffff")
+                draw.text(
+                    (940, y),
+                    cls._display(line),
+                    font=small,
+                    fill="#ffffff",
+                    anchor="ra",
+                )
             else:
                 draw.text(
                     (135, y),
@@ -478,14 +502,20 @@ class ProfilePreviewService:
     @staticmethod
     def _font(size: int, *, bold: bool) -> ImageFont.FreeTypeFont:
         names = (
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf"
             if bold
-            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            else "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"
             if bold
             else "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "C:/Windows/Fonts/tahomabd.ttf" if bold else "C:/Windows/Fonts/tahoma.ttf",
             "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         )
         for name in names:
             if Path(name).exists():
@@ -494,7 +524,7 @@ class ProfilePreviewService:
 
     @staticmethod
     def _rtl(value: str) -> str:
-        return get_display(arabic_reshaper.reshape(value))
+        return get_display(arabic_reshaper.reshape(value), base_dir="R")
 
     @classmethod
     def _display(cls, value: str) -> str:
@@ -546,24 +576,37 @@ class ProfilePreviewService:
         return lines
 
     @classmethod
-    def _draw_rtl_words(
+    def _ellipsize_for_width(
         cls,
         draw: ImageDraw.ImageDraw,
         value: str,
-        right: int,
-        y: int,
         font: ImageFont.FreeTypeFont,
-        fill: str,
-    ) -> None:
-        space_box = draw.textbbox((0, 0), " ", font=font)
-        space_width = max(space_box[2] - space_box[0], font.size // 3)
-        cursor = right
-        for word in value.split():
-            rendered = cls._rtl(word)
+        max_width: int,
+    ) -> str:
+        value = value.strip()
+        if not value:
+            return value
+        rendered = cls._display(value)
+        box = draw.textbbox((0, 0), rendered, font=font)
+        if box[2] - box[0] <= max_width:
+            return value
+        suffix = "..."
+        shortened = value
+        while shortened:
+            shortened = shortened[:-1].rstrip()
+            candidate = shortened + suffix
+            rendered = cls._display(candidate)
             box = draw.textbbox((0, 0), rendered, font=font)
-            width = box[2] - box[0]
-            draw.text((cursor, y), rendered, font=font, fill=fill, anchor="ra")
-            cursor -= width + space_width
+            if box[2] - box[0] <= max_width:
+                return candidate
+        return suffix
+
+    @staticmethod
+    def _clip_text(value: str, limit: int) -> str:
+        value = value.strip()
+        if len(value) <= limit:
+            return value
+        return value[: max(0, limit - 3)].rstrip() + "..."
 
     @classmethod
     def _avatar(

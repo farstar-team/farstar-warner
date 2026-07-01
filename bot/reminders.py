@@ -11,12 +11,10 @@ from sqlalchemy import select
 from bot.database import SessionFactory
 from bot.keyboards.inline import expiry_reminder_keyboard
 from bot.models import SubscriptionReminderPreference, User, UserSubscription, UserStatus
+from bot.time_utils import format_datetime_dual, to_persian_digits
 
 
 logger = logging.getLogger(__name__)
-PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
-
-
 async def send_expiry_reminders(bot: Bot, session_factory: SessionFactory) -> None:
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -55,9 +53,10 @@ async def send_expiry_reminders(bot: Bot, session_factory: SessionFactory) -> No
                 await bot.send_message(
                     user.telegram_id,
                     "یادآوری پایان اشتراک ⏳\n\n"
-                    f"تنها <b>{str(days_left).translate(PERSIAN_DIGITS)} روز</b> از اشتراک "
+                    f"تنها <b>{to_persian_digits(days_left)} روز</b> از اشتراک "
                     f"<b>{html.escape(subscription.plan_name)}</b> شما باقی مانده است. "
-                    "با تمدید زودتر، مدت جدید به اعتبار فعلی شما اضافه می‌شود.",
+                    "با تمدید زودتر، مدت جدید به اعتبار فعلی شما اضافه می‌شود.\n\n"
+                    f"تاریخ پایان:\n{format_datetime_dual(expires_at)}",
                     reply_markup=expiry_reminder_keyboard(),
                 )
             except TelegramAPIError as exc:

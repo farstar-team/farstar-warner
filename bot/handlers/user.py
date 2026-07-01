@@ -63,6 +63,7 @@ from bot.models import (
     UserStatus,
 )
 from bot.profile_preview import EmbedProfile, PreviewOutcome, ProfilePreviewService
+from bot.time_utils import format_datetime_dual, format_datetime_dual_plain
 from bot.version import APP_VERSION, version_message
 
 
@@ -232,10 +233,7 @@ def format_count(value: int | None) -> str:
 
 
 def format_datetime(value: datetime | None) -> str:
-    if value is None:
-        return "ثبت نشده"
-    utc_value = value.astimezone(timezone.utc)
-    return to_persian_digits(utc_value.strftime("%Y/%m/%d - %H:%M")) + " به وقت جهانی"
+    return format_datetime_dual(value)
 
 
 def profile_result_to_embed(
@@ -256,6 +254,22 @@ def profile_result_to_embed(
         diagnostic=(
             "web_profile_api_cache" if result.from_cache else "web_profile_api"
         ),
+    )
+
+
+def snapshot_to_embed(page: TargetPage, snapshot: PageSnapshot) -> EmbedProfile:
+    return EmbedProfile(
+        outcome=PreviewOutcome.ACTIVE,
+        username=page.instagram_username,
+        full_name=snapshot.full_name,
+        biography=snapshot.biography,
+        profile_picture_url=snapshot.profile_picture_url,
+        follower_count=snapshot.follower_count,
+        following_count=snapshot.following_count,
+        post_count=snapshot.post_count,
+        is_private=snapshot.is_private,
+        is_verified=snapshot.is_verified,
+        diagnostic="web_profile_api_cache",
     )
 
 
@@ -556,7 +570,11 @@ async def add_page(
         return
 
     await message.answer("در حال بررسی پیج و ساخت تصویر تأیید… لطفاً کمی صبر کنید.")
-    status = await checker.fetch_profile(username)
+    status = await checker.fetch_profile(
+        username,
+        allow_stale=False,
+        force_refresh=True,
+    )
     if status.outcome == CheckOutcome.ACTIVE:
         confirmed_username = status.canonical_username or username
         preview = profile_result_to_embed(status, confirmed_username)
@@ -838,9 +856,9 @@ def _profile_details_caption(details: EmbedProfile) -> str:
     source_text = (
         "آخرین پاسخ سالم ذخیره‌شده نمایش داده شد؛ اینستاگرام موقتاً پاسخ زنده نداد."
         if details.diagnostic == "web_profile_api_cache"
-        else "اطلاعات از رابط وب اینستاگرام و بدون ورود به حساب دریافت شد."
+        else "اطلاعات از Web Profile API اینستاگرام و بدون ورود به حساب دریافت شد."
     )
-    lines.extend(("", source_text))
+    lines.extend(("", source_text, "", f"زمان تولید گزارش:\n{format_datetime(datetime.now(timezone.utc))}"))
     return "\n".join(lines)
 
 
@@ -873,7 +891,11 @@ async def live_profile_details(
         return
 
     await callback.answer("در حال دریافت اطلاعات زنده…")
-    status = await checker.fetch_profile(page.instagram_username)
+    status = await checker.fetch_profile(
+        page.instagram_username,
+        allow_stale=False,
+        force_refresh=True,
+    )
     if status.outcome == CheckOutcome.ACTIVE:
         details = profile_result_to_embed(status, page.instagram_username)
     elif status.outcome == CheckOutcome.DEACTIVATED:
@@ -882,26 +904,19 @@ async def live_profile_details(
         )
         return
     else:
-        details = await profile_preview.inspect(page.instagram_username)
-        if details.outcome != PreviewOutcome.ACTIVE:
-            if snapshot is None:
-                await callback.message.answer(
-                    "دریافت اطلاعات این پیج فعلاً ممکن نیست. وضعیت ذخیره‌شده تغییر نکرد."
-                )
-                return
-            details = EmbedProfile(
-                outcome=PreviewOutcome.ACTIVE,
-                username=page.instagram_username,
-                full_name=snapshot.full_name,
-                biography=snapshot.biography,
-                profile_picture_url=snapshot.profile_picture_url,
-                follower_count=snapshot.follower_count,
-                following_count=snapshot.following_count,
-                post_count=snapshot.post_count,
-                is_private=snapshot.is_private,
-                is_verified=snapshot.is_verified,
-                diagnostic="web_profile_api_cache",
+        if snapshot is None:
+            http_text = (
+                to_persian_digits(status.http_status)
+                if status.http_status
+                else "ثبت نشد"
             )
+            await callback.message.answer(
+                "دریافت اطلاعات زنده این پیج فعلاً قطعی نبود؛ وضعیت ذخیره‌شده تغییر نکرد.\n\n"
+                f"کد HTTP: <code>{http_text}</code>\n"
+                "چند لحظه بعد دوباره امتحان کنید."
+            )
+            return
+        details = snapshot_to_embed(page, snapshot)
 
     caption = _profile_details_caption(details)
     try:
@@ -969,7 +984,11 @@ async def run_security_tool(
     keyboard = security_tools_keyboard(page.id)
 
     if action == "check":
-        result = await checker.fetch_profile(page.instagram_username)
+        result = await checker.fetch_profile(
+            page.instagram_username,
+            allow_stale=False,
+            force_refresh=True,
+        )
         current_names = {
             CheckOutcome.ACTIVE: "فعال و قابل مشاهده ✅",
             CheckOutcome.DEACTIVATED: "غیرفعال یا نام کاربری تغییر کرده ⚠️",
@@ -1052,12 +1071,24 @@ async def run_security_tool(
         )
         return
 
-    live_result = await checker.fetch_profile(page.instagram_username)
+    live_result = await checker.fetch_profile(
+        page.instagram_username,
+        allow_stale=False,
+        force_refresh=True,
+    )
     if live_result.outcome == CheckOutcome.ACTIVE:
         details = profile_result_to_embed(live_result, page.instagram_username)
     else:
-        details = await profile_preview.inspect(
-            page.instagram_username, use_cache=False
+        async with session_factory() as session:
+            snapshot = await session.get(PageSnapshot, page.id)
+        details = (
+            snapshot_to_embed(page, snapshot)
+            if snapshot is not None
+            else EmbedProfile(
+                outcome=PreviewOutcome.UNKNOWN,
+                username=page.instagram_username,
+                diagnostic="web_profile_api_unavailable",
+            )
         )
     if details.outcome != PreviewOutcome.ACTIVE and action in {
         "fingerprint",
@@ -1183,6 +1214,7 @@ async def run_security_tool(
             )
         report = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at_dual": format_datetime_dual_plain(datetime.now(timezone.utc)),
             "page": {
                 "username": page.instagram_username,
                 "stored_status": page.last_known_status.value
@@ -1191,6 +1223,9 @@ async def run_security_tool(
                 "last_checked_at": page.last_checked_at.isoformat()
                 if page.last_checked_at
                 else None,
+                "last_checked_at_dual": format_datetime_dual_plain(
+                    page.last_checked_at
+                ),
             },
             "public_profile": identity
             | {
@@ -1211,6 +1246,9 @@ async def run_security_tool(
                     "is_private": snapshot.is_private,
                     "is_verified": snapshot.is_verified,
                     "updated_at": snapshot.updated_at.isoformat(),
+                    "updated_at_dual": format_datetime_dual_plain(
+                        snapshot.updated_at
+                    ),
                 }
                 if snapshot
                 else None
@@ -1224,11 +1262,28 @@ async def run_security_tool(
                     "type": event.event_type,
                     "description": event.description,
                     "created_at": event.created_at.isoformat(),
+                    "created_at_dual": format_datetime_dual_plain(event.created_at),
                 }
                 for event in events
             ],
         }
         payload = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+        if details.outcome == PreviewOutcome.ACTIVE:
+            try:
+                card = await profile_preview.render_card(details)
+                await callback.message.answer_photo(
+                    BufferedInputFile(
+                        card,
+                        filename=f"farstar-evidence-{page.instagram_username}.jpg",
+                    ),
+                    caption=f"تصویر شواهد پیج <b>@{username}</b> آماده شد. 🖼️",
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not render evidence card for %s",
+                    page.instagram_username,
+                )
         await callback.message.answer_document(
             BufferedInputFile(
                 payload, filename=f"farstar-incident-{page.instagram_username}.json"

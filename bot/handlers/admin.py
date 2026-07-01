@@ -50,6 +50,7 @@ from bot.models import (
     PlanTier,
 )
 from bot.profile_preview import PreviewOutcome, ProfilePreviewService
+from bot.time_utils import format_datetime_dual
 
 
 router = Router(name="admin")
@@ -854,7 +855,7 @@ async def approve_receipt(
             "فیش پرداخت شما تأیید شد. ✅\n\n"
             f"پلن فعال: <b>{html.escape(plan_name)}</b>\n"
             f"مدت افزوده‌شده: {_digits(duration_days)} روز\n"
-            f"تاریخ پایان: {_digits(new_expiry.strftime('%Y/%m/%d - %H:%M'))} به وقت جهانی",
+            f"تاریخ پایان:\n{format_datetime_dual(new_expiry)}",
         )
     except TelegramAPIError:
         logger.exception(
@@ -1321,7 +1322,8 @@ async def system_stats(
         f"رخدادهای ۲۴ ساعت اخیر: {_digits(events_24h or 0)}\n\n"
         f"پلن‌های فروش فعال: {_digits(active_plans or 0)}\n"
         f"فیش‌های در انتظار: {_digits(pending_receipt_count or 0)}\n"
-        f"کانال‌های عضویت اجباری: {_digits(required_channels or 0)}"
+        f"کانال‌های عضویت اجباری: {_digits(required_channels or 0)}\n\n"
+        f"زمان گزارش:\n{format_datetime_dual(now)}"
     )
     if callback.message:
         await callback.message.edit_text(text, reply_markup=admin_panel_keyboard())
@@ -1455,14 +1457,11 @@ async def finish_renew_subscription(
         await session.commit()
 
     await state.clear()
-    expiry_text = _digits(
-        new_expiry.astimezone(timezone.utc).strftime("%Y/%m/%d - %H:%M")
-    )
     await message.answer(
         "اشتراک کاربر با موفقیت تمدید شد. ✅\n\n"
         f"شناسه کاربر: <code>{_digits(user_id)}</code>\n"
         f"پلن: {PLAN_NAMES[plan]}\n"
-        f"اعتبار جدید: {expiry_text} به وقت جهانی",
+        f"اعتبار جدید:\n{format_datetime_dual(new_expiry)}",
         reply_markup=main_menu_keyboard(is_admin=True),
     )
 

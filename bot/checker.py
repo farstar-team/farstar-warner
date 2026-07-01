@@ -4,8 +4,6 @@ import asyncio
 import html
 import json
 import logging
-import random
-import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -85,14 +83,12 @@ class InstagramChecker:
     LOCK_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 8_000_000
     CURL_EXECUTABLE = "curl"
+    CURL_ATTEMPTS = 3
     PROFILE_CACHE_PREFIX = "farstar:instagram:profile:fresh:"
     PROFILE_STALE_PREFIX = "farstar:instagram:profile:stale:"
     PROFILE_LOCK_PREFIX = "farstar:instagram:profile-lock:"
-    CURL_GATE_LOCK_KEY = "farstar:instagram:curl-gate"
-    CURL_LAST_REQUEST_KEY = "farstar:instagram:curl-last-request"
-    FRESH_CACHE_SECONDS = 300
+    FRESH_CACHE_SECONDS = 60
     STALE_CACHE_SECONDS = 86400
-    MIN_REQUEST_INTERVAL_SECONDS = 8.0
 
     def __init__(
         self,
@@ -130,19 +126,24 @@ class InstagramChecker:
             if cached is not None:
                 return replace(cached, from_cache=True)
 
-        await asyncio.sleep(
-            random.uniform(
-                self.settings.check_jitter_min_seconds,
-                self.settings.check_jitter_max_seconds,
-            )
-        )
         profile_lock = self.redis.lock(
             f"{self.PROFILE_LOCK_PREFIX}{normalized_username}",
-            timeout=120,
-            blocking_timeout=90,
+            timeout=60,
+            blocking_timeout=30,
         )
         acquired = await profile_lock.acquire()
         if not acquired:
+            if force_refresh:
+                response = await self._execute_curl(normalized_username)
+                result = await self._profile_result_from_response(
+                    response,
+                    normalized_username,
+                )
+                if result.outcome == CheckOutcome.ACTIVE:
+                    await self._cache_profile(result, normalized_username)
+                elif result.outcome == CheckOutcome.DEACTIVATED:
+                    await self._cache_deactivated(result, normalized_username)
+                return result
             return await self._stale_or_unknown(normalized_username, allow_stale)
         try:
             if not force_refresh:
@@ -151,7 +152,7 @@ class InstagramChecker:
                 )
                 if cached is not None:
                     return replace(cached, from_cache=True)
-            response = await self._execute_curl_throttled(normalized_username)
+            response = await self._execute_curl(normalized_username)
             result = await self._profile_result_from_response(
                 response,
                 normalized_username,
@@ -179,7 +180,7 @@ class InstagramChecker:
         response: CurlResponse,
         username: str,
     ) -> ProfileResult:
-        if response.status_code is None:
+        if response.status_code is None and not response.body:
             logger.warning(
                 "Instagram curl request failed for %s (code %s): %s",
                 username,
@@ -188,11 +189,25 @@ class InstagramChecker:
             )
             await self._alert_access_issue(username, None, response.error)
             return ProfileResult(CheckOutcome.UNKNOWN)
+
+        result = self._parse_profile_response(
+            response.body,
+            username,
+            response.status_code,
+        )
+        if result is not None:
+            return result
+
         status_code = response.status_code
-        if status_code == 429:
-            return ProfileResult(CheckOutcome.RATE_LIMITED, http_status=status_code)
-        if status_code == 404:
+        if status_code == 404 or self._body_indicates_deactivated(response.body):
             return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
+        if status_code == 429:
+            await self._alert_access_issue(
+                username,
+                status_code,
+                "Instagram returned HTTP 429 to the curl transport",
+            )
+            return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
         if status_code != 200:
             logger.info(
                 "Instagram Web Profile API returned HTTP %s for %s",
@@ -201,40 +216,12 @@ class InstagramChecker:
             )
             await self._alert_access_issue(username, status_code)
             return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
-        result = self._parse_profile_response(response.body, username, status_code)
-        if result is None:
-            await self._alert_access_issue(
-                username,
-                status_code,
-                "پاسخ JSON معتبر نبود",
-            )
-            return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
-        return result
-
-    async def _execute_curl_throttled(self, username: str) -> CurlResponse:
-        gate = self.redis.lock(
-            self.CURL_GATE_LOCK_KEY,
-            timeout=90,
-            blocking_timeout=75,
+        await self._alert_access_issue(
+            username,
+            status_code,
+            "پاسخ JSON شامل data.user معتبر نبود",
         )
-        acquired = await gate.acquire()
-        if not acquired:
-            return CurlResponse(None, b"", "curl rate gate timed out", 28)
-        try:
-            last_raw = await self.redis.get(self.CURL_LAST_REQUEST_KEY)
-            try:
-                last_request = float(last_raw or 0)
-            except (TypeError, ValueError):
-                last_request = 0
-            delay = self.MIN_REQUEST_INTERVAL_SECONDS - (time.time() - last_request)
-            if delay > 0:
-                await asyncio.sleep(delay)
-            response = await self._execute_curl(username)
-            await self.redis.set(self.CURL_LAST_REQUEST_KEY, str(time.time()), ex=300)
-            return response
-        finally:
-            with suppress(LockError):
-                await gate.release()
+        return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
 
     async def _cache_profile(
         self,
@@ -301,26 +288,36 @@ class InstagramChecker:
         return fallback or ProfileResult(CheckOutcome.UNKNOWN)
 
     async def _execute_curl(self, username: str) -> CurlResponse:
+        last_response: CurlResponse | None = None
+        for attempt in range(1, self.CURL_ATTEMPTS + 1):
+            response = await self._execute_curl_once(username)
+            if response.status_code in {200, 404} and response.body:
+                return response
+            if response.status_code == 404:
+                return response
+            last_response = response
+            if attempt < self.CURL_ATTEMPTS:
+                await asyncio.sleep(0.4 * attempt)
+        return last_response or CurlResponse(None, b"", "curl did not run", 1)
+
+    async def _execute_curl_once(self, username: str) -> CurlResponse:
         safe_username = quote(username.strip(), safe="")
         url = (
             f"{self.settings.instagram_base_url}"
             f"/api/v1/users/web_profile_info/?username={safe_username}"
         )
         request_timeout = self.settings.instagram_request_timeout_seconds
+        status_marker = "\n__FARSTAR_HTTP_STATUS__:%{http_code}"
         command = (
             self.CURL_EXECUTABLE,
-            "-sS",
+            "-s",
             "-A",
             USER_AGENTS[0],
+            url,
             "-H",
             f"X-IG-App-ID: {WEB_PROFILE_APP_ID}",
-            "--connect-timeout",
-            str(min(request_timeout, 10.0)),
-            "--max-time",
-            str(request_timeout),
             "--write-out",
-            "\n%{http_code}",
-            url,
+            status_marker,
         )
         try:
             process = await asyncio.create_subprocess_exec(
@@ -348,7 +345,9 @@ class InstagramChecker:
         if len(stdout) > self.MAX_RESPONSE_BYTES:
             return CurlResponse(None, b"", "response exceeded safety limit", 63)
 
-        body, separator, status_bytes = stdout.rpartition(b"\n")
+        marker = b"\n__FARSTAR_HTTP_STATUS__:"
+        body, separator, status_bytes = stdout.rpartition(marker)
+        status_bytes = status_bytes.strip()
         if not separator or not status_bytes.isdigit():
             return CurlResponse(None, b"", "curl did not return an HTTP status", 1)
         return CurlResponse(int(status_bytes), body, error, process.returncode or 0)
@@ -406,6 +405,29 @@ class InstagramChecker:
             http_status=status_code,
         )
 
+    @staticmethod
+    def _body_indicates_deactivated(body: bytes) -> bool:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        data = payload.get("data")
+        if isinstance(data, dict) and data.get("user") is None:
+            return True
+        message = str(payload.get("message") or "").lower()
+        status = str(payload.get("status") or "").lower()
+        return status == "fail" and any(
+            phrase in message
+            for phrase in (
+                "not found",
+                "not available",
+                "doesn't exist",
+                "user not found",
+            )
+        )
+
     async def _alert_access_issue(
         self,
         username: str,
@@ -433,8 +455,8 @@ class InstagramChecker:
 
     async def run(self) -> None:
         if await self.redis.exists(self.STATUS_COOLDOWN_KEY):
-            logger.info("Checker skipped because the Instagram cooldown is active")
-            return
+            await self.redis.delete(self.STATUS_COOLDOWN_KEY)
+            logger.info("Removed legacy Instagram cooldown key before checker cycle")
 
         lock = self.redis.lock(
             self.LOCK_KEY,
@@ -569,12 +591,15 @@ class InstagramChecker:
 
         # Background state transitions must only use a live Instagram response.
         # Stale metadata is reserved for user-facing profile previews.
-        result = await self.fetch_profile(username, allow_stale=False)
+        result = await self.fetch_profile(
+            username,
+            allow_stale=False,
+            force_refresh=True,
+        )
         if result.outcome == CheckOutcome.UNKNOWN:
             return
         if result.outcome == CheckOutcome.RATE_LIMITED:
-            self._rate_limited.set()
-            await self._activate_cooldown(result.retry_after)
+            logger.warning("Ignoring non-authoritative rate-limit result for %s", username)
             return
 
         streak_key = f"{self.DEACTIVATION_STREAK_PREFIX}{target_id}"
