@@ -546,6 +546,12 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🧰 لاگ کامل و عیب‌یابی",
+                    callback_data="admin:diagnostics",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="📢 کانال‌های عضویت اجباری",
                     callback_data="admin:channels",
                 )
@@ -596,6 +602,51 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                     text="بررسی فوری همه پیج‌ها 🔄", callback_data="admin:check_now"
                 )
             ],
+        ]
+    )
+
+
+def admin_diagnostics_keyboard(*, confirm_clear: bool = False) -> InlineKeyboardMarkup:
+    if confirm_clear:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="بله، لاگ پاک شود ✅",
+                        callback_data="admin:diagnostics:clear_confirm",
+                    ),
+                    InlineKeyboardButton(
+                        text="انصراف ↩️",
+                        callback_data="admin:diagnostics",
+                    ),
+                ]
+            ]
+        )
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 تازه‌سازی",
+                    callback_data="admin:diagnostics",
+                ),
+                InlineKeyboardButton(
+                    text="🧪 تست اتصال",
+                    callback_data="admin:instagram_health",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📄 دریافت فایل کامل لاگ",
+                    callback_data="admin:diagnostics:download",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 پاک‌کردن لاگ",
+                    callback_data="admin:diagnostics:clear",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
         ]
     )
 

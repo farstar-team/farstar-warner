@@ -4,6 +4,8 @@ import asyncio
 import html
 import json
 import logging
+import secrets
+import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -21,6 +23,7 @@ from sqlalchemy import and_, case, func, select
 
 from bot.config import Settings
 from bot.database import SessionFactory
+from bot.diagnostics import DiagnosticStore
 from bot.models import (
     NotificationSettings,
     PageEvent,
@@ -85,12 +88,12 @@ class CurlResponse:
     error: str | None = None
     return_code: int = 0
     transport: str = "unknown"
+    elapsed_ms: int | None = None
 
 
 class InstagramChecker:
     LOCK_KEY = "farstar:checker:lock"
     STATUS_COOLDOWN_KEY = "farstar:checker:status-cooldown"
-    ACCESS_ALERT_KEY = "farstar:checker:access-alert"
     DEACTIVATION_STREAK_PREFIX = "farstar:checker:deactivation-streak:"
     LOCK_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 8_000_000
@@ -113,6 +116,7 @@ class InstagramChecker:
         self.session_factory = session_factory
         self.redis = redis
         self.settings = settings
+        self.diagnostics = DiagnosticStore(redis)
         self._rate_limited = asyncio.Event()
         self._lock_lost = asyncio.Event()
         self._http = httpx.AsyncClient(
@@ -207,7 +211,7 @@ class InstagramChecker:
                 response.return_code,
                 response.error or "unknown error",
             )
-            await self._alert_access_issue(username, None, response.error)
+            await self._record_final_failure(username, response)
             return ProfileResult(CheckOutcome.UNKNOWN)
 
         result = self._parse_profile_response(
@@ -222,11 +226,7 @@ class InstagramChecker:
         if status_code == 404 or self._body_indicates_deactivated(response.body):
             return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
         if status_code == 429:
-            await self._alert_access_issue(
-                username,
-                status_code,
-                f"Instagram returned HTTP 429 via {response.transport}",
-            )
+            await self._record_final_failure(username, response)
             return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
         if status_code != 200:
             logger.info(
@@ -234,13 +234,9 @@ class InstagramChecker:
                 status_code,
                 username,
             )
-            await self._alert_access_issue(username, status_code, response.transport)
+            await self._record_final_failure(username, response)
             return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
-        await self._alert_access_issue(
-            username,
-            status_code,
-            "پاسخ JSON شامل data.user معتبر نبود",
-        )
+        await self._record_final_failure(username, response)
         return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
 
     async def _cache_profile(
@@ -308,10 +304,22 @@ class InstagramChecker:
         return fallback or ProfileResult(CheckOutcome.UNKNOWN)
 
     async def _execute_profile_request(self, username: str) -> CurlResponse:
+        trace_id = secrets.token_hex(4)
+        await self.diagnostics.add(
+            level="INFO",
+            event="profile_request_started",
+            message="بررسی زنده پیج آغاز شد.",
+            trace_id=trace_id,
+            username=username,
+        )
         last_response: CurlResponse | None = None
         for attempt in range(1, self.CURL_ATTEMPTS + 1):
             http_response = await self._execute_http2_once(username)
+            await self._record_transport_attempt(
+                trace_id, username, attempt, http_response
+            )
             if self._response_is_authoritative(http_response, username):
+                await self._record_authoritative(trace_id, username, http_response)
                 return http_response
             last_response = http_response
 
@@ -319,7 +327,13 @@ class InstagramChecker:
                 username,
                 force_http2=True,
             )
+            await self._record_transport_attempt(
+                trace_id, username, attempt, curl_http2_response
+            )
             if self._response_is_authoritative(curl_http2_response, username):
+                await self._record_authoritative(
+                    trace_id, username, curl_http2_response
+                )
                 return curl_http2_response
             if (
                 curl_http2_response.return_code != 2
@@ -333,20 +347,38 @@ class InstagramChecker:
                 username,
                 force_http2=False,
             )
+            await self._record_transport_attempt(
+                trace_id, username, attempt, curl_response
+            )
             if self._response_is_authoritative(curl_response, username):
+                await self._record_authoritative(trace_id, username, curl_response)
                 return curl_response
             last_response = curl_response
 
             if attempt < self.CURL_ATTEMPTS:
                 await asyncio.sleep(0.45 * attempt)
 
-        return last_response or CurlResponse(
+        final_response = last_response or CurlResponse(
             None,
             b"",
             "Instagram request transports did not run",
             1,
             "none",
         )
+        await self.diagnostics.add(
+            level="ERROR",
+            event="profile_request_failed",
+            message="هیچ مسیر اتصال پاسخ قطعی و معتبر دریافت نکرد.",
+            trace_id=trace_id,
+            username=username,
+            transport=final_response.transport,
+            http_status=final_response.status_code,
+            return_code=final_response.return_code,
+            elapsed_ms=final_response.elapsed_ms,
+            response_bytes=len(final_response.body),
+            detail=self._response_diagnostic(final_response),
+        )
+        return final_response
 
     async def _execute_http2_once(self, username: str) -> CurlResponse:
         safe_username = quote(username.strip(), safe="")
@@ -354,10 +386,18 @@ class InstagramChecker:
             f"{self.settings.instagram_base_url}"
             f"/api/v1/users/web_profile_info/?username={safe_username}"
         )
+        started_at = time.perf_counter()
         try:
             response = await self._http.get(url)
         except httpx.HTTPError as exc:
-            return CurlResponse(None, b"", str(exc), 1, "httpx-http2")
+            return CurlResponse(
+                None,
+                b"",
+                str(exc),
+                1,
+                "httpx-http2",
+                int((time.perf_counter() - started_at) * 1000),
+            )
         if len(response.content) > self.MAX_RESPONSE_BYTES:
             return CurlResponse(
                 response.status_code,
@@ -365,6 +405,7 @@ class InstagramChecker:
                 "response exceeded safety limit",
                 63,
                 f"httpx-{response.http_version}",
+                int((time.perf_counter() - started_at) * 1000),
             )
         return CurlResponse(
             response.status_code,
@@ -372,6 +413,7 @@ class InstagramChecker:
             f"httpx {response.http_version}",
             0,
             f"httpx-{response.http_version}",
+            int((time.perf_counter() - started_at) * 1000),
         )
 
     def _response_is_authoritative(
@@ -428,6 +470,7 @@ class InstagramChecker:
         )
         if not force_http2:
             command = tuple(part for part in command if part != "--http2")
+        started_at = time.perf_counter()
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -435,7 +478,14 @@ class InstagramChecker:
                 stderr=asyncio.subprocess.PIPE,
             )
         except (FileNotFoundError, OSError) as exc:
-            return CurlResponse(None, b"", str(exc), 127, "curl")
+            return CurlResponse(
+                None,
+                b"",
+                str(exc),
+                127,
+                "curl",
+                int((time.perf_counter() - started_at) * 1000),
+            )
 
         try:
             stdout, stderr = await asyncio.wait_for(
@@ -452,6 +502,7 @@ class InstagramChecker:
                 "curl execution timed out",
                 28,
                 "curl-http2" if force_http2 else "curl",
+                int((time.perf_counter() - started_at) * 1000),
             )
 
         error = stderr.decode("utf-8", errors="replace").strip() or None
@@ -462,6 +513,7 @@ class InstagramChecker:
                 error,
                 process.returncode or 1,
                 "curl-http2" if force_http2 else "curl",
+                int((time.perf_counter() - started_at) * 1000),
             )
         if len(stdout) > self.MAX_RESPONSE_BYTES:
             return CurlResponse(
@@ -470,6 +522,7 @@ class InstagramChecker:
                 "response exceeded safety limit",
                 63,
                 "curl-http2" if force_http2 else "curl",
+                int((time.perf_counter() - started_at) * 1000),
             )
 
         marker = b"\n__FARSTAR_HTTP_STATUS__:"
@@ -482,6 +535,7 @@ class InstagramChecker:
                 "curl did not return an HTTP status",
                 1,
                 "curl-http2" if force_http2 else "curl",
+                int((time.perf_counter() - started_at) * 1000),
             )
         return CurlResponse(
             int(status_bytes),
@@ -489,6 +543,7 @@ class InstagramChecker:
             error,
             process.returncode or 0,
             "curl-http2" if force_http2 else "curl",
+            int((time.perf_counter() - started_at) * 1000),
         )
 
     @classmethod
@@ -567,30 +622,129 @@ class InstagramChecker:
             )
         )
 
-    async def _alert_access_issue(
+    async def _record_transport_attempt(
+        self,
+        trace_id: str,
+        username: str,
+        attempt: int,
+        response: CurlResponse,
+    ) -> None:
+        authoritative = self._response_is_authoritative(response, username)
+        await self.diagnostics.add(
+            level="INFO" if authoritative else "WARNING",
+            event="transport_attempt",
+            message=(
+                f"تلاش شماره {attempt} پاسخ معتبر داد."
+                if authoritative
+                else f"تلاش شماره {attempt} پاسخ معتبر نداد و مسیر بعدی اجرا می‌شود."
+            ),
+            trace_id=trace_id,
+            username=username,
+            transport=response.transport,
+            http_status=response.status_code,
+            return_code=response.return_code,
+            elapsed_ms=response.elapsed_ms,
+            response_bytes=len(response.body),
+            detail=self._response_diagnostic(response),
+        )
+
+    async def _record_authoritative(
+        self,
+        trace_id: str,
+        username: str,
+        response: CurlResponse,
+    ) -> None:
+        parsed = self._parse_profile_response(
+            response.body,
+            username,
+            response.status_code or 0,
+        )
+        if parsed is not None:
+            message = "اطلاعات معتبر پیج از data.user استخراج شد."
+        else:
+            message = "پاسخ قطعی نبودن پیج دریافت شد."
+        await self.diagnostics.add(
+            level="INFO",
+            event="profile_request_succeeded",
+            message=message,
+            trace_id=trace_id,
+            username=username,
+            transport=response.transport,
+            http_status=response.status_code,
+            return_code=response.return_code,
+            elapsed_ms=response.elapsed_ms,
+            response_bytes=len(response.body),
+            detail=self._response_diagnostic(response),
+        )
+
+    async def _record_final_failure(
         self,
         username: str,
-        http_status: int | None,
-        detail: str | None = None,
+        response: CurlResponse,
     ) -> None:
-        should_alert = await self.redis.set(
-            self.ACCESS_ALERT_KEY,
-            "1",
-            ex=3600,
-            nx=True,
+        await self.diagnostics.add(
+            level="ERROR",
+            event="profile_result_unknown",
+            message=(
+                "نتیجه قطعی نبود؛ برای جلوگیری از هشدار اشتباه، وضعیت ذخیره‌شده تغییر نکرد."
+            ),
+            username=username,
+            transport=response.transport,
+            http_status=response.status_code,
+            return_code=response.return_code,
+            elapsed_ms=response.elapsed_ms,
+            response_bytes=len(response.body),
+            detail=self._response_diagnostic(response),
         )
-        if not should_alert:
-            return
-        status_text = str(http_status) if http_status is not None else "بدون پاسخ"
-        detail_text = html.escape(detail or "ثبت نشده")
-        await self._notify(
-            self.settings.admin_telegram_id,
-            "دسترسی Web Profile اینستاگرام پاسخ قطعی نداد. ⚠️\n\n"
-            f"نمونه پیج: <b>@{html.escape(username)}</b>\n"
-            f"کد HTTP: <code>{status_text}</code>\n"
-            f"جزئیات: <code>{detail_text}</code>\n"
-            "وضعیت ذخیره‌شده پیج‌ها تغییر نکرد.",
-        )
+
+    @classmethod
+    def _response_diagnostic(cls, response: CurlResponse) -> str:
+        if response.status_code is None:
+            return response.error or "هیچ پاسخ HTTP دریافت نشد."
+        status_reasons = {
+            301: "اینستاگرام درخواست را به آدرس دیگری منتقل کرد.",
+            302: "اینستاگرام درخواست را ریدایرکت کرد؛ احتمال انتقال به صفحه ورود وجود دارد.",
+            400: "ساختار درخواست از سمت اینستاگرام نامعتبر تشخیص داده شد.",
+            401: "اینستاگرام درخواست بدون نشست را نپذیرفت (Unauthorized).",
+            403: "دسترسی این IP یا اثرانگشت درخواست از سمت اینستاگرام رد شد.",
+            404: "اینستاگرام پیج را پیدا نکرد؛ پاسخ قطعی غیرفعال/تغییرنام محسوب می‌شود.",
+            429: "اینستاگرام تعداد درخواست‌ها را محدود کرده است.",
+        }
+        if response.status_code in status_reasons:
+            reason = status_reasons[response.status_code]
+        elif response.status_code >= 500:
+            reason = "سرویس اینستاگرام خطای سمت سرور برگرداند."
+        elif response.status_code != 200:
+            reason = f"پاسخ HTTP {response.status_code} قطعی و قابل پردازش نبود."
+        else:
+            reason = "پاسخ HTTP 200 دریافت شد."
+
+        try:
+            payload = json.loads(response.body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            user = data.get("user") if isinstance(data, dict) else None
+            if isinstance(user, dict):
+                profile_id = str(user.get("id") or "")
+                username = str(user.get("username") or "")
+                if profile_id.isdigit() and username:
+                    return f"{reason} ساختار data.user و شناسه عددی معتبر است."
+                return f"{reason} data.user وجود دارد اما id یا username معتبر نیست."
+            message = str(payload.get("message") or "").strip()
+            status = str(payload.get("status") or "").strip()
+            suffix = "; ".join(
+                part for part in (f"status={status}" if status else "", f"message={message}" if message else "") if part
+            )
+            return f"{reason} data.user معتبر وجود ندارد.{f' {suffix}' if suffix else ''}"
+
+        lowered = response.body[:2000].decode("utf-8", errors="ignore").lower()
+        if "accounts/login" in lowered or "log in" in lowered:
+            return f"{reason} محتوای پاسخ نشانه صفحه ورود اینستاگرام دارد."
+        if response.status_code == 200:
+            return f"{reason} بدنه پاسخ JSON معتبر نبود یا data.user نداشت."
+        return reason
 
     async def run(self) -> None:
         if await self.redis.exists(self.STATUS_COOLDOWN_KEY):
@@ -605,6 +759,11 @@ class InstagramChecker:
         acquired = await lock.acquire(blocking=False)
         if not acquired:
             logger.info("Checker skipped because another instance holds the lock")
+            await self.diagnostics.add(
+                level="INFO",
+                event="checker_cycle_skipped",
+                message="چرخه اجرا نشد؛ نمونه دیگری از چکر قفل اجرا را در اختیار دارد.",
+            )
             return
 
         self._lock_lost.clear()
@@ -612,6 +771,11 @@ class InstagramChecker:
         try:
             self._rate_limited.clear()
             target_ids = await self._eligible_target_ids()
+            await self.diagnostics.add(
+                level="INFO",
+                event="checker_cycle_started",
+                message=f"چرخه پایش برای {len(target_ids)} پیج آغاز شد.",
+            )
             if not target_ids:
                 return
 
@@ -628,8 +792,19 @@ class InstagramChecker:
                 asyncio.create_task(self._worker(queue)) for _ in range(worker_count)
             ]
             await asyncio.gather(*workers)
-        except Exception:
+            await self.diagnostics.add(
+                level="INFO",
+                event="checker_cycle_completed",
+                message=f"چرخه پایش {len(target_ids)} پیج پایان یافت.",
+            )
+        except Exception as exc:
             logger.exception("Unexpected checker cycle failure")
+            await self.diagnostics.add(
+                level="ERROR",
+                event="checker_cycle_failed",
+                message="چرخه پایش با خطای داخلی متوقف شد.",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
         finally:
             renewal_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -662,8 +837,14 @@ class InstagramChecker:
                 if self._rate_limited.is_set() or self._lock_lost.is_set():
                     continue
                 await self._check_target(target_id)
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to process target %s", target_id)
+                await self.diagnostics.add(
+                    level="ERROR",
+                    event="target_processing_failed",
+                    message=f"پردازش هدف داخلی {target_id} با خطا متوقف شد.",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
             finally:
                 queue.task_done()
 
@@ -734,6 +915,21 @@ class InstagramChecker:
             allow_stale=False,
             force_refresh=True,
         )
+        await self.diagnostics.add(
+            level=(
+                "INFO"
+                if result.outcome in {CheckOutcome.ACTIVE, CheckOutcome.DEACTIVATED}
+                else "WARNING"
+            ),
+            event="target_result",
+            message=f"نتیجه نهایی پایش: {result.outcome.value}",
+            username=username,
+            http_status=result.http_status,
+            detail=(
+                f"target_id={target_id}; profile_id={result.profile_id or 'none'}; "
+                f"from_cache={result.from_cache}"
+            ),
+        )
         if result.outcome == CheckOutcome.UNKNOWN:
             return
         if result.outcome == CheckOutcome.RATE_LIMITED:
@@ -751,6 +947,20 @@ class InstagramChecker:
                     streak,
                     self.settings.deactivation_confirmations,
                     target_id,
+                )
+                await self.diagnostics.add(
+                    level="INFO",
+                    event="deactivation_confirmation_pending",
+                    message=(
+                        "پاسخ غیرفعال ثبت شد اما برای جلوگیری از هشدار اشتباه "
+                        "منتظر تأیید بعدی است."
+                    ),
+                    username=username,
+                    http_status=result.http_status,
+                    detail=(
+                        f"target_id={target_id}; confirmation={streak}/"
+                        f"{self.settings.deactivation_confirmations}"
+                    ),
                 )
                 return
             await self.redis.delete(streak_key)
@@ -940,6 +1150,20 @@ class InstagramChecker:
 
             recipient_id = target.user_id
             await session.commit()
+
+        await self.diagnostics.add(
+            level="INFO",
+            event="target_state_synchronized",
+            message=(
+                f"وضعیت پیج ذخیره شد؛ {len(notifications)} اعلان برای مالک ساخته شد."
+            ),
+            username=username,
+            http_status=result.http_status,
+            detail=(
+                f"target_id={target_id}; owner_id={recipient_id}; "
+                "admin_copy=false"
+            ),
+        )
 
         if recipient_id is not None:
             for notification in notifications:

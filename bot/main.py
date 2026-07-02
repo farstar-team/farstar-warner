@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from bot.checker import InstagramChecker
 from bot.config import Settings, get_settings
 from bot.database import SessionFactory, create_database, initialize_database
+from bot.diagnostics import DiagnosticStore, RedisDiagnosticLogHandler
 from bot.handlers import admin, user
 from bot.models import PlanTier, User, UserStatus
 from bot.profile_preview import ProfilePreviewService
@@ -125,6 +126,21 @@ async def run() -> None:
         health_check_interval=30,
         socket_keepalive=True,
     )
+    diagnostic_handler = RedisDiagnosticLogHandler(
+        DiagnosticStore(
+            redis,
+            redactions=(
+                settings.telegram_bot_token.get_secret_value(),
+                settings.postgres_password.get_secret_value(),
+                settings.redis_password.get_secret_value(),
+            ),
+        ),
+        asyncio.get_running_loop(),
+    )
+    diagnostic_handler.setFormatter(
+        logging.Formatter("%(name)s | %(message)s")
+    )
+    logging.getLogger().addHandler(diagnostic_handler)
     bot = Bot(
         token=settings.telegram_bot_token.get_secret_value(),
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -203,6 +219,8 @@ async def run() -> None:
             scheduler.shutdown(wait=False)
         await profile_preview.close()
         await checker.close()
+        logging.getLogger().removeHandler(diagnostic_handler)
+        await diagnostic_handler.drain()
         await redis.aclose()
         await engine.dispose()
 

@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from redis.asyncio import Redis
@@ -19,10 +19,12 @@ from sqlalchemy.exc import IntegrityError
 from bot.checker import CheckOutcome, InstagramChecker
 from bot.config import Settings
 from bot.database import SessionFactory
+from bot.diagnostics import DiagnosticEntry
 from bot.handlers.user import AddPageState
 from bot.keyboards.inline import (
     admin_channels_keyboard,
     admin_discounts_keyboard,
+    admin_diagnostics_keyboard,
     admin_panel_keyboard,
     admin_plan_keyboard,
     admin_plans_keyboard,
@@ -51,6 +53,7 @@ from bot.models import (
 )
 from bot.profile_preview import PreviewOutcome, ProfilePreviewService
 from bot.time_utils import format_datetime_dual
+from bot.version import APP_VERSION
 
 
 router = Router(name="admin")
@@ -61,6 +64,46 @@ PLAN_NAMES = {
     PlanTier.PREMIUM: "پریمیوم",
     PlanTier.VIP: "ویژه",
 }
+DIAGNOSTIC_LEVELS = {
+    "INFO": "اطلاعات",
+    "WARNING": "هشدار",
+    "ERROR": "خطا",
+    "CRITICAL": "بحرانی",
+}
+
+
+def _diagnostic_time(value: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return format_datetime_dual(parsed).replace("<code>", "").replace("</code>", "")
+
+
+def _diagnostic_text(entry: DiagnosticEntry, *, compact: bool) -> str:
+    status = str(entry.http_status) if entry.http_status is not None else "—"
+    fields = [
+        f"سطح: {DIAGNOSTIC_LEVELS.get(entry.level, entry.level)}",
+        f"رخداد: {entry.event}",
+        f"توضیح: {entry.message}",
+        f"زمان: {_diagnostic_time(entry.timestamp)}",
+    ]
+    if entry.trace_id:
+        fields.append(f"شناسه رهگیری: {entry.trace_id}")
+    if entry.username:
+        fields.append(f"پیج: @{entry.username}")
+    if entry.transport:
+        fields.append(f"مسیر اتصال: {entry.transport}")
+    if entry.http_status is not None or entry.return_code is not None:
+        fields.append(f"HTTP: {status} | کد اجرا: {entry.return_code or 0}")
+    if entry.elapsed_ms is not None:
+        fields.append(f"مدت پاسخ: {entry.elapsed_ms}ms")
+    if entry.response_bytes is not None:
+        fields.append(f"حجم پاسخ: {entry.response_bytes} bytes")
+    if entry.detail:
+        detail = entry.detail[:180] if compact else entry.detail
+        fields.append(f"علت فنی: {detail}")
+    return "\n".join(fields)
 
 
 class AdminRenewState(StatesGroup):
@@ -1197,7 +1240,11 @@ async def instagram_connection_health(
         return
     await callback.answer("در حال آزمایش مسیر عمومی اینستاگرام…")
     browser_ok, browser_version = await profile_preview.browser_health()
-    result = await checker.fetch_profile("instagram")
+    result = await checker.fetch_profile(
+        "instagram",
+        allow_stale=False,
+        force_refresh=True,
+    )
     rendered = await profile_preview.inspect("instagram", use_cache=False)
     cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
 
@@ -1253,6 +1300,128 @@ async def instagram_connection_health(
     )
     if callback.message:
         await callback.message.edit_text(text, reply_markup=admin_panel_keyboard())
+
+
+async def _show_diagnostics(
+    callback: CallbackQuery,
+    checker: InstagramChecker,
+) -> None:
+    entries = await checker.diagnostics.latest(500)
+    error_count = sum(
+        entry.level in {"ERROR", "CRITICAL"} for entry in entries
+    )
+    warning_count = sum(entry.level == "WARNING" for entry in entries)
+    lines = [
+        "لاگ کامل و عیب‌یابی 🧰",
+        "",
+        f"نسخه ربات: <code>{APP_VERSION}</code>",
+        f"تعداد رکوردهای ذخیره‌شده: {_digits(len(entries))} از ۵۰۰",
+        f"خطاها: {_digits(error_count)} | هشدارها: {_digits(warning_count)}",
+        "",
+        "آخرین رخدادها:",
+    ]
+    if not entries:
+        lines.append("هنوز رخدادی ثبت نشده است.")
+    else:
+        for index, entry in enumerate(entries[:4], start=1):
+            lines.extend(
+                (
+                    "",
+                    f"<b>رکورد {_digits(index)}</b>",
+                    f"<pre>{html.escape(_diagnostic_text(entry, compact=True))}</pre>",
+                )
+            )
+    lines.extend(
+        (
+            "",
+            "برای ارسال گزارش فنی، دکمه «دریافت فایل کامل لاگ» را بزنید. "
+            "توکن ربات، رمز دیتابیس و رمز Redis داخل این فایل ذخیره نمی‌شوند.",
+        )
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=admin_diagnostics_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:diagnostics")
+async def admin_diagnostics(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await _show_diagnostics(callback, checker)
+
+
+@router.callback_query(F.data == "admin:diagnostics:download")
+async def download_diagnostics(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    entries = await checker.diagnostics.latest(500)
+    if not entries:
+        await callback.answer("هنوز لاگی برای دریافت وجود ندارد.", show_alert=True)
+        return
+    generated_at = datetime.now(timezone.utc)
+    sections = [
+        "لاگ عیب‌یابی فارستار وارنر",
+        f"نسخه: {APP_VERSION}",
+        f"زمان تولید:\n{_diagnostic_time(generated_at.isoformat())}",
+        "توضیح امنیتی: اطلاعات محرمانه محیط در این خروجی ثبت نشده‌اند.",
+    ]
+    for index, entry in enumerate(entries, start=1):
+        sections.append(
+            f"رکورد {index}\n{_diagnostic_text(entry, compact=False)}"
+        )
+    content = ("\n\n" + "=" * 72 + "\n\n").join(sections)
+    document = BufferedInputFile(
+        content.encode("utf-8-sig"),
+        filename=f"farstar-diagnostics-{generated_at:%Y%m%d-%H%M%S}.txt",
+    )
+    if callback.message:
+        await callback.message.answer_document(
+            document,
+            caption=(
+                "فایل کامل لاگ فنی آماده شد. 📄\n"
+                "این فایل را می‌توانید برای بررسی خطا ارسال کنید."
+            ),
+        )
+    await callback.answer("فایل لاگ ساخته شد. ✅")
+
+
+@router.callback_query(F.data == "admin:diagnostics:clear")
+async def confirm_clear_diagnostics(
+    callback: CallbackQuery,
+    settings: Settings,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            "همه ۵۰۰ رکورد اخیر عیب‌یابی پاک شوند؟\n\n"
+            "این عملیات قابل بازگشت نیست.",
+            reply_markup=admin_diagnostics_keyboard(confirm_clear=True),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:diagnostics:clear_confirm")
+async def clear_diagnostics(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await checker.diagnostics.clear()
+    await _show_diagnostics(callback, checker)
 
 
 @router.callback_query(F.data == "admin:stats")
