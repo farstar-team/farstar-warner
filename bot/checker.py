@@ -123,7 +123,6 @@ class InstagramChecker:
     LOCK_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 8_000_000
     CURL_EXECUTABLE = "curl"
-    CURL_ATTEMPTS = 3
     PROFILE_CACHE_PREFIX = "farstar:instagram:profile:fresh:"
     PROFILE_STALE_PREFIX = "farstar:instagram:profile:stale:"
     PROFILE_LOCK_PREFIX = "farstar:instagram:profile-lock:"
@@ -184,6 +183,19 @@ class InstagramChecker:
             )
             if cached is not None:
                 return replace(cached, from_cache=True)
+
+        cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
+        if cooldown_ttl > 0:
+            if allow_stale:
+                stale = await self._read_cached_profile(
+                    f"{self.PROFILE_STALE_PREFIX}{normalized_username}"
+                )
+                if stale is not None:
+                    return replace(stale, from_cache=True)
+            return ProfileResult(
+                CheckOutcome.RATE_LIMITED,
+                retry_after=cooldown_ttl,
+            )
 
         profile_lock = self.redis.lock(
             f"{self.PROFILE_LOCK_PREFIX}{normalized_username}",
@@ -261,10 +273,15 @@ class InstagramChecker:
         status_code = response.status_code
         if status_code == 404 or self._body_indicates_deactivated(response.body):
             return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
-        if status_code in {403, 429}:
+        if self._response_is_access_blocked(response):
             self._rate_limited.set()
+            cooldown = await self._activate_cooldown(None)
             await self._record_final_failure(username, response)
-            return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+            return ProfileResult(
+                CheckOutcome.RATE_LIMITED,
+                retry_after=cooldown,
+                http_status=status_code,
+            )
         if status_code != 200:
             logger.info(
                 "Instagram Web Profile API returned HTTP %s for %s",
@@ -350,80 +367,91 @@ class InstagramChecker:
             username=username,
         )
         last_response: CurlResponse | None = None
-        for attempt in range(1, self.CURL_ATTEMPTS + 1):
-            http_response = await self._execute_http2_once(username)
-            await self._record_transport_attempt(
-                trace_id, username, attempt, http_response
-            )
-            if self._response_is_authoritative(http_response, username):
-                await self._record_authoritative(trace_id, username, http_response)
-                return http_response
-            last_response = http_response
+        blocked_proxy_response: CurlResponse | None = None
+        attempt = 0
 
-            if self.settings.instagram_proxy_url:
-                direct_http_response = await self._execute_http2_once(
-                    username,
-                    use_proxy=False,
-                )
-                await self._record_transport_attempt(
-                    trace_id, username, attempt, direct_http_response
-                )
-                if self._response_is_authoritative(direct_http_response, username):
-                    await self._record_authoritative(
-                        trace_id, username, direct_http_response
-                    )
-                    return direct_http_response
-                last_response = direct_http_response
-
-                direct_curl_response = await self._execute_curl_once(
-                    username,
-                    force_http2=False,
-                    use_proxy=False,
-                )
-                await self._record_transport_attempt(
-                    trace_id, username, attempt, direct_curl_response
-                )
-                if self._response_is_authoritative(direct_curl_response, username):
-                    await self._record_authoritative(
-                        trace_id, username, direct_curl_response
-                    )
-                    return direct_curl_response
-                last_response = direct_curl_response
-
-            curl_http2_response = await self._execute_curl_once(
+        if self.settings.instagram_proxy_url:
+            attempt += 1
+            proxy_response = await self._execute_http2_once(
                 username,
-                force_http2=True,
+                use_proxy=True,
             )
             await self._record_transport_attempt(
-                trace_id, username, attempt, curl_http2_response
+                trace_id, username, attempt, proxy_response
             )
-            if self._response_is_authoritative(curl_http2_response, username):
-                await self._record_authoritative(
-                    trace_id, username, curl_http2_response
-                )
-                return curl_http2_response
-            if (
-                curl_http2_response.return_code != 2
-                or "the installed libcurl version doesn't support"
-                not in (curl_http2_response.error or "").lower()
-            ):
-                last_response = curl_http2_response
+            if self._response_is_authoritative(proxy_response, username):
+                await self._record_authoritative(trace_id, username, proxy_response)
+                return proxy_response
+            if self._response_is_access_blocked(proxy_response):
+                blocked_proxy_response = proxy_response
+            else:
+                last_response = proxy_response
 
-            curl_response = await self._execute_curl_once(
+        attempt += 1
+        direct_response = await self._execute_http2_once(
+            username,
+            use_proxy=False,
+        )
+        await self._record_transport_attempt(
+            trace_id, username, attempt, direct_response
+        )
+        if self._response_is_authoritative(direct_response, username):
+            await self._record_authoritative(trace_id, username, direct_response)
+            return direct_response
+        if self._response_is_access_blocked(direct_response):
+            await self.diagnostics.add(
+                level="WARNING",
+                event="instagram_circuit_opening",
+                message=(
+                    "هم مسیر WARP و هم مسیر مستقیم با رد دسترسی اینستاگرام "
+                    "مواجه شدند؛ ادامه retry متوقف می‌شود."
+                ),
+                trace_id=trace_id,
+                username=username,
+                transport=direct_response.transport,
+                http_status=direct_response.status_code,
+                detail=self._response_diagnostic(direct_response),
+            )
+            return direct_response
+        last_response = direct_response
+
+        attempt += 1
+        direct_curl_response = await self._execute_curl_once(
+            username,
+            force_http2=False,
+            use_proxy=False,
+        )
+        await self._record_transport_attempt(
+            trace_id, username, attempt, direct_curl_response
+        )
+        if self._response_is_authoritative(direct_curl_response, username):
+            await self._record_authoritative(trace_id, username, direct_curl_response)
+            return direct_curl_response
+        if self._response_is_access_blocked(direct_curl_response):
+            return direct_curl_response
+        last_response = direct_curl_response
+
+        if self.settings.instagram_proxy_url and blocked_proxy_response is None:
+            attempt += 1
+            proxy_curl_response = await self._execute_curl_once(
                 username,
                 force_http2=False,
+                use_proxy=True,
             )
             await self._record_transport_attempt(
-                trace_id, username, attempt, curl_response
+                trace_id, username, attempt, proxy_curl_response
             )
-            if self._response_is_authoritative(curl_response, username):
-                await self._record_authoritative(trace_id, username, curl_response)
-                return curl_response
-            last_response = curl_response
+            if self._response_is_authoritative(proxy_curl_response, username):
+                await self._record_authoritative(
+                    trace_id, username, proxy_curl_response
+                )
+                return proxy_curl_response
+            if self._response_is_access_blocked(proxy_curl_response):
+                return proxy_curl_response
+            last_response = proxy_curl_response
 
-            if attempt < self.CURL_ATTEMPTS:
-                ceiling = min(45.0, 15.0 * (2**attempt))
-                await asyncio.sleep(random.uniform(15.0, ceiling))
+        if blocked_proxy_response is not None:
+            last_response = blocked_proxy_response
 
         final_response = last_response or CurlResponse(
             None,
@@ -502,18 +530,20 @@ class InstagramChecker:
             response.body, username, 200
         ) is not None or self._body_indicates_deactivated(response.body)
 
-    async def _execute_curl(self, username: str) -> CurlResponse:
-        last_response: CurlResponse | None = None
-        for attempt in range(1, self.CURL_ATTEMPTS + 1):
-            response = await self._execute_curl_once(username, force_http2=False)
-            if response.status_code in {200, 404} and response.body:
-                return response
-            if response.status_code == 404:
-                return response
-            last_response = response
-            if attempt < self.CURL_ATTEMPTS:
-                await asyncio.sleep(0.4 * attempt)
-        return last_response or CurlResponse(None, b"", "curl did not run", 1)
+    @staticmethod
+    def _response_is_access_blocked(response: CurlResponse) -> bool:
+        if response.status_code in {401, 403, 429}:
+            return True
+        lowered = response.body[:4000].decode("utf-8", errors="ignore").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                "please wait a few minutes",
+                "rate limit",
+                "too many requests",
+                "challenge_required",
+            )
+        )
 
     async def _execute_curl_once(
         self,
@@ -764,11 +794,18 @@ class InstagramChecker:
         username: str,
         response: CurlResponse,
     ) -> None:
+        access_blocked = self._response_is_access_blocked(response)
         await self.diagnostics.add(
-            level="ERROR",
-            event="profile_result_unknown",
+            level="WARNING" if access_blocked else "ERROR",
+            event=(
+                "instagram_access_denied"
+                if access_blocked
+                else "profile_result_unknown"
+            ),
             message=(
-                "نتیجه قطعی نبود؛ برای جلوگیری از هشدار اشتباه، وضعیت ذخیره‌شده تغییر نکرد."
+                "اینستاگرام دسترسی را موقتاً رد کرد؛ مدار محافظ فعال شد و retry متوقف شد."
+                if access_blocked
+                else "نتیجه قطعی نبود؛ برای جلوگیری از هشدار اشتباه، وضعیت ذخیره‌شده تغییر نکرد."
             ),
             username=username,
             transport=response.transport,
@@ -787,7 +824,7 @@ class InstagramChecker:
             301: "اینستاگرام درخواست را به آدرس دیگری منتقل کرد.",
             302: "اینستاگرام درخواست را ریدایرکت کرد؛ احتمال انتقال به صفحه ورود وجود دارد.",
             400: "ساختار درخواست از سمت اینستاگرام نامعتبر تشخیص داده شد.",
-            401: "اینستاگرام درخواست بدون نشست را نپذیرفت (Unauthorized).",
+            401: "اینستاگرام دسترسی این درخواست را موقتاً رد کرد (Unauthorized).",
             403: "دسترسی این IP یا اثرانگشت درخواست از سمت اینستاگرام رد شد.",
             404: "اینستاگرام پیج را پیدا نکرد؛ پاسخ قطعی غیرفعال/تغییرنام محسوب می‌شود.",
             429: "اینستاگرام تعداد درخواست‌ها را محدود کرده است.",
@@ -867,38 +904,18 @@ class InstagramChecker:
                 elapsed_ms=elapsed_ms,
             )
 
-        instagram_response = await self._instagram_preflight_response()
-        if not self._response_is_authoritative(instagram_response, "instagram"):
-            return await self._register_proxy_failure(
-                self._response_diagnostic(instagram_response),
-                http_status=instagram_response.status_code,
-                elapsed_ms=instagram_response.elapsed_ms,
-            )
-
         await self.redis.delete(self.PROXY_FAILURE_STREAK_KEY, self.PROXY_ALERT_KEY)
         await self.diagnostics.add(
             level="INFO",
             event="proxy_preflight_succeeded",
-            message="سلامت WARP و دسترسی Web Profile اینستاگرام تأیید شد.",
-            transport=instagram_response.transport,
-            http_status=instagram_response.status_code,
-            elapsed_ms=instagram_response.elapsed_ms,
-            response_bytes=len(instagram_response.body),
-            detail=f"proxy={proxy_url}; warp=on",
+            message=("تونل WARP مستقل از پاسخ اینستاگرام سالم است و warp=on تأیید شد."),
+            transport="httpx-warp-trace",
+            http_status=trace_response.status_code,
+            elapsed_ms=elapsed_ms,
+            response_bytes=len(trace_response.content),
+            detail=f"proxy={proxy_url}; warp=on; instagram_not_tested_here=true",
         )
         return True
-
-    async def _instagram_preflight_response(self) -> CurlResponse:
-        responses = [await self._execute_http2_once("instagram")]
-        if not self._response_is_authoritative(responses[-1], "instagram"):
-            responses.append(
-                await self._execute_curl_once("instagram", force_http2=True)
-            )
-        if not self._response_is_authoritative(responses[-1], "instagram"):
-            responses.append(
-                await self._execute_curl_once("instagram", force_http2=False)
-            )
-        return responses[-1]
 
     async def _register_proxy_failure(
         self,
@@ -914,7 +931,7 @@ class InstagramChecker:
             level="ERROR",
             event="proxy_preflight_failed",
             message=(
-                "مسیر WARP پاسخ سالم نداد؛ تصمیم ادامه پایش با تست مرجع اینستاگرام انجام می‌شود."
+                "خود تونل WARP در تست Cloudflare سالم نبود؛ این خطا مستقل از پاسخ اینستاگرام است."
             ),
             http_status=http_status,
             elapsed_ms=elapsed_ms,
@@ -930,10 +947,10 @@ class InstagramChecker:
             if should_alert:
                 await self._notify(
                     self.settings.admin_telegram_id,
-                    "⚠️ سیستم وارپ یا مسیر دسترسی اینستاگرام با اختلال مواجه شده است!\n\n"
-                    "سه چرخه متوالی پاسخ سالم دریافت نشد و پایش برای جلوگیری از "
-                    "اعلان اشتباه متوقف ماند. جزئیات کامل در بخش «لاگ کامل و "
-                    "عیب‌یابی» پنل مدیریت ثبت شده است.",
+                    "⚠️ خود تونل WARP در سه تست متوالی سالم نبود!\n\n"
+                    "Cloudflare Trace مقدار warp=on را تأیید نکرد. supervisor داخل "
+                    "کانتینر تلاش می‌کند تونل را reconnect کند و مسیر مستقیم تا "
+                    "بازیابی WARP در دسترس می‌ماند. جزئیات در لاگ ثبت شده است.",
                 )
         return False
 
@@ -941,7 +958,7 @@ class InstagramChecker:
         result = await self.fetch_profile(
             "instagram",
             allow_stale=False,
-            force_refresh=True,
+            force_refresh=False,
         )
         if result.outcome == CheckOutcome.ACTIVE and result.profile_id:
             await self.redis.delete(self.REFERENCE_ALERT_KEY)
@@ -958,16 +975,21 @@ class InstagramChecker:
             )
             return True
 
+        rate_limited = result.outcome == CheckOutcome.RATE_LIMITED
         await self.diagnostics.add(
             level="ERROR",
             event="reference_profile_failed",
             message=(
-                "پیج مرجع @instagram پاسخ زنده معتبر نداد؛ برای جلوگیری از هشدار اشتباه "
-                "وضعیت هیچ پیجی تغییر نمی‌کند."
+                "مدار محافظ دسترسی اینستاگرام باز است؛ درخواست جدید ارسال نمی‌شود."
+                if rate_limited
+                else "پیج مرجع @instagram پاسخ زنده معتبر نداد؛ برای جلوگیری از هشدار اشتباه وضعیت هیچ پیجی تغییر نمی‌کند."
             ),
             username="instagram",
             http_status=result.http_status,
-            detail=f"outcome={result.outcome.value}; from_cache={result.from_cache}",
+            detail=(
+                f"outcome={result.outcome.value}; from_cache={result.from_cache}; "
+                f"retry_after={result.retry_after or 0}"
+            ),
         )
         should_alert = await self.redis.set(
             self.REFERENCE_ALERT_KEY,
@@ -978,10 +1000,17 @@ class InstagramChecker:
         if should_alert:
             await self._notify(
                 self.settings.admin_telegram_id,
-                "تست مرجع اینستاگرام ناموفق بود. ⚠️\n\n"
-                "ربات نتوانست پیج ثابت <b>@instagram</b> را با پاسخ زنده ببیند؛ "
-                "بنابراین این چرخه بدون تغییر وضعیت پیج‌های کاربران متوقف شد. "
-                "جزئیات در بخش لاگ کامل ثبت شده است.",
+                (
+                    "دسترسی اینستاگرام موقتاً درخواست‌ها را رد کرده است. ⚠️\n\n"
+                    f"مدار محافظ برای <b>{result.retry_after or self.settings.rate_limit_cooldown_seconds}</b> "
+                    "ثانیه باز می‌ماند و در این مدت هیچ درخواست تکراری ارسال نمی‌شود. "
+                    "وضعیت پیج‌ها بدون تغییر محفوظ است."
+                    if rate_limited
+                    else "تست مرجع اینستاگرام ناموفق بود. ⚠️\n\n"
+                    "ربات نتوانست پیج ثابت <b>@instagram</b> را با پاسخ زنده ببیند؛ "
+                    "بنابراین این چرخه بدون تغییر وضعیت پیج‌های کاربران متوقف شد. "
+                    "جزئیات در بخش لاگ کامل ثبت شده است."
+                ),
             )
         return False
 
@@ -1008,7 +1037,7 @@ class InstagramChecker:
                 result = await self.fetch_profile(
                     "instagram",
                     allow_stale=False,
-                    force_refresh=True,
+                    force_refresh=False,
                 )
                 if result.outcome != CheckOutcome.ACTIVE:
                     failure_reason = (
@@ -1104,9 +1133,15 @@ class InstagramChecker:
                 await lock.release()
 
     async def run(self) -> None:
-        if await self.redis.exists(self.STATUS_COOLDOWN_KEY):
-            await self.redis.delete(self.STATUS_COOLDOWN_KEY)
-            logger.info("Removed legacy Instagram cooldown key before checker cycle")
+        cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
+        if cooldown_ttl > 0:
+            await self.diagnostics.add(
+                level="WARNING",
+                event="checker_circuit_open",
+                message=("چرخه پایش برای جلوگیری از تکرار درخواست ردشده اجرا نشد."),
+                detail=f"retry_after_seconds={cooldown_ttl}",
+            )
+            return
 
         lock = self.redis.lock(
             self.LOCK_KEY,
@@ -1154,6 +1189,7 @@ class InstagramChecker:
 
             worker_count = min(
                 self.settings.check_concurrency,
+                3,
                 len(target_ids),
             )
             for _ in range(worker_count):
@@ -1281,7 +1317,6 @@ class InstagramChecker:
             return list(result)
 
     async def check_target_now(self, target_id: int) -> ProfileResult | None:
-        self._rate_limited.clear()
         if not await self.reference_profile_preflight():
             return None
         return await self._check_target(target_id)

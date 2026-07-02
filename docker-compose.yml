@@ -39,14 +39,18 @@ services:
       - no-new-privileges:true
 
   warp_proxy:
-    image: caomingjun/warp:latest
+    image: caomingjun/warp:2026.4.1390.0-2.12.0
     restart: always
+    entrypoint: ["/bin/bash", "/warp-supervisor.sh"]
     environment:
       WARP_SLEEP: "5"
+      WARP_HEALTH_INTERVAL_SECONDS: "30"
+      WARP_HEALTH_FAILURE_THRESHOLD: "3"
     expose:
       - "1080"
     volumes:
       - warp-data:/var/lib/cloudflare-warp
+      - ./warp-supervisor.sh:/warp-supervisor.sh:ro
     cap_add:
       - NET_ADMIN
       - MKNOD

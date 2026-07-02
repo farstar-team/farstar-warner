@@ -1984,13 +1984,17 @@ async def instagram_connection_health(
     await callback.answer("در حال آزمایش مسیر عمومی اینستاگرام…")
     warp_ok = await checker.proxy_preflight()
     browser_ok, browser_version = await profile_preview.browser_health()
+    cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
     result = await checker.fetch_profile(
         "instagram",
         allow_stale=False,
         force_refresh=True,
     )
-    rendered = await profile_preview.inspect("instagram", use_cache=False)
-    cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
+    rendered = (
+        None
+        if result.outcome == CheckOutcome.RATE_LIMITED
+        else await profile_preview.inspect("instagram", use_cache=False)
+    )
     proxy_failure_streak = int(await redis.get(checker.PROXY_FAILURE_STREAK_KEY) or 0)
 
     outcome_names = {
@@ -2028,9 +2032,18 @@ async def instagram_connection_health(
         "http_404": "پاسخ ۴۰۴",
         "not_available_text": "پیام در دسترس نبودن پیج",
     }
-    render_diagnostic = diagnostic_names.get(
-        rendered.diagnostic or "",
-        rendered.diagnostic or "ثبت نشد",
+    render_diagnostic = (
+        diagnostic_names.get(
+            rendered.diagnostic or "",
+            rendered.diagnostic or "ثبت نشد",
+        )
+        if rendered is not None
+        else "به‌دلیل فعال‌بودن مدار محافظ اجرا نشد"
+    )
+    render_text = (
+        render_names[rendered.outcome]
+        if rendered is not None
+        else "برای جلوگیری از درخواست تکراری اجرا نشد"
     )
     text = (
         "وضعیت اتصال اینستاگرام 🌐\n\n"
@@ -2043,7 +2056,7 @@ async def instagram_connection_health(
         f"Chromium: <b>{browser_text}</b>\n"
         f"نتیجه تست: <b>{outcome_names[result.outcome]}</b>\n"
         f"کد HTTP: <code>{http_text}</code>\n"
-        f"رندر واقعی: <b>{render_names[rendered.outcome]}</b>\n"
+        f"رندر واقعی: <b>{render_text}</b>\n"
         f"تشخیص رندر: <b>{render_diagnostic}</b>\n"
         f"توقف موقت چکر: <b>{cooldown_text}</b>\n\n"
         "پاسخ نامشخص هیچ‌گاه وضعیت پیج را به دی‌اکتیو تغییر نمی‌دهد."

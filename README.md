@@ -43,7 +43,7 @@
 - PostgreSQL برای نگهداری کاربران، پیج‌ها و تنظیمات
 - Redis برای وضعیت‌های موقت ربات، قفل توزیع‌شده و کنترل محدودیت درخواست
 - زمان‌بندی بررسی‌ها با APScheduler
-- تأخیر تصادفی، User-Agent چرخشی، هم‌روندی محدود و توقف خودکار هنگام دریافت خطای `429`
+- تأخیر تصادفی، هم‌روندی محدود و circuit breaker برای پاسخ‌های `401`، `403` و `429`
 - اجرای ایمن در کانتینر بدون دسترسی ریشه، با فایل‌سیستم فقط‌خواندنی
 - نصب تعاملی روی اوبونتو با یک اسکریپت انگلیسی
 - پنل مدیریت انگلیسی سرور با فرمان `farstar` و پشتیبانی از چند ربات مستقل
@@ -209,7 +209,7 @@ farstar update
 
 پس از نصب، وارد گفت‌وگوی ربات شوید و دستور `/start` را ارسال کنید.
 
-نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **4.3.0** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
+نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **4.4.0** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
 
 منوی اصلی شامل این گزینه‌هاست:
 
@@ -296,10 +296,10 @@ https://www.instagram.com/instagram/
 - اولین بررسی فقط وضعیت پایه را ثبت می‌کند و اعلان تغییر وضعیت نمی‌فرستد.
 - پاسخ‌های ورود اجباری، چالش امنیتی، خطاهای شبکه و خطاهای موقت به‌عنوان وضعیت نامشخص در نظر گرفته می‌شوند و وضعیت ذخیره‌شده را تغییر نمی‌دهند.
 - هدف‌ها با workerهای هم‌زمان محدودشده توسط `CHECK_CONCURRENCY` پردازش می‌شوند؛ هر worker بین هدف‌های خود فاصله تصادفی دارد تا یک فهرست بزرگ ساعت‌ها در صف نماند.
-- در پاسخ `403` یا `429` چرخه متوقف می‌شود تا فشار بیشتری به سرویس وارد نشود. پس از سه چرخه شکست متوالی، مدیر یک هشدار زیرساختی دریافت می‌کند.
+- پاسخ `401` همراه `Please wait`، پاسخ `403` و پاسخ `429` رد موقت دسترسی محسوب می‌شوند. پس از یک تلاش WARP و یک تلاش مستقیم، مدار محافظ باز می‌شود و تا ۱۵ دقیقه هیچ retry تکراری ارسال نمی‌شود.
 - هر چرخه و همچنین تست مستقل پنج‌دقیقه‌ای، `@instagram`، مسیر اتصال و توانایی ساخت کارت تصویری را بررسی می‌کند؛ خطای تشخیصی برای مدیر و بازیابی سلامت نیز اطلاع‌رسانی می‌شود.
 
-WARP در این معماری یک مسیر خروجی پایدار و health-checked است. برنامه برای دورزدن rate limit، حساب جدید یا IP تازه تولید نمی‌کند و Docker socket نیز در اختیار ربات قرار نمی‌گیرد. این تصمیم از دسترسی سطح ریشه ربات به میزبان و هشدارهای نادرست جلوگیری می‌کند.
+سلامت WARP فقط با Cloudflare Trace و مقدار `warp=on` سنجیده می‌شود و دیگر پاسخ 401 اینستاگرام به‌اشتباه «خرابی WARP» گزارش نمی‌شود. `warp-supervisor.sh` هنگام سه شکست واقعی Trace، همان تونل ثبت‌شده را reconnect می‌کند. برنامه برای دورزدن rate limit، ثبت حساب WARP تازه یا تعویض اجباری IP انجام نمی‌دهد و Docker socket نیز در اختیار ربات قرار نمی‌گیرد.
 
 > [!IMPORTANT]
 > اینستاگرام می‌تواند ساختار صفحات عمومی یا سیاست‌های دسترسی خود را بدون اطلاع قبلی تغییر دهد. پایش بدون API رسمی تضمین دائمی ندارد. فقط پیج‌های عمومی را بررسی کنید و قوانین محل فعالیت و شرایط استفاده سرویس‌ها را رعایت کنید.
@@ -381,7 +381,7 @@ docker compose logs --tail=100 bot-app
 3. خروجی `docker compose logs --tail=100 bot-app` را بررسی کنید.
 4. مطمئن شوید سرور به `api.telegram.org` دسترسی دارد.
 
-اگر بررسی اینستاگرام انجام نمی‌شود، ابتدا وضعیت `warp_proxy` و سپس بخش «وضعیت اتصال اینستاگرام» و «لاگ کامل و عیب‌یابی» پنل مدیر را بررسی کنید. پاسخ `403` یا `429` وضعیت ذخیره‌شده پیج‌ها را تغییر نمی‌دهد.
+اگر بررسی اینستاگرام انجام نمی‌شود، ابتدا وضعیت `warp_proxy` و سپس بخش «وضعیت اتصال اینستاگرام» و «لاگ کامل و عیب‌یابی» پنل مدیر را بررسی کنید. پاسخ `401`، `403` یا `429` وضعیت ذخیره‌شده پیج‌ها را تغییر نمی‌دهد.
 
 مشاهده علت دقیق سلامت WARP:
 
@@ -405,6 +405,7 @@ docker compose ps
 farstar-warner/
 ├── install.sh
 ├── farstar.sh
+├── warp-supervisor.sh
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
@@ -460,7 +461,8 @@ Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram p
 - Ten defensive per-profile tools for identity baselines, audit evidence, history, risk scoring, test alerts, health, and incident reports
 - Automatic primary-administrator provisioning with a dedicated menu
 - PostgreSQL persistence and Redis coordination
-- APScheduler background checks with jitter, bounded concurrency, distributed locking, and HTTP 429 cooldown
+- APScheduler checks with bounded concurrency and a 401/403/429 circuit breaker
+- WARP tunnel supervisor that reconnects only when Cloudflare Trace no longer reports `warp=on`
 - Hardened, non-root Docker deployment
 - An English `farstar` Ubuntu server manager for multiple isolated bot instances
 
@@ -496,6 +498,6 @@ Open the bot and send `/start`. The configured administrator can access the rest
 
 ### Operational note
 
-Instagram can change public page behavior or apply temporary access restrictions at any time. Login redirects, challenge pages, network errors, and temporary server failures are treated as unknown results and do not overwrite the last known profile state. Inconclusive HTTP results are verified through a rendered public page, and deactivation requires consecutive definitive responses. A `429` response activates a status-check-only Redis cooldown; profile previews use a separate cache and cannot pause monitoring.
+Instagram can change public page behavior or apply temporary access restrictions at any time. Login redirects, challenge pages, network errors, and temporary server failures do not overwrite the last known profile state. A `401` with a wait message, `403`, or `429` opens a Redis-backed circuit breaker so repeated retries cannot amplify a temporary denial. WARP health is measured independently through Cloudflare Trace.
 
 Use the software only for public profiles and in accordance with applicable law and platform terms.
