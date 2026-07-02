@@ -613,6 +613,8 @@ async def add_page(
             pending_username=confirmed_username,
             pending_status=PageStatus.ACTIVE.value,
             pending_profile_id=status.profile_id,
+            pending_status_confirmed=True,
+            pending_http_status=status.http_status,
         )
         await state.set_state(AddPageState.waiting_for_confirmation)
         caption = (
@@ -645,6 +647,8 @@ async def add_page(
             pending_username=username,
             pending_status=PageStatus.DEACTIVATED.value,
             pending_profile_id=None,
+            pending_status_confirmed=True,
+            pending_http_status=status.http_status,
         )
         await state.set_state(AddPageState.waiting_for_confirmation)
         await message.answer(
@@ -661,6 +665,8 @@ async def add_page(
         pending_username=username,
         pending_status="Unknown",
         pending_profile_id=None,
+        pending_status_confirmed=False,
+        pending_http_status=status.http_status,
     )
     await state.set_state(AddPageState.waiting_for_confirmation)
     reason = (
@@ -750,12 +756,29 @@ async def confirm_page_registration(
                 if requested_status == "active"
                 else PageStatus.DEACTIVATED
             )
+            registered_at = datetime.now(timezone.utc)
+            status_confirmed = bool(data.get("pending_status_confirmed"))
             target = TargetPage(
                 instagram_username=username,
                 user_id=user.telegram_id,
                 last_known_status=page_status,
                 last_known_id=data.get("pending_profile_id"),
-                last_checked_at=datetime.now(timezone.utc),
+                last_checked_at=registered_at,
+                last_successful_check_at=(registered_at if status_confirmed else None),
+                last_status_changed_at=registered_at,
+                last_check_outcome=(
+                    page_status.value if status_confirmed else "UserSelected"
+                ),
+                last_http_status=data.get("pending_http_status"),
+                status_confirmed=status_confirmed,
+                consecutive_active_checks=(
+                    1 if status_confirmed and page_status == PageStatus.ACTIVE else 0
+                ),
+                consecutive_deactivated_checks=(
+                    1
+                    if status_confirmed and page_status == PageStatus.DEACTIVATED
+                    else 0
+                ),
             )
             session.add(target)
             await session.flush()
@@ -825,8 +848,24 @@ async def view_page(
     callback: CallbackQuery,
     db_user: User,
     session_factory: SessionFactory,
+    checker: InstagramChecker,
 ) -> None:
     page_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        owned = await session.scalar(
+            select(TargetPage.id).where(
+                TargetPage.id == page_id,
+                TargetPage.user_id == db_user.telegram_id,
+            )
+        )
+    if owned is None:
+        await callback.answer("این پیج پیدا نشد.", show_alert=True)
+        return
+    await callback.answer("در حال بررسی وضعیت قطعی پیج…")
+    try:
+        await checker.check_target_now(page_id)
+    except Exception:
+        logger.exception("Could not synchronize target %s before details", page_id)
     async with session_factory() as session:
         page = await session.scalar(
             select(TargetPage).where(
@@ -835,21 +874,46 @@ async def view_page(
             )
         )
     if page is None:
-        await callback.answer("این پیج پیدا نشد.", show_alert=True)
+        if callback.message:
+            await callback.message.answer("این پیج پیدا نشد.")
         return
 
-    status_text = PAGE_STATUS_NAMES[page.last_known_status]
+    status_text = PAGE_STATUS_NAMES.get(page.last_known_status, "نامشخص")
+    if not page.status_confirmed:
+        status_text = f"{status_text} — در انتظار تأیید قطعی"
+    outcome_names = {
+        CheckOutcome.ACTIVE.value: "فعال و قابل مشاهده ✅",
+        CheckOutcome.DEACTIVATED.value: "غیرفعال و خارج از دسترس ❌",
+        CheckOutcome.UNKNOWN.value: "پاسخ نامشخص؛ وضعیت قطعی تغییر نکرد",
+        CheckOutcome.RATE_LIMITED.value: "محدودیت موقت؛ وضعیت قطعی تغییر نکرد",
+        "UnconfirmedDeactivation": "نشانه غیرفعال‌شدن تأیید دوم را نگرفت",
+        "UserSelected": "وضعیت اولیه توسط کاربر انتخاب شده است",
+    }
+    latest_outcome = outcome_names.get(
+        page.last_check_outcome or "",
+        page.last_check_outcome or "هنوز بررسی نشده",
+    )
+    http_status = (
+        to_persian_digits(page.last_http_status)
+        if page.last_http_status is not None
+        else "ثبت نشده"
+    )
     text = (
         f"جزئیات پیج <b>@{html.escape(page.instagram_username)}</b>\n\n"
-        f"وضعیت: {status_text}\n"
-        f"آخرین بررسی: {format_datetime(page.last_checked_at)}\n"
+        f"وضعیت قطعی ذخیره‌شده: <b>{status_text}</b>\n"
+        f"نتیجه آخرین تلاش: <b>{latest_outcome}</b>\n"
+        f"کد HTTP آخر: <code>{http_status}</code>\n"
+        f"آخرین تلاش: {format_datetime(page.last_checked_at)}\n"
+        f"آخرین پاسخ قطعی: {format_datetime(page.last_successful_check_at)}\n"
+        f"آخرین تغییر وضعیت: {format_datetime(page.last_status_changed_at)}\n"
+        f"تأییدهای متوالی فعال: <code>{to_persian_digits(page.consecutive_active_checks)}</code>\n"
+        f"تأییدهای متوالی غیرفعال: <code>{to_persian_digits(page.consecutive_deactivated_checks)}</code>\n"
         f"شناسه اینستاگرام: <code>{html.escape(page.last_known_id or 'ثبت نشده')}</code>"
     )
     if callback.message:
         await callback.message.edit_text(
             text, reply_markup=page_details_keyboard(page.id)
         )
-    await callback.answer()
 
 
 def _profile_details_caption(details: EmbedProfile) -> str:
@@ -927,11 +991,13 @@ async def live_profile_details(
         return
 
     await callback.answer("در حال دریافت اطلاعات زنده…")
-    status = await checker.fetch_profile(
-        page.instagram_username,
-        allow_stale=False,
-        force_refresh=True,
-    )
+    try:
+        status = await checker.check_target_now(page_id)
+    except Exception:
+        logger.exception("Could not synchronize target %s before live report", page_id)
+        status = None
+    if status is None:
+        status = ProfileResult(CheckOutcome.UNKNOWN)
     if status.outcome == CheckOutcome.ACTIVE:
         details = profile_result_to_embed(status, page.instagram_username)
     elif status.outcome == CheckOutcome.DEACTIVATED:

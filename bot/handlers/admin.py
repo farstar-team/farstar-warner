@@ -32,6 +32,7 @@ from bot.keyboards.inline import (
     admin_store_keyboard,
     admin_user_detail_keyboard,
     admin_user_section_keyboard,
+    admin_user_subscription_keyboard,
     admin_users_keyboard,
     currency_selection_keyboard,
     payment_config_keyboard,
@@ -1647,6 +1648,155 @@ async def user_report_copy_settings(
     await callback.answer()
 
 
+@router.callback_query(F.data.startswith("admin:user:subview:"))
+async def view_user_subscription(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    user_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        subscription = await session.get(UserSubscription, user_id)
+    if user is None:
+        await callback.answer("کاربر پیدا نشد.", show_alert=True)
+        return
+    plan_name = (
+        html.escape(subscription.plan_name)
+        if subscription
+        else PLAN_NAMES[user.plan_tier]
+    )
+    target_limit = (
+        subscription.target_limit if subscription else user.plan_tier.target_limit
+    )
+    expiry = subscription.expires_at if subscription else user.subscription_expiry
+    text = (
+        f"<b>کنترل اشتراک کاربر <code>{user_id}</code> 💎</b>\n\n"
+        f"پلن فعلی: <b>{plan_name}</b>\n"
+        f"ظرفیت پایش: <code>{_digits(target_limit)}</code> پیج\n"
+        f"پایان اعتبار:\n{format_datetime_dual(expiry)}\n\n"
+        "می‌توانید پلن را تغییر دهید، روز اضافه کنید یا اشتراک ویژه را پایان دهید."
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_user_subscription_keyboard(user_id),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:user:sub:renew:"))
+async def renew_user_from_profile(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    user_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+    if user is None:
+        await callback.answer("کاربر پیدا نشد.", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(renew_user_id=user_id, renew_return_user=True)
+    await state.set_state(AdminRenewState.choosing_plan)
+    if callback.message:
+        await callback.message.answer(
+            "پلن جدید کاربر را انتخاب کنید:",
+            reply_markup=admin_plan_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:user:sub:extend"))
+async def extend_user_subscription(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 5 or parts[3] not in {"extend30", "extend90"}:
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    days = 30 if parts[3] == "extend30" else 90
+    user_id = int(parts[4])
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        user = await session.scalar(
+            select(User).where(User.telegram_id == user_id).with_for_update()
+        )
+        if user is None:
+            await callback.answer("کاربر پیدا نشد.", show_alert=True)
+            return
+        subscription = await session.get(UserSubscription, user_id)
+        current_expiry = (
+            subscription.expires_at if subscription else user.subscription_expiry
+        )
+        if current_expiry.tzinfo is None:
+            current_expiry = current_expiry.replace(tzinfo=timezone.utc)
+        new_expiry = max(now, current_expiry) + timedelta(days=days)
+        user.subscription_expiry = new_expiry
+        user.status = UserStatus.ACTIVE
+        if subscription:
+            subscription.expires_at = new_expiry
+            subscription.updated_at = now
+        await session.commit()
+    await callback.answer(
+        f"{_digits(days)} روز به اشتراک اضافه شد. ✅",
+        show_alert=True,
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            f"اشتراک کاربر <code>{user_id}</code> تمدید شد. ✅\n\n"
+            f"پایان اعتبار جدید:\n{format_datetime_dual(new_expiry)}",
+            reply_markup=admin_user_subscription_keyboard(user_id),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:user:sub:expire:"))
+async def expire_user_subscription(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    user_id = int((callback.data or "").rsplit(":", 1)[1])
+    if user_id == settings.admin_telegram_id:
+        await callback.answer(
+            "اشتراک مدیر اصلی قابل پایان‌دادن نیست.",
+            show_alert=True,
+        )
+        return
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        user = await session.scalar(
+            select(User).where(User.telegram_id == user_id).with_for_update()
+        )
+        if user is None:
+            await callback.answer("کاربر پیدا نشد.", show_alert=True)
+            return
+        subscription = await session.get(UserSubscription, user_id)
+        if subscription is not None:
+            await session.delete(subscription)
+        user.subscription_expiry = now
+        user.plan_tier = PlanTier.FREE
+        await session.commit()
+    if callback.message:
+        await callback.message.edit_text(
+            f"اشتراک ویژه کاربر <code>{user_id}</code> پایان یافت و حساب به پلن رایگان برگشت.",
+            reply_markup=admin_user_subscription_keyboard(user_id),
+        )
+    await callback.answer("اشتراک ویژه پایان یافت. ✅", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("admin:user:status:"))
 async def toggle_user_status(
     callback: CallbackQuery,
@@ -1716,12 +1866,15 @@ async def view_user_pages(
             if target.last_known_status == PageStatus.DEACTIVATED
             else "نامشخص"
         )
+        if not target.status_confirmed:
+            status += " — در انتظار تأیید قطعی"
         lines.extend(
             (
                 f"<b>@{html.escape(target.instagram_username)}</b>",
                 f"شناسه داخلی: <code>{_digits(target.id)}</code> | وضعیت: {status}",
                 f"شناسه اینستاگرام: <code>{html.escape(target.last_known_id or 'ثبت نشده')}</code>",
-                f"آخرین بررسی:\n{format_datetime_dual(target.last_checked_at)}",
+                f"نتیجه آخرین تلاش: <code>{html.escape(target.last_check_outcome or 'ثبت نشده')}</code>",
+                f"آخرین پاسخ قطعی:\n{format_datetime_dual(target.last_successful_check_at)}",
                 "",
             )
         )
@@ -2186,6 +2339,7 @@ async def finish_renew_subscription(
     data = await state.get_data()
     user_id = int(data["renew_user_id"])
     plan = PlanTier(data["renew_plan"])
+    return_to_user = bool(data.get("renew_return_user"))
     now = datetime.now(timezone.utc)
     async with session_factory() as session:
         user = await session.scalar(
@@ -2223,7 +2377,11 @@ async def finish_renew_subscription(
         f"شناسه کاربر: <code>{_digits(user_id)}</code>\n"
         f"پلن: {PLAN_NAMES[plan]}\n"
         f"اعتبار جدید:\n{format_datetime_dual(new_expiry)}",
-        reply_markup=main_menu_keyboard(is_admin=True),
+        reply_markup=(
+            admin_user_detail_keyboard(user_id, banned=False)
+            if return_to_user
+            else main_menu_keyboard(is_admin=True)
+        ),
     )
 
 

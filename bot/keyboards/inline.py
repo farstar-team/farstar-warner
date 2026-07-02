@@ -620,6 +620,12 @@ def admin_user_detail_keyboard(user_id: int, *, banned: bool) -> InlineKeyboardM
             ],
             [
                 InlineKeyboardButton(
+                    text="💎 کنترل اشتراک کاربر",
+                    callback_data=f"admin:user:subview:{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="✅ رفع مسدودی" if banned else "⛔ مسدودکردن کاربر",
                     callback_data=f"admin:user:status:{user_id}",
                 )
@@ -628,6 +634,41 @@ def admin_user_detail_keyboard(user_id: int, *, banned: bool) -> InlineKeyboardM
                 InlineKeyboardButton(
                     text="↩️ فهرست کاربران",
                     callback_data="admin:users:0",
+                )
+            ],
+        ]
+    )
+
+
+def admin_user_subscription_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✏️ تغییر پلن و افزودن روز",
+                    callback_data=f"admin:user:sub:renew:{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="➕ ۳۰ روز به اشتراک فعلی",
+                    callback_data=f"admin:user:sub:extend30:{user_id}",
+                ),
+                InlineKeyboardButton(
+                    text="➕ ۹۰ روز به اشتراک فعلی",
+                    callback_data=f"admin:user:sub:extend90:{user_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⏹ پایان‌دادن اشتراک ویژه",
+                    callback_data=f"admin:user:sub:expire:{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ اطلاعات کاربر",
+                    callback_data=f"admin:user:view:{user_id}",
                 )
             ],
         ]

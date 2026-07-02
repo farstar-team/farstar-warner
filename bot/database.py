@@ -44,6 +44,20 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 "admin_report_copy BOOLEAN NOT NULL DEFAULT FALSE",
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
                 "admin_report_categories VARCHAR(200) NOT NULL DEFAULT ''",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "last_successful_check_at TIMESTAMPTZ NULL",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "last_status_changed_at TIMESTAMPTZ NULL",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "last_check_outcome VARCHAR(32) NULL",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "last_http_status INTEGER NULL",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "status_confirmed BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "consecutive_active_checks INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "consecutive_deactivated_checks INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
                 "notify_follower_change BOOLEAN NOT NULL DEFAULT TRUE",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
@@ -98,6 +112,44 @@ async def initialize_database(engine: AsyncEngine) -> None:
             }
             for column, statement in sqlite_migrations.items():
                 if column not in existing_columns:
+                    await connection.execute(text(statement))
+            target_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(text("PRAGMA table_info(target_pages)"))
+                ).all()
+            }
+            target_migrations = {
+                "last_successful_check_at": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "last_successful_check_at DATETIME NULL"
+                ),
+                "last_status_changed_at": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "last_status_changed_at DATETIME NULL"
+                ),
+                "last_check_outcome": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "last_check_outcome VARCHAR(32) NULL"
+                ),
+                "last_http_status": (
+                    "ALTER TABLE target_pages ADD COLUMN last_http_status INTEGER NULL"
+                ),
+                "status_confirmed": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "status_confirmed BOOLEAN NOT NULL DEFAULT 0"
+                ),
+                "consecutive_active_checks": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "consecutive_active_checks INTEGER NOT NULL DEFAULT 0"
+                ),
+                "consecutive_deactivated_checks": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "consecutive_deactivated_checks INTEGER NOT NULL DEFAULT 0"
+                ),
+            }
+            for column, statement in target_migrations.items():
+                if column not in target_columns:
                     await connection.execute(text(statement))
             user_columns = {
                 row[1]

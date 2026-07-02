@@ -1280,11 +1280,35 @@ class InstagramChecker:
             )
             return list(result)
 
-    async def _check_target(self, target_id: int) -> None:
+    async def check_target_now(self, target_id: int) -> ProfileResult | None:
+        self._rate_limited.clear()
+        if not await self.reference_profile_preflight():
+            return None
+        return await self._check_target(target_id)
+
+    async def _record_inconclusive_check(
+        self,
+        target_id: int,
+        result: ProfileResult,
+        *,
+        outcome: str | None = None,
+    ) -> None:
+        async with self.session_factory() as session:
+            target = await session.scalar(
+                select(TargetPage).where(TargetPage.id == target_id).with_for_update()
+            )
+            if target is None:
+                return
+            target.last_checked_at = datetime.now(timezone.utc)
+            target.last_check_outcome = outcome or result.outcome.value
+            target.last_http_status = result.http_status
+            await session.commit()
+
+    async def _check_target(self, target_id: int) -> ProfileResult | None:
         async with self.session_factory() as session:
             snapshot = await session.get(TargetPage, target_id)
             if snapshot is None:
-                return
+                return None
             username = snapshot.instagram_username
             known_status = snapshot.last_known_status
 
@@ -1311,12 +1335,14 @@ class InstagramChecker:
             ),
         )
         if result.outcome == CheckOutcome.UNKNOWN:
-            return
+            await self._record_inconclusive_check(target_id, result)
+            return result
         if result.outcome == CheckOutcome.RATE_LIMITED:
             logger.warning(
                 "Ignoring non-authoritative rate-limit result for %s", username
             )
-            return
+            await self._record_inconclusive_check(target_id, result)
+            return result
 
         streak_key = f"{self.DEACTIVATION_STREAK_PREFIX}{target_id}"
         await self.redis.delete(streak_key)
@@ -1333,6 +1359,11 @@ class InstagramChecker:
                     force_refresh=True,
                 )
                 if confirmation.outcome != CheckOutcome.DEACTIVATED:
+                    await self._record_inconclusive_check(
+                        target_id,
+                        confirmation,
+                        outcome="UnconfirmedDeactivation",
+                    )
                     await self.diagnostics.add(
                         level="WARNING",
                         event="deactivation_confirmation_rejected",
@@ -1347,7 +1378,7 @@ class InstagramChecker:
                             f"confirmation={confirmation.outcome.value}"
                         ),
                     )
-                    return
+                    return confirmation
                 confirmations += 1
             await self.diagnostics.add(
                 level="INFO",
@@ -1366,7 +1397,7 @@ class InstagramChecker:
                 select(TargetPage).where(TargetPage.id == target_id).with_for_update()
             )
             if target is None:
-                return
+                return None
             owner = await session.get(User, target.user_id)
             if owner is not None:
                 admin_report_categories = parse_admin_report_categories(
@@ -1397,7 +1428,23 @@ class InstagramChecker:
             )
 
             target.last_known_status = new_status
-            target.last_checked_at = datetime.now(timezone.utc)
+            checked_at = datetime.now(timezone.utc)
+            target.last_checked_at = checked_at
+            target.last_successful_check_at = checked_at
+            target.last_check_outcome = result.outcome.value
+            target.last_http_status = result.http_status
+            target.status_confirmed = True
+            if new_status == PageStatus.ACTIVE:
+                target.consecutive_active_checks += 1
+                target.consecutive_deactivated_checks = 0
+            else:
+                target.consecutive_deactivated_checks = max(
+                    self.settings.deactivation_confirmations,
+                    target.consecutive_deactivated_checks + 1,
+                )
+                target.consecutive_active_checks = 0
+            if previous_status != new_status or target.last_status_changed_at is None:
+                target.last_status_changed_at = checked_at
             username_changed = False
             identity_changed = False
 
@@ -1857,6 +1904,7 @@ class InstagramChecker:
                             reply_markup=None,
                         ),
                     )
+        return result
 
     async def _notify(
         self,
