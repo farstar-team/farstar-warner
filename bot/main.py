@@ -137,9 +137,7 @@ async def run() -> None:
         ),
         asyncio.get_running_loop(),
     )
-    diagnostic_handler.setFormatter(
-        logging.Formatter("%(name)s | %(message)s")
-    )
+    diagnostic_handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
     logging.getLogger().addHandler(diagnostic_handler)
     bot = Bot(
         token=settings.telegram_bot_token.get_secret_value(),
@@ -183,6 +181,14 @@ async def run() -> None:
             name="Instagram public profile checker",
             replace_existing=True,
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=5),
+        )
+        scheduler.add_job(
+            checker.health_monitor,
+            trigger=IntervalTrigger(minutes=5, timezone=timezone.utc),
+            id="instagram-health-monitor",
+            name="Five-minute Instagram and report health monitor",
+            replace_existing=True,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
         )
         scheduler.add_job(
             send_expiry_reminders,

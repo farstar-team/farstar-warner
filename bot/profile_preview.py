@@ -23,6 +23,7 @@ from redis.asyncio import Redis
 
 from bot.checker import CheckOutcome, ProfileResult, USER_AGENTS
 from bot.config import Settings
+from bot.report_cards import ProfileCardData, ReportCardRenderer
 
 
 logger = logging.getLogger(__name__)
@@ -335,6 +336,21 @@ class ProfilePreviewService:
 
     @classmethod
     def _draw_card(cls, profile: EmbedProfile, avatar_bytes: bytes | None) -> bytes:
+        return ReportCardRenderer.render_profile(
+            ProfileCardData(
+                username=profile.username,
+                full_name=profile.full_name,
+                biography=profile.biography,
+                follower_count=profile.follower_count,
+                following_count=profile.following_count,
+                post_count=profile.post_count,
+                is_private=profile.is_private,
+                is_verified=profile.is_verified,
+            ),
+            avatar_bytes,
+        )
+
+        # Legacy renderer retained below for compatibility with older deployments.
         width, height = 1080, 1350
         image = Image.new("RGB", (width, height), "#070914")
         pixels = image.load()

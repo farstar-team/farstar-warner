@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -37,6 +38,55 @@ def create_database(settings: Settings) -> tuple[AsyncEngine, SessionFactory]:
 async def initialize_database(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        if connection.dialect.name == "postgresql":
+            migrations = (
+                "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
+                "notify_follower_change BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
+                "follower_report_mode VARCHAR(16) NOT NULL DEFAULT 'threshold'",
+                "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
+                "follower_change_threshold INTEGER NOT NULL DEFAULT 100",
+                "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
+                "follower_report_baseline BIGINT NULL",
+                "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
+                "last_follower_report_at TIMESTAMPTZ NULL",
+            )
+            for statement in migrations:
+                await connection.execute(text(statement))
+        elif connection.dialect.name == "sqlite":
+            existing_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(
+                        text("PRAGMA table_info(notification_settings)")
+                    )
+                ).all()
+            }
+            sqlite_migrations = {
+                "notify_follower_change": (
+                    "ALTER TABLE notification_settings ADD COLUMN "
+                    "notify_follower_change BOOLEAN NOT NULL DEFAULT 1"
+                ),
+                "follower_report_mode": (
+                    "ALTER TABLE notification_settings ADD COLUMN "
+                    "follower_report_mode VARCHAR(16) NOT NULL DEFAULT 'threshold'"
+                ),
+                "follower_change_threshold": (
+                    "ALTER TABLE notification_settings ADD COLUMN "
+                    "follower_change_threshold INTEGER NOT NULL DEFAULT 100"
+                ),
+                "follower_report_baseline": (
+                    "ALTER TABLE notification_settings ADD COLUMN "
+                    "follower_report_baseline BIGINT NULL"
+                ),
+                "last_follower_report_at": (
+                    "ALTER TABLE notification_settings ADD COLUMN "
+                    "last_follower_report_at DATETIME NULL"
+                ),
+            }
+            for column, statement in sqlite_migrations.items():
+                if column not in existing_columns:
+                    await connection.execute(text(statement))
 
 
 @asynccontextmanager

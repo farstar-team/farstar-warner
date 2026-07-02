@@ -180,6 +180,21 @@ class NotificationSettings(Base):
     notify_username_change: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
+    notify_follower_change: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    follower_report_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="threshold"
+    )
+    follower_change_threshold: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=100
+    )
+    follower_report_baseline: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    last_follower_report_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     user: Mapped[User] = relationship(back_populates="notification_settings")
     target_page: Mapped[TargetPage] = relationship(
@@ -385,7 +400,9 @@ class DiscountCode(Base):
     __tablename__ = "discount_codes"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    code: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
     percent: Mapped[int] = mapped_column(Integer, nullable=False)
     max_uses: Mapped[int | None] = mapped_column(Integer, nullable=True)
     used_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

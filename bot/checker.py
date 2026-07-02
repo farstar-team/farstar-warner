@@ -9,7 +9,7 @@ import secrets
 import time
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
 from urllib.parse import quote, urlsplit
@@ -17,9 +17,10 @@ from urllib.parse import quote, urlsplit
 import httpx
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
+from aiogram.types import BufferedInputFile
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
-from redis.exceptions import LockError
+from redis.exceptions import LockError, RedisError
 from sqlalchemy import and_, case, func, select
 
 from bot.config import Settings
@@ -36,6 +37,7 @@ from bot.models import (
     UserSubscription,
     UserStatus,
 )
+from bot.report_cards import AlertCardData, ProfileCardData, ReportCardRenderer
 
 
 logger = logging.getLogger(__name__)
@@ -93,12 +95,28 @@ class CurlResponse:
     elapsed_ms: int | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class NotificationPayload:
+    message: str
+    username: str
+    title: str
+    category: str
+    primary_label: str
+    primary_value: str
+    secondary_label: str | None = None
+    secondary_value: str | None = None
+    accent: str = "gold"
+
+
 class InstagramChecker:
     LOCK_KEY = "farstar:checker:lock"
     STATUS_COOLDOWN_KEY = "farstar:checker:status-cooldown"
     DEACTIVATION_STREAK_PREFIX = "farstar:checker:deactivation-streak:"
     PROXY_FAILURE_STREAK_KEY = "farstar:checker:proxy-failure-streak"
     PROXY_ALERT_KEY = "farstar:checker:proxy-alert-sent"
+    HEALTH_LOCK_KEY = "farstar:checker:health-monitor-lock"
+    HEALTH_STATE_KEY = "farstar:checker:health-state"
+    HEALTH_ALERT_KEY = "farstar:checker:health-alert"
     LOCK_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 8_000_000
     CURL_EXECUTABLE = "curl"
@@ -344,9 +362,8 @@ class InstagramChecker:
                 return curl_http2_response
             if (
                 curl_http2_response.return_code != 2
-                or "the installed libcurl version doesn't support" not in (
-                    curl_http2_response.error or ""
-                ).lower()
+                or "the installed libcurl version doesn't support"
+                not in (curl_http2_response.error or "").lower()
             ):
                 last_response = curl_http2_response
 
@@ -433,10 +450,9 @@ class InstagramChecker:
             return True
         if response.status_code != 200:
             return False
-        return (
-            self._parse_profile_response(response.body, username, 200) is not None
-            or self._body_indicates_deactivated(response.body)
-        )
+        return self._parse_profile_response(
+            response.body, username, 200
+        ) is not None or self._body_indicates_deactivated(response.body)
 
     async def _execute_curl(self, username: str) -> CurlResponse:
         last_response: CurlResponse | None = None
@@ -748,9 +764,16 @@ class InstagramChecker:
             message = str(payload.get("message") or "").strip()
             status = str(payload.get("status") or "").strip()
             suffix = "; ".join(
-                part for part in (f"status={status}" if status else "", f"message={message}" if message else "") if part
+                part
+                for part in (
+                    f"status={status}" if status else "",
+                    f"message={message}" if message else "",
+                )
+                if part
             )
-            return f"{reason} data.user معتبر وجود ندارد.{f' {suffix}' if suffix else ''}"
+            return (
+                f"{reason} data.user معتبر وجود ندارد.{f' {suffix}' if suffix else ''}"
+            )
 
         lowered = response.body[:2000].decode("utf-8", errors="ignore").lower()
         if "accounts/login" in lowered or "log in" in lowered:
@@ -860,6 +883,119 @@ class InstagramChecker:
                     "عیب‌یابی» پنل مدیریت ثبت شده است.",
                 )
         return False
+
+    async def health_monitor(self) -> None:
+        lock = self.redis.lock(
+            self.HEALTH_LOCK_KEY,
+            timeout=240,
+            blocking_timeout=0,
+        )
+        if not await lock.acquire(blocking=False):
+            return
+        try:
+            failure_reason: str | None = None
+            if not await self.proxy_preflight():
+                latest = await self.diagnostics.latest(1)
+                failure_reason = (
+                    latest[0].detail
+                    if latest and latest[0].detail
+                    else "مسیر WARP یا endpoint اینستاگرام پاسخ سالم نداد."
+                )
+            else:
+                result = await self.fetch_profile(
+                    "instagram",
+                    allow_stale=False,
+                    force_refresh=True,
+                )
+                if result.outcome != CheckOutcome.ACTIVE:
+                    failure_reason = (
+                        "Web Profile API برای پیج آزمایشی پاسخ معتبر نداد؛ "
+                        f"outcome={result.outcome.value}; http={result.http_status}"
+                    )
+                else:
+                    try:
+                        await asyncio.to_thread(
+                            ReportCardRenderer.render_profile,
+                            ProfileCardData(
+                                username=result.canonical_username or "instagram",
+                                full_name=result.full_name,
+                                biography=result.biography,
+                                follower_count=result.follower_count,
+                                following_count=result.following_count,
+                                post_count=result.post_count,
+                                is_private=result.is_private,
+                                is_verified=result.is_verified,
+                            ),
+                        )
+                    except Exception as exc:
+                        failure_reason = (
+                            "موتور گزارش تصویری نتوانست کارت آزمایشی بسازد؛ "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+            previous_state = await self.redis.get(self.HEALTH_STATE_KEY)
+            if failure_reason is None:
+                await self.redis.set(self.HEALTH_STATE_KEY, "healthy", ex=86400)
+                await self.redis.delete(self.HEALTH_ALERT_KEY)
+                await self.diagnostics.add(
+                    level="INFO",
+                    event="health_monitor_succeeded",
+                    message=("تست پنج‌دقیقه‌ای API، WARP و موتور گزارش تصویری موفق بود."),
+                )
+                if previous_state == "failed":
+                    await self._notify(
+                        self.settings.admin_telegram_id,
+                        "سیستم پایش دوباره سالم شد. ✅\n\n"
+                        "دسترسی اینستاگرام، مسیر WARP و تولید گزارش تصویری "
+                        "با موفقیت آزمایش شدند.",
+                    )
+                return
+
+            await self.redis.set(self.HEALTH_STATE_KEY, "failed", ex=86400)
+            await self.diagnostics.add(
+                level="ERROR",
+                event="health_monitor_failed",
+                message="تست پنج‌دقیقه‌ای سلامت سامانه ناموفق بود.",
+                detail=failure_reason,
+            )
+            should_alert = await self.redis.set(
+                self.HEALTH_ALERT_KEY,
+                "1",
+                ex=900,
+                nx=True,
+            )
+            if should_alert:
+                await self._notify(
+                    self.settings.admin_telegram_id,
+                    "ربات در تهیه گزارش آزمایشی با مشکل روبه‌رو شد. ⚠️\n\n"
+                    f"علت تشخیصی: <code>{html.escape(failure_reason[:700])}</code>\n\n"
+                    "جزئیات بیشتر در بخش «لاگ کامل و عیب‌یابی» ثبت شده است.",
+                )
+        except Exception as exc:
+            logger.exception("Health monitor failed unexpectedly")
+            await self.diagnostics.add(
+                level="CRITICAL",
+                event="health_monitor_exception",
+                message="اجرای مانیتور سلامت با خطای داخلی متوقف شد.",
+                detail=f"{type(exc).__name__}: {exc}",
+            )
+            with suppress(Exception):
+                should_alert = await self.redis.set(
+                    self.HEALTH_ALERT_KEY,
+                    "1",
+                    ex=900,
+                    nx=True,
+                )
+                if should_alert:
+                    await self._notify(
+                        self.settings.admin_telegram_id,
+                        "مانیتور سلامت ربات با خطای داخلی متوقف شد. ⚠️\n\n"
+                        f"نوع خطا: <code>{html.escape(type(exc).__name__)}</code>\n"
+                        "جزئیات کامل در لاگ عیب‌یابی ثبت شده است.",
+                    )
+        finally:
+            with suppress(LockError, RedisError):
+                await lock.release()
 
     async def run(self) -> None:
         if await self.redis.exists(self.STATUS_COOLDOWN_KEY):
@@ -1059,7 +1195,9 @@ class InstagramChecker:
         if result.outcome == CheckOutcome.UNKNOWN:
             return
         if result.outcome == CheckOutcome.RATE_LIMITED:
-            logger.warning("Ignoring non-authoritative rate-limit result for %s", username)
+            logger.warning(
+                "Ignoring non-authoritative rate-limit result for %s", username
+            )
             return
 
         streak_key = f"{self.DEACTIVATION_STREAK_PREFIX}{target_id}"
@@ -1093,7 +1231,7 @@ class InstagramChecker:
         else:
             await self.redis.delete(streak_key)
 
-        notifications: list[str] = []
+        notifications: list[NotificationPayload] = []
         recipient_id: int | None = None
         async with self.session_factory() as session:
             target = await session.scalar(
@@ -1189,33 +1327,18 @@ class InstagramChecker:
                             )
                         )
                         notifications.append(
-                            "عکس پروفایل پیج تغییر کرد! 🖼️\n\n"
-                            f"پیج: <b>@{escaped_page}</b>"
-                        )
-                    if (
-                        snapshot.follower_count is not None
-                        and result.follower_count is not None
-                        and snapshot.follower_count != result.follower_count
-                    ):
-                        previous_followers = snapshot.follower_count
-                        follower_delta = result.follower_count - previous_followers
-                        session.add(
-                            PageEvent(
-                                target_page_id=target.id,
-                                user_id=target.user_id,
-                                event_type="follower_count_changed",
-                                description=(
-                                    f"تعداد فالوورها از {previous_followers} به "
-                                    f"{result.follower_count} تغییر کرد."
+                            NotificationPayload(
+                                message=(
+                                    "عکس پروفایل پیج تغییر کرد! 🖼️\n\n"
+                                    f"پیج: <b>@{escaped_page}</b>"
                                 ),
+                                username=target.instagram_username,
+                                title="عکس پروفایل تغییر کرد",
+                                category="IDENTITY",
+                                primary_label="رویداد",
+                                primary_value="تصویر جدید شناسایی شد",
+                                accent="blue",
                             )
-                        )
-                        notifications.append(
-                            "تعداد فالوورها تغییر کرد 📈\n\n"
-                            f"پیج: <b>@{escaped_page}</b>\n"
-                            f"مقدار قبلی: <code>{self._format_count(previous_followers)}</code>\n"
-                            f"مقدار جدید: <code>{self._format_count(result.follower_count)}</code>\n"
-                            f"میزان تغییر: <code>{self._format_count(follower_delta, signed=True)}</code>"
                         )
                     if (
                         snapshot.post_count is not None
@@ -1235,10 +1358,22 @@ class InstagramChecker:
                             )
                         )
                         notifications.append(
-                            "تعداد پست‌های پیج تغییر کرد 🗂️\n\n"
-                            f"پیج: <b>@{escaped_page}</b>\n"
-                            f"مقدار قبلی: <code>{self._format_count(previous_posts)}</code>\n"
-                            f"مقدار جدید: <code>{self._format_count(result.post_count)}</code>"
+                            NotificationPayload(
+                                message=(
+                                    "تعداد پست‌های پیج تغییر کرد 🗂️\n\n"
+                                    f"پیج: <b>@{escaped_page}</b>\n"
+                                    f"مقدار قبلی: <code>{self._format_count(previous_posts)}</code>\n"
+                                    f"مقدار جدید: <code>{self._format_count(result.post_count)}</code>"
+                                ),
+                                username=target.instagram_username,
+                                title="تعداد پست‌ها تغییر کرد",
+                                category="CONTENT",
+                                primary_label="تعداد فعلی",
+                                primary_value=self._format_count(result.post_count),
+                                secondary_label="مقدار قبلی",
+                                secondary_value=self._format_count(previous_posts),
+                                accent="gold",
+                            )
                         )
                     if (
                         snapshot.full_name is not None
@@ -1254,10 +1389,22 @@ class InstagramChecker:
                             )
                         )
                         notifications.append(
-                            "نام اصلی پیج عوض شد 🔄\n\n"
-                            f"پیج: <b>@{escaped_page}</b>\n"
-                            f"نام قبلی: <b>{html.escape(snapshot.full_name)}</b>\n"
-                            f"نام جدید: <b>{html.escape(result.full_name)}</b>"
+                            NotificationPayload(
+                                message=(
+                                    "نام اصلی پیج عوض شد 🔄\n\n"
+                                    f"پیج: <b>@{escaped_page}</b>\n"
+                                    f"نام قبلی: <b>{html.escape(snapshot.full_name)}</b>\n"
+                                    f"نام جدید: <b>{html.escape(result.full_name)}</b>"
+                                ),
+                                username=target.instagram_username,
+                                title="نام اصلی پیج عوض شد",
+                                category="IDENTITY",
+                                primary_label="نام جدید",
+                                primary_value=result.full_name,
+                                secondary_label="نام قبلی",
+                                secondary_value=snapshot.full_name,
+                                accent="blue",
+                            )
                         )
                     if (
                         snapshot.biography is not None
@@ -1272,10 +1419,100 @@ class InstagramChecker:
                             )
                         )
                         notifications.append(
-                            "بیوگرافی پیج تغییر کرد 📝\n\n"
-                            f"پیج: <b>@{escaped_page}</b>\n"
-                            "نسخه جدید در بخش اطلاعات زنده پیج قابل مشاهده است."
+                            NotificationPayload(
+                                message=(
+                                    "بیوگرافی پیج تغییر کرد 📝\n\n"
+                                    f"پیج: <b>@{escaped_page}</b>\n"
+                                    "نسخه جدید در بخش اطلاعات زنده پیج قابل مشاهده است."
+                                ),
+                                username=target.instagram_username,
+                                title="بیوگرافی پیج تغییر کرد",
+                                category="IDENTITY",
+                                primary_label="وضعیت",
+                                primary_value="متن جدید ثبت شد",
+                                accent="blue",
+                            )
                         )
+                if result.follower_count is not None:
+                    follower_now = datetime.now(timezone.utc)
+                    follower_baseline = notification_settings.follower_report_baseline
+                    if (
+                        follower_baseline is None
+                        or not notification_settings.notify_follower_change
+                    ):
+                        notification_settings.follower_report_baseline = (
+                            result.follower_count
+                        )
+                        notification_settings.last_follower_report_at = follower_now
+                    else:
+                        follower_delta = result.follower_count - follower_baseline
+                        follower_mode = notification_settings.follower_report_mode
+                        last_report_at = notification_settings.last_follower_report_at
+                        if last_report_at and last_report_at.tzinfo is None:
+                            last_report_at = last_report_at.replace(tzinfo=timezone.utc)
+                        hourly_due = follower_mode == "hourly" and (
+                            last_report_at is None
+                            or follower_now - last_report_at >= timedelta(hours=1)
+                        )
+                        threshold = max(
+                            1,
+                            notification_settings.follower_change_threshold,
+                        )
+                        threshold_due = (
+                            follower_mode != "hourly"
+                            and abs(follower_delta) >= threshold
+                        )
+                        if hourly_due or threshold_due:
+                            event_type = (
+                                "follower_hourly_report"
+                                if hourly_due
+                                else "follower_threshold_report"
+                            )
+                            session.add(
+                                PageEvent(
+                                    target_page_id=target.id,
+                                    user_id=target.user_id,
+                                    event_type=event_type,
+                                    description=(
+                                        f"گزارش فالوور از {follower_baseline} به "
+                                        f"{result.follower_count}؛ تغییر "
+                                        f"{follower_delta}."
+                                    ),
+                                )
+                            )
+                            report_title = (
+                                "گزارش ساعتی فالوورها 🕐"
+                                if hourly_due
+                                else "تعداد فالوورها به آستانه رسید 📈"
+                            )
+                            notifications.append(
+                                NotificationPayload(
+                                    message=(
+                                        f"{report_title}\n\n"
+                                        f"پیج: <b>@{html.escape(target.instagram_username)}</b>\n"
+                                        f"مقدار مبنا: <code>{self._format_count(follower_baseline)}</code>\n"
+                                        f"مقدار فعلی: <code>{self._format_count(result.follower_count)}</code>\n"
+                                        f"میزان تغییر: <code>{self._format_count(follower_delta, signed=True)}</code>"
+                                    ),
+                                    username=target.instagram_username,
+                                    title=report_title.rstrip(" 🕐📈"),
+                                    category="FOLLOWERS",
+                                    primary_label="تعداد فعلی",
+                                    primary_value=self._format_count(
+                                        result.follower_count
+                                    ),
+                                    secondary_label="میزان تغییر",
+                                    secondary_value=self._format_count(
+                                        follower_delta,
+                                        signed=True,
+                                    ),
+                                    accent=("green" if follower_delta >= 0 else "red"),
+                                )
+                            )
+                            notification_settings.follower_report_baseline = (
+                                result.follower_count
+                            )
+                            notification_settings.last_follower_report_at = follower_now
                 if picture_key:
                     snapshot.profile_picture_key = picture_key
                     snapshot.profile_picture_url = result.profile_picture_url
@@ -1303,7 +1540,17 @@ class InstagramChecker:
                 )
                 if notification_settings.notify_activation:
                     notifications.append(
-                        f"پیج فعال شد! 🎉\n\nپیج: <b>@{escaped_current}</b>"
+                        NotificationPayload(
+                            message=(
+                                f"پیج فعال شد! 🎉\n\nپیج: <b>@{escaped_current}</b>"
+                            ),
+                            username=target.instagram_username,
+                            title="پیج دوباره فعال شد",
+                            category="ACTIVATED",
+                            primary_label="وضعیت جدید",
+                            primary_value="فعال و در دسترس",
+                            accent="green",
+                        )
                     )
             elif (
                 previous_status == PageStatus.ACTIVE
@@ -1319,7 +1566,17 @@ class InstagramChecker:
                 )
                 if notification_settings.notify_deactivation:
                     notifications.append(
-                        f"پیج دی‌اکتیو شد! ⚠️\n\nپیج: <b>@{escaped_current}</b>"
+                        NotificationPayload(
+                            message=(
+                                f"پیج دی‌اکتیو شد! ⚠️\n\nپیج: <b>@{escaped_current}</b>"
+                            ),
+                            username=target.instagram_username,
+                            title="پیج دی‌اکتیو شد",
+                            category="DEACTIVATED",
+                            primary_label="وضعیت جدید",
+                            primary_value="غیرفعال یا خارج از دسترس",
+                            accent="red",
+                        )
                     )
 
             if username_changed:
@@ -1336,9 +1593,21 @@ class InstagramChecker:
                 )
                 if notification_settings.notify_username_change:
                     notifications.append(
-                        "نام کاربری پیج تغییر کرد! 🔄\n\n"
-                        f"نام قبلی: <b>@{escaped_previous}</b>\n"
-                        f"نام جدید: <b>@{escaped_current}</b>"
+                        NotificationPayload(
+                            message=(
+                                "نام کاربری پیج تغییر کرد! 🔄\n\n"
+                                f"نام قبلی: <b>@{escaped_previous}</b>\n"
+                                f"نام جدید: <b>@{escaped_current}</b>"
+                            ),
+                            username=target.instagram_username,
+                            title="نام کاربری تغییر کرد",
+                            category="IDENTITY",
+                            primary_label="نام جدید",
+                            primary_value=f"@{target.instagram_username}",
+                            secondary_label="نام قبلی",
+                            secondary_value=f"@{previous_username}",
+                            accent="blue",
+                        )
                     )
 
             if identity_changed:
@@ -1355,9 +1624,21 @@ class InstagramChecker:
                 )
                 if notification_settings.notify_username_change:
                     notifications.append(
-                        "هویت پیج تغییر کرده است! ⚠️\n\n"
-                        f"پیج: <b>@{escaped_current}</b>\n"
-                        "شناسه یکتای اینستاگرام با مقدار قبلی مطابقت ندارد."
+                        NotificationPayload(
+                            message=(
+                                "هویت پیج تغییر کرده است! ⚠️\n\n"
+                                f"پیج: <b>@{escaped_current}</b>\n"
+                                "شناسه یکتای اینستاگرام با مقدار قبلی مطابقت ندارد."
+                            ),
+                            username=target.instagram_username,
+                            title="هویت عددی پیج تغییر کرد",
+                            category="CRITICAL",
+                            primary_label="شناسه جدید",
+                            primary_value=result.profile_id or "نامشخص",
+                            secondary_label="شناسه قبلی",
+                            secondary_value=previous_profile_id or "ثبت نشده",
+                            accent="red",
+                        )
                     )
 
             recipient_id = target.user_id
@@ -1372,8 +1653,7 @@ class InstagramChecker:
             username=username,
             http_status=result.http_status,
             detail=(
-                f"target_id={target_id}; owner_id={recipient_id}; "
-                "admin_copy=false"
+                f"target_id={target_id}; owner_id={recipient_id}; admin_copy=false"
             ),
         )
 
@@ -1381,9 +1661,54 @@ class InstagramChecker:
             for notification in notifications:
                 await self._notify(recipient_id, notification)
 
-    async def _notify(self, telegram_id: int, message: str) -> None:
+    async def _notify(
+        self,
+        telegram_id: int,
+        notification: str | NotificationPayload,
+    ) -> None:
+        if isinstance(notification, str):
+            payload = NotificationPayload(
+                message=notification,
+                username="system",
+                title="هشدار زیرساخت پایش",
+                category="SYSTEM",
+                primary_label="وضعیت",
+                primary_value="نیازمند بررسی مدیر",
+                accent="red",
+            )
+        else:
+            payload = notification
         try:
-            await self.bot.send_message(telegram_id, message)
+            card = await asyncio.to_thread(
+                ReportCardRenderer.render_alert,
+                AlertCardData(
+                    title=payload.title,
+                    username=payload.username,
+                    category=payload.category,
+                    primary_label=payload.primary_label,
+                    primary_value=payload.primary_value,
+                    secondary_label=payload.secondary_label,
+                    secondary_value=payload.secondary_value,
+                    accent=payload.accent,
+                    occurred_at=datetime.now().astimezone(),
+                ),
+            )
+            await self.bot.send_photo(
+                telegram_id,
+                BufferedInputFile(card, filename="farstar-security-report.jpg"),
+                caption=payload.message,
+            )
+            return
+        except TelegramAPIError as exc:
+            logger.warning(
+                "Telegram photo notification failed for user %s: %s",
+                telegram_id,
+                exc,
+            )
+        except Exception as exc:
+            logger.warning("Could not render notification card: %s", exc)
+        try:
+            await self.bot.send_message(telegram_id, payload.message)
         except TelegramAPIError as exc:
             logger.warning(
                 "Telegram notification failed for user %s: %s",

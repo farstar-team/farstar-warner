@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import hashlib
 import json
@@ -16,7 +17,13 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, Message, TelegramObject
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    Message,
+    TelegramObject,
+)
 from redis.asyncio import Redis
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -63,6 +70,7 @@ from bot.models import (
     UserStatus,
 )
 from bot.profile_preview import EmbedProfile, PreviewOutcome, ProfilePreviewService
+from bot.report_cards import AlertCardData, ReportCardRenderer
 from bot.time_utils import format_datetime_dual, format_datetime_dual_plain
 from bot.version import APP_VERSION, version_message
 
@@ -92,6 +100,10 @@ class AddPageState(StatesGroup):
 class PurchaseState(StatesGroup):
     waiting_for_discount_code = State()
     waiting_for_receipt = State()
+
+
+class FollowerSettingsState(StatesGroup):
+    waiting_for_threshold = State()
 
 
 class UserAccessMiddleware(BaseMiddleware):
@@ -234,6 +246,24 @@ def format_count(value: int | None) -> str:
 
 def format_datetime(value: datetime | None) -> str:
     return format_datetime_dual(value)
+
+
+async def answer_alert_report(
+    message: Message,
+    card_data: AlertCardData,
+    caption: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    try:
+        card = await asyncio.to_thread(ReportCardRenderer.render_alert, card_data)
+        await message.answer_photo(
+            BufferedInputFile(card, filename="farstar-live-report.jpg"),
+            caption=caption,
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        logger.exception("Could not render or send an alert report card")
+        await message.answer(caption, reply_markup=reply_markup)
 
 
 def profile_result_to_embed(
@@ -858,7 +888,14 @@ def _profile_details_caption(details: EmbedProfile) -> str:
         if details.diagnostic == "web_profile_api_cache"
         else "اطلاعات از Web Profile API اینستاگرام و بدون ورود به حساب دریافت شد."
     )
-    lines.extend(("", source_text, "", f"زمان تولید گزارش:\n{format_datetime(datetime.now(timezone.utc))}"))
+    lines.extend(
+        (
+            "",
+            source_text,
+            "",
+            f"زمان تولید گزارش:\n{format_datetime(datetime.now(timezone.utc))}",
+        )
+    )
     return "\n".join(lines)
 
 
@@ -879,9 +916,7 @@ async def live_profile_details(
             )
         )
         snapshot = (
-            await session.get(PageSnapshot, page_id)
-            if page is not None
-            else None
+            await session.get(PageSnapshot, page_id) if page is not None else None
         )
     if page is None:
         await callback.answer("این پیج پیدا نشد.", show_alert=True)
@@ -899,8 +934,21 @@ async def live_profile_details(
     if status.outcome == CheckOutcome.ACTIVE:
         details = profile_result_to_embed(status, page.instagram_username)
     elif status.outcome == CheckOutcome.DEACTIVATED:
-        await callback.message.answer(
-            f"پیج <b>@{html.escape(page.instagram_username)}</b> در حال حاضر در دسترس نیست یا دی‌اکتیو شده است."
+        caption = (
+            f"پیج <b>@{html.escape(page.instagram_username)}</b> در حال حاضر "
+            "در دسترس نیست یا دی‌اکتیو شده است."
+        )
+        await answer_alert_report(
+            callback.message,
+            AlertCardData(
+                title="گزارش زنده وضعیت پیج",
+                username=page.instagram_username,
+                category="DEACTIVATED",
+                primary_label="وضعیت فعلی",
+                primary_value="غیرفعال یا خارج از دسترس",
+                accent="red",
+            ),
+            caption,
         )
         return
     else:
@@ -910,10 +958,23 @@ async def live_profile_details(
                 if status.http_status
                 else "ثبت نشد"
             )
-            await callback.message.answer(
-                "دریافت اطلاعات زنده این پیج فعلاً قطعی نبود؛ وضعیت ذخیره‌شده تغییر نکرد.\n\n"
+            caption = (
+                "دریافت اطلاعات زنده این پیج فعلاً قطعی نبود؛ وضعیت ذخیره‌شده "
+                "تغییر نکرد.\n\n"
                 f"کد HTTP: <code>{http_text}</code>\n"
                 "چند لحظه بعد دوباره امتحان کنید."
+            )
+            await answer_alert_report(
+                callback.message,
+                AlertCardData(
+                    title="پاسخ زنده قطعی دریافت نشد",
+                    username=page.instagram_username,
+                    category="UNKNOWN",
+                    primary_label="کد HTTP",
+                    primary_value=http_text,
+                    accent="gold",
+                ),
+                caption,
             )
             return
         details = snapshot_to_embed(page, snapshot)
@@ -995,12 +1056,36 @@ async def run_security_tool(
             CheckOutcome.RATE_LIMITED: "محدودیت موقت درخواست ⚠️",
             CheckOutcome.UNKNOWN: "نامشخص؛ وضعیت ذخیره‌شده تغییر نکرد",
         }
-        await callback.message.answer(
+        caption = (
             f"بررسی فوری <b>@{username}</b>\n\n"
             f"نتیجه زنده: <b>{current_names[result.outcome]}</b>\n"
             f"کد HTTP: <code>{to_persian_digits(result.http_status) if result.http_status else 'ثبت نشد'}</code>\n"
-            f"وضعیت ذخیره‌شده: {PAGE_STATUS_NAMES[page.last_known_status]}",
-            reply_markup=keyboard,
+            f"وضعیت ذخیره‌شده: {PAGE_STATUS_NAMES[page.last_known_status]}"
+        )
+        await answer_alert_report(
+            callback.message,
+            AlertCardData(
+                title="بررسی فوری وضعیت پیج",
+                username=page.instagram_username,
+                category=result.outcome.value.upper(),
+                primary_label="نتیجه زنده",
+                primary_value=current_names[result.outcome].rstrip(" ✅⚠️"),
+                secondary_label="کد HTTP",
+                secondary_value=(
+                    to_persian_digits(result.http_status)
+                    if result.http_status
+                    else "ثبت نشد"
+                ),
+                accent=(
+                    "green"
+                    if result.outcome == CheckOutcome.ACTIVE
+                    else "red"
+                    if result.outcome == CheckOutcome.DEACTIVATED
+                    else "gold"
+                ),
+            ),
+            caption,
+            keyboard,
         )
         return
 
@@ -1039,10 +1124,22 @@ async def run_security_tool(
                 )
             )
             await session.commit()
-        await callback.message.answer(
+        caption = (
             f"این یک اعلان آزمایشی برای پیج <b>@{username}</b> است. 🔔\n\n"
-            "کانال ارسال اعلان ربات سالم است.",
-            reply_markup=keyboard,
+            "کانال ارسال اعلان و تولید تصویر ربات سالم است."
+        )
+        await answer_alert_report(
+            callback.message,
+            AlertCardData(
+                title="آزمون اعلان تصویری",
+                username=page.instagram_username,
+                category="TEST",
+                primary_label="وضعیت کانال",
+                primary_value="سالم و آماده ارسال",
+                accent="green",
+            ),
+            caption,
+            keyboard,
         )
         return
 
@@ -1053,7 +1150,7 @@ async def run_security_tool(
             f"{profile_preview.CACHE_PREFIX}{page.instagram_username.lower()}"
         )
         cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
-        await callback.message.answer(
+        caption = (
             f"سلامت پایش <b>@{username}</b> 💠\n\n"
             f"آخرین بررسی قطعی: {format_datetime(page.last_checked_at)}\n"
             f"فاصله زمان‌بندی: {to_persian_digits(interval)} ثانیه\n"
@@ -1066,8 +1163,24 @@ async def run_security_tool(
                 if cooldown_ttl > 0
                 else ""
             )
-            + "\nحالت دسترسی: نمای عمومی بدون ورود",
-            reply_markup=keyboard,
+            + "\nحالت دسترسی: نمای عمومی بدون ورود"
+        )
+        await answer_alert_report(
+            callback.message,
+            AlertCardData(
+                title="گزارش سلامت پایش",
+                username=page.instagram_username,
+                category="HEALTH",
+                primary_label="آخرین بررسی قطعی",
+                primary_value=(
+                    "ثبت شده" if page.last_checked_at is not None else "ثبت نشده"
+                ),
+                secondary_label="فاصله بررسی",
+                secondary_value=f"{to_persian_digits(interval)} ثانیه",
+                accent="green" if page.last_checked_at is not None else "gold",
+            ),
+            caption,
+            keyboard,
         )
         return
 
@@ -1246,9 +1359,7 @@ async def run_security_tool(
                     "is_private": snapshot.is_private,
                     "is_verified": snapshot.is_verified,
                     "updated_at": snapshot.updated_at.isoformat(),
-                    "updated_at_dual": format_datetime_dual_plain(
-                        snapshot.updated_at
-                    ),
+                    "updated_at_dual": format_datetime_dual_plain(snapshot.updated_at),
                 }
                 if snapshot
                 else None
@@ -1404,7 +1515,9 @@ async def view_notification_settings(
     if callback.message:
         await callback.message.edit_text(
             f"تنظیم اعلان‌های <b>@{html.escape(page.instagram_username)}</b>\n\n"
-            "برای فعال یا غیرفعال‌کردن هر اعلان، روی آن بزنید.",
+            "برای فعال یا غیرفعال‌کردن هر اعلان، روی آن بزنید.\n\n"
+            "در حالت آستانه‌ای، فقط پس از رسیدن تغییر فالوور به عدد انتخابی "
+            "گزارش می‌گیرید. در حالت ساعتی، هر ساعت یک گزارش مقایسه‌ای ارسال می‌شود.",
             reply_markup=notification_settings_keyboard(page.id, settings),
         )
     await callback.answer()
@@ -1422,6 +1535,7 @@ async def toggle_notification(
         "activation": "notify_activation",
         "deactivation": "notify_deactivation",
         "username": "notify_username_change",
+        "follower": "notify_follower_change",
     }
     attribute = field_map.get(field)
     if attribute is None:
@@ -1456,6 +1570,125 @@ async def toggle_notification(
             reply_markup=notification_settings_keyboard(page_id, settings)
         )
     await callback.answer("تنظیم اعلان ذخیره شد. ✅")
+
+
+@router.callback_query(F.data.startswith("follower:mode:"))
+async def set_follower_report_mode(
+    callback: CallbackQuery,
+    db_user: User,
+    session_factory: SessionFactory,
+) -> None:
+    _, _, page_id_raw, mode = (callback.data or "").split(":", 3)
+    if mode not in {"threshold", "hourly"}:
+        await callback.answer("حالت گزارش معتبر نیست.", show_alert=True)
+        return
+    page_id = int(page_id_raw)
+    async with session_factory() as session:
+        page = await session.scalar(
+            select(TargetPage).where(
+                TargetPage.id == page_id,
+                TargetPage.user_id == db_user.telegram_id,
+            )
+        )
+        if page is None:
+            await callback.answer("این پیج پیدا نشد.", show_alert=True)
+            return
+        settings = await session.get(
+            NotificationSettings,
+            (db_user.telegram_id, page_id),
+        )
+        if settings is None:
+            settings = NotificationSettings(
+                user_id=db_user.telegram_id,
+                target_page_id=page_id,
+            )
+            session.add(settings)
+        settings.follower_report_mode = mode
+        settings.follower_report_baseline = None
+        settings.last_follower_report_at = None
+        await session.commit()
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=notification_settings_keyboard(page_id, settings)
+        )
+    mode_text = "آستانه‌ای" if mode == "threshold" else "ساعتی"
+    await callback.answer(f"حالت گزارش روی «{mode_text}» تنظیم شد. ✅")
+
+
+@router.callback_query(F.data.startswith("follower:threshold:"))
+async def begin_follower_threshold(
+    callback: CallbackQuery,
+    db_user: User,
+    session_factory: SessionFactory,
+    state: FSMContext,
+) -> None:
+    page_id = int((callback.data or "").rsplit(":", 1)[1])
+    page, settings = await _get_page_settings(
+        session_factory,
+        db_user.telegram_id,
+        page_id,
+    )
+    if page is None or settings is None:
+        await callback.answer("این پیج پیدا نشد.", show_alert=True)
+        return
+    await state.set_state(FollowerSettingsState.waiting_for_threshold)
+    await state.update_data(follower_threshold_page_id=page_id)
+    if callback.message:
+        await callback.message.answer(
+            "حداقل تعداد تغییر فالوور برای ارسال گزارش را وارد کنید.\n\n"
+            "مثال: <code>100</code>\n"
+            "عدد باید بین ۱ تا ۱۰٬۰۰۰٬۰۰۰ باشد.",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(FollowerSettingsState.waiting_for_threshold)
+async def save_follower_threshold(
+    message: Message,
+    db_user: User,
+    session_factory: SessionFactory,
+    state: FSMContext,
+    store_enabled: bool,
+    settings: Settings,
+) -> None:
+    normalized = (message.text or "").translate(
+        str.maketrans("۰۱۲۳۴۵۶۷۸۹٬,", "0123456789  ")
+    )
+    try:
+        threshold = int(normalized.replace(" ", ""))
+        if not 1 <= threshold <= 10_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer("عدد معتبر بین ۱ تا ۱۰٬۰۰۰٬۰۰۰ ارسال کنید.")
+        return
+    data = await state.get_data()
+    page_id = data.get("follower_threshold_page_id")
+    if not isinstance(page_id, int):
+        await state.clear()
+        await message.answer("درخواست منقضی شده است؛ دوباره تلاش کنید.")
+        return
+    async with session_factory() as session:
+        notification_settings = await session.get(
+            NotificationSettings,
+            (db_user.telegram_id, page_id),
+        )
+        if notification_settings is None:
+            await state.clear()
+            await message.answer("تنظیمات این پیج پیدا نشد.")
+            return
+        notification_settings.follower_change_threshold = threshold
+        notification_settings.follower_report_mode = "threshold"
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        "آستانه گزارش فالوور روی "
+        f"<b>{to_persian_digits(f'{threshold:,}')}</b> تنظیم شد. ✅",
+        reply_markup=main_menu_keyboard(
+            is_admin=db_user.telegram_id == settings.admin_telegram_id,
+            store_enabled=store_enabled,
+        ),
+    )
 
 
 @router.message(F.text == "خرید اشتراک 💎")
@@ -1572,7 +1805,11 @@ async def apply_discount_code(
     code_text = (message.text or "").strip().upper()
     now = datetime.now(timezone.utc)
     async with session_factory() as session:
-        plan = await session.get(SubscriptionPlan, plan_id) if isinstance(plan_id, int) else None
+        plan = (
+            await session.get(SubscriptionPlan, plan_id)
+            if isinstance(plan_id, int)
+            else None
+        )
         discount = await session.scalar(
             select(DiscountCode).where(func.upper(DiscountCode.code) == code_text)
         )
@@ -1584,7 +1821,9 @@ async def apply_discount_code(
                 .where(
                     ReceiptDiscount.discount_code_id == discount.id,
                     ReceiptDiscount.user_id == db_user.telegram_id,
-                    PaymentReceipt.status.in_([ReceiptStatus.PENDING, ReceiptStatus.APPROVED]),
+                    PaymentReceipt.status.in_(
+                        [ReceiptStatus.PENDING, ReceiptStatus.APPROVED]
+                    ),
                 )
             )
         payment = await session.get(PaymentConfig, 1)
@@ -1709,7 +1948,9 @@ async def receive_payment_receipt(
                 plan_name=plan.name,
                 duration_days=plan.duration_days,
                 target_limit=plan.target_limit,
-                amount=(purchase_amount if isinstance(purchase_amount, int) else plan.price),
+                amount=(
+                    purchase_amount if isinstance(purchase_amount, int) else plan.price
+                ),
                 file_id=file_id,
                 file_unique_id=file_unique_id,
                 file_type=file_type,

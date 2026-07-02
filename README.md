@@ -203,7 +203,7 @@ farstar update
 
 پس از نصب، وارد گفت‌وگوی ربات شوید و دستور `/start` را ارسال کنید.
 
-نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **3.1.1** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
+نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **4.0.0** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
 
 منوی اصلی شامل این گزینه‌هاست:
 
@@ -276,11 +276,15 @@ https://www.instagram.com/instagram/
 - انتقال وضعیت از دی‌اکتیو به فعال، اعلان `پیج فعال شد! 🎉` ایجاد می‌کند.
 - انتقال وضعیت از فعال به دی‌اکتیو پس از دو پاسخ قطعی متوالی، اعلان `پیج دی‌اکتیو شد! ⚠️` ایجاد می‌کند.
 - تغییر مسیر پایدار عکس پروفایل اعلان `عکس پروفایل پیج تغییر کرد! 🖼️` ایجاد می‌کند؛ پارامترهای موقت CDN نادیده گرفته می‌شوند.
-- تغییر تعداد فالوورها، تعداد پست، نام اصلی یا بیوگرافی بلافاصله فقط به مالک پیج اطلاع داده می‌شود.
+- تغییر تعداد پست، نام اصلی یا بیوگرافی بلافاصله فقط به مالک پیج اطلاع داده می‌شود؛ گزارش فالوور مطابق حالت انتخابی کاربر عمل می‌کند.
+- گزارش فالوور برای هر پیج مستقل است: کاربر می‌تواند آن را خاموش کند، حالت آستانه‌ای با عدد دلخواه انتخاب کند یا گزارش مقایسه‌ای ساعتی بگیرد.
+- تمام رخدادهای فعال‌شدن، دی‌اکتیوشدن، فالوور، پست، نام، بیو و تصویر پروفایل همراه کارت تصویری مشکی‌طلایی ارسال می‌شوند.
+- موتور تصویر از فونت دو‌زبانه و RAQM/fallback استاندارد استفاده می‌کند تا فارسی راست‌به‌چپ و متن لاتین بدون مربع نمایش داده شوند.
 - اولین بررسی فقط وضعیت پایه را ثبت می‌کند و اعلان تغییر وضعیت نمی‌فرستد.
 - پاسخ‌های ورود اجباری، چالش امنیتی، خطاهای شبکه و خطاهای موقت به‌عنوان وضعیت نامشخص در نظر گرفته می‌شوند و وضعیت ذخیره‌شده را تغییر نمی‌دهند.
 - بین بررسی پیج‌ها ۱۵ تا ۴۵ ثانیه فاصله تصادفی اعمال می‌شود و retryها backoff تصاعدی دارند.
 - در پاسخ `403` یا `429` چرخه متوقف می‌شود تا فشار بیشتری به سرویس وارد نشود. پس از سه چرخه شکست متوالی، مدیر یک هشدار زیرساختی دریافت می‌کند.
+- هر پنج دقیقه یک تست مستقل، سلامت WARP، پاسخ Web Profile API و توانایی ساخت کارت تصویری را بررسی می‌کند؛ خطای تشخیصی برای مدیر و بازیابی سلامت نیز اطلاع‌رسانی می‌شود.
 
 WARP در این معماری یک مسیر خروجی پایدار و health-checked است. برنامه برای دورزدن rate limit، حساب جدید یا IP تازه تولید نمی‌کند و Docker socket نیز در اختیار ربات قرار نمی‌گیرد. این تصمیم از دسترسی سطح ریشه ربات به میزبان و هشدارهای نادرست جلوگیری می‌کند.
 
@@ -397,6 +401,10 @@ farstar-warner/
     ├── models.py
     ├── checker.py
     ├── profile_preview.py
+    ├── report_cards.py
+    ├── diagnostics.py
+    ├── time_utils.py
+    ├── reminders.py
     ├── version.py
     ├── main.py
     ├── handlers/
@@ -417,8 +425,11 @@ Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram p
 
 - Asynchronous Telegram UI with aiogram 3
 - Asynchronous curl-based Web Profile API checks using the server-validated headers
-- Activation, deactivation, and username-change notifications
-- On-demand profile card with photo, follower count, post count, privacy, verification, and biography when exposed by the public embed
+- Activation and confirmed deactivation notifications with image evidence
+- Per-profile hourly or threshold-based follower reports
+- Black-and-gold bilingual live cards and image reports for monitoring events
+- Five-minute WARP, Instagram API, and image-renderer health monitoring
+- Automatic additive database migration for existing installations
 - Confirmation before saving active profiles and an explicit waiting-list path for inactive usernames
 - Per-profile notification settings
 - Permanent one-target Free access, 100-target Premium, and 500-target VIP defaults

@@ -18,6 +18,10 @@ def _enabled_icon(enabled: bool) -> str:
     return "✅" if enabled else "❌"
 
 
+def _persian_number(value: int) -> str:
+    return f"{value:,}".translate(str.maketrans("0123456789,", "۰۱۲۳۴۵۶۷۸۹٬"))
+
+
 def _page_status_icon(status: PageStatus | None) -> str:
     if status == PageStatus.ACTIVE:
         return "🟢"
@@ -231,6 +235,39 @@ def notification_settings_keyboard(
                     callback_data=f"toggle:{page_id}:username",
                 )
             ],
+            [
+                InlineKeyboardButton(
+                    text=f"{_enabled_icon(settings.notify_follower_change)} گزارش تغییر فالوور",
+                    callback_data=f"toggle:{page_id}:follower",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "✅ حالت آستانه‌ای"
+                        if settings.follower_report_mode == "threshold"
+                        else "حالت آستانه‌ای"
+                    ),
+                    callback_data=f"follower:mode:{page_id}:threshold",
+                ),
+                InlineKeyboardButton(
+                    text=(
+                        "✅ گزارش ساعتی"
+                        if settings.follower_report_mode == "hourly"
+                        else "گزارش ساعتی"
+                    ),
+                    callback_data=f"follower:mode:{page_id}:hourly",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "🔢 آستانه فعلی: "
+                        f"{_persian_number(settings.follower_change_threshold)}"
+                    ),
+                    callback_data=f"follower:threshold:{page_id}",
+                )
+            ],
             [InlineKeyboardButton(text="↩️ بازگشت به پیج‌ها", callback_data="page:list")],
         ]
     )
@@ -404,7 +441,11 @@ def admin_discounts_keyboard(codes: list[DiscountCode]) -> InlineKeyboardMarkup:
         )
     rows.extend(
         [
-            [InlineKeyboardButton(text="➕ کد تخفیف جدید", callback_data="admin:discount:add")],
+            [
+                InlineKeyboardButton(
+                    text="➕ کد تخفیف جدید", callback_data="admin:discount:add"
+                )
+            ],
             [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
         ]
     )
@@ -434,7 +475,11 @@ def admin_store_keyboard(
         )
     rows.extend(
         [
-            [InlineKeyboardButton(text="➕ افزودن محصول", callback_data="admin:store:add")],
+            [
+                InlineKeyboardButton(
+                    text="➕ افزودن محصول", callback_data="admin:store:add"
+                )
+            ],
             [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
         ]
     )
