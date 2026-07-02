@@ -88,6 +88,12 @@ class User(Base):
         default=PlanTier.FREE,
         index=True,
     )
+    admin_report_copy: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    admin_report_categories: Mapped[str] = mapped_column(
+        String(200), nullable=False, default=""
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -183,6 +189,9 @@ class NotificationSettings(Base):
     notify_follower_change: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
+    notify_verification_change: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
     follower_report_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="threshold"
     )
@@ -195,7 +204,6 @@ class NotificationSettings(Base):
     last_follower_report_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
-
     user: Mapped[User] = relationship(back_populates="notification_settings")
     target_page: Mapped[TargetPage] = relationship(
         back_populates="notification_settings"
@@ -462,6 +470,9 @@ class StoreProduct(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     description: Mapped[str] = mapped_column(String(2000), nullable=False)
     price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    price_currency: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="TOMAN"
+    )
     purchase_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -28,7 +28,12 @@ from bot.keyboards.inline import (
     admin_panel_keyboard,
     admin_plan_keyboard,
     admin_plans_keyboard,
+    admin_report_copy_keyboard,
     admin_store_keyboard,
+    admin_user_detail_keyboard,
+    admin_user_section_keyboard,
+    admin_users_keyboard,
+    currency_selection_keyboard,
     payment_config_keyboard,
     receipt_review_keyboard,
 )
@@ -51,7 +56,13 @@ from bot.models import (
     UserSubscription,
     PlanTier,
 )
+from bot.money import format_money, normalize_currency
 from bot.profile_preview import PreviewOutcome, ProfilePreviewService
+from bot.reporting import (
+    ADMIN_REPORT_KEYS,
+    parse_admin_report_categories,
+    serialize_admin_report_categories,
+)
 from bot.time_utils import format_datetime_dual
 from bot.version import APP_VERSION
 
@@ -145,12 +156,26 @@ class AdminDiscountState(StatesGroup):
 class AdminStoreState(StatesGroup):
     waiting_for_name = State()
     waiting_for_description = State()
+    choosing_currency = State()
     waiting_for_price = State()
     waiting_for_url = State()
 
 
+class AdminReportCopyState(StatesGroup):
+    waiting_for_user_id = State()
+
+
+class AdminUserState(StatesGroup):
+    waiting_for_user_id = State()
+
+
 def _digits(value: object) -> str:
     return str(value).translate(PERSIAN_DIGITS)
+
+
+def _parse_integer(value: str | None) -> int:
+    normalized = (value or "").translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٬,", "0123456789  "))
+    return int(normalized.replace(" ", "").strip())
 
 
 async def _reject_message(message: Message, settings: Settings) -> bool:
@@ -189,8 +214,11 @@ async def _reject_callback(callback: CallbackQuery, settings: Settings) -> bool:
         AdminDiscountState.waiting_for_expiry_days,
         AdminStoreState.waiting_for_name,
         AdminStoreState.waiting_for_description,
+        AdminStoreState.choosing_currency,
         AdminStoreState.waiting_for_price,
         AdminStoreState.waiting_for_url,
+        AdminReportCopyState.waiting_for_user_id,
+        AdminUserState.waiting_for_user_id,
     ),
     F.text == "لغو عملیات ↩️",
 )
@@ -858,9 +886,7 @@ async def approve_receipt(
         if stored_expiry is not None and stored_expiry.tzinfo is None:
             stored_expiry = stored_expiry.replace(tzinfo=timezone.utc)
         current_expiry = (
-            stored_expiry
-            if stored_expiry is not None and stored_expiry > now
-            else now
+            stored_expiry if stored_expiry is not None and stored_expiry > now else now
         )
         new_expiry = current_expiry + timedelta(days=receipt.duration_days)
         if subscription is None:
@@ -970,9 +996,15 @@ async def admin_discounts(
             )
         )
     text = "مدیریت کدهای تخفیف 🏷\n\n"
-    text += "هنوز کدی ثبت نشده است." if not codes else "برای حذف، کد موردنظر را انتخاب کنید."
+    text += (
+        "هنوز کدی ثبت نشده است."
+        if not codes
+        else "برای حذف، کد موردنظر را انتخاب کنید."
+    )
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=admin_discounts_keyboard(codes))
+        await callback.message.edit_text(
+            text, reply_markup=admin_discounts_keyboard(codes)
+        )
     await callback.answer()
 
 
@@ -987,17 +1019,28 @@ async def begin_discount_add(
     await state.clear()
     await state.set_state(AdminDiscountState.waiting_for_code)
     if callback.message:
-        await callback.message.answer("کد تخفیف جدید را با حروف انگلیسی ارسال کنید:", reply_markup=cancel_keyboard())
+        await callback.message.answer(
+            "کد تخفیف جدید را با حروف انگلیسی ارسال کنید:",
+            reply_markup=cancel_keyboard(),
+        )
     await callback.answer()
 
 
 @router.message(AdminDiscountState.waiting_for_code, F.text)
-async def discount_code_received(message: Message, state: FSMContext, settings: Settings) -> None:
+async def discount_code_received(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
     if await _reject_message(message, settings):
         return
     code = (message.text or "").strip().upper()
-    if not code or len(code) > 64 or not all(ch.isalnum() or ch in {"-", "_"} for ch in code):
-        await message.answer("کد فقط می‌تواند شامل حروف انگلیسی، عدد، خط تیره و زیرخط باشد.")
+    if (
+        not code
+        or len(code) > 64
+        or not all(ch.isalnum() or ch in {"-", "_"} for ch in code)
+    ):
+        await message.answer(
+            "کد فقط می‌تواند شامل حروف انگلیسی، عدد، خط تیره و زیرخط باشد."
+        )
         return
     await state.update_data(discount_code=code)
     await state.set_state(AdminDiscountState.waiting_for_percent)
@@ -1005,7 +1048,9 @@ async def discount_code_received(message: Message, state: FSMContext, settings: 
 
 
 @router.message(AdminDiscountState.waiting_for_percent, F.text)
-async def discount_percent_received(message: Message, state: FSMContext, settings: Settings) -> None:
+async def discount_percent_received(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
     if await _reject_message(message, settings):
         return
     try:
@@ -1017,11 +1062,15 @@ async def discount_percent_received(message: Message, state: FSMContext, setting
         return
     await state.update_data(discount_percent=percent)
     await state.set_state(AdminDiscountState.waiting_for_max_uses)
-    await message.answer("حداکثر تعداد استفاده را وارد کنید؛ برای نامحدود عدد ۰ را بفرستید:")
+    await message.answer(
+        "حداکثر تعداد استفاده را وارد کنید؛ برای نامحدود عدد ۰ را بفرستید:"
+    )
 
 
 @router.message(AdminDiscountState.waiting_for_max_uses, F.text)
-async def discount_limit_received(message: Message, state: FSMContext, settings: Settings) -> None:
+async def discount_limit_received(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
     if await _reject_message(message, settings):
         return
     try:
@@ -1060,7 +1109,9 @@ async def discount_expiry_received(
                     code=data["discount_code"],
                     percent=data["discount_percent"],
                     max_uses=data["discount_max_uses"] or None,
-                    expires_at=(datetime.now(timezone.utc) + timedelta(days=days)) if days else None,
+                    expires_at=(datetime.now(timezone.utc) + timedelta(days=days))
+                    if days
+                    else None,
                 )
             )
             await session.commit()
@@ -1068,11 +1119,16 @@ async def discount_expiry_received(
         await message.answer("این کد قبلاً ثبت شده است.")
         return
     await state.clear()
-    await message.answer("کد تخفیف با موفقیت ساخته شد. ✅", reply_markup=main_menu_keyboard(is_admin=True))
+    await message.answer(
+        "کد تخفیف با موفقیت ساخته شد. ✅",
+        reply_markup=main_menu_keyboard(is_admin=True),
+    )
 
 
 @router.callback_query(F.data.startswith("admin:discount:delete:"))
-async def delete_discount_code(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+async def delete_discount_code(
+    callback: CallbackQuery, settings: Settings, session_factory: SessionFactory
+) -> None:
     if await _reject_callback(callback, settings):
         return
     code_id = int((callback.data or "").rsplit(":", 1)[1])
@@ -1084,10 +1140,18 @@ async def delete_discount_code(callback: CallbackQuery, settings: Settings, sess
     await admin_discounts(callback, settings, session_factory)
 
 
-async def _show_admin_store(callback: CallbackQuery, session_factory: SessionFactory) -> None:
+async def _show_admin_store(
+    callback: CallbackQuery, session_factory: SessionFactory
+) -> None:
     async with session_factory() as session:
         config = await session.get(StoreConfig, 1)
-        products = list(await session.scalars(select(StoreProduct).where(StoreProduct.is_active.is_(True)).order_by(StoreProduct.id)))
+        products = list(
+            await session.scalars(
+                select(StoreProduct)
+                .where(StoreProduct.is_active.is_(True))
+                .order_by(StoreProduct.id)
+            )
+        )
     enabled = bool(config and config.enabled)
     if callback.message:
         await callback.message.edit_text(
@@ -1097,7 +1161,9 @@ async def _show_admin_store(callback: CallbackQuery, session_factory: SessionFac
 
 
 @router.callback_query(F.data == "admin:store")
-async def admin_store(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+async def admin_store(
+    callback: CallbackQuery, settings: Settings, session_factory: SessionFactory
+) -> None:
     if await _reject_callback(callback, settings):
         return
     await _show_admin_store(callback, session_factory)
@@ -1105,7 +1171,9 @@ async def admin_store(callback: CallbackQuery, settings: Settings, session_facto
 
 
 @router.callback_query(F.data == "admin:store:toggle")
-async def toggle_store(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+async def toggle_store(
+    callback: CallbackQuery, settings: Settings, session_factory: SessionFactory
+) -> None:
     if await _reject_callback(callback, settings):
         return
     async with session_factory() as session:
@@ -1121,18 +1189,24 @@ async def toggle_store(callback: CallbackQuery, settings: Settings, session_fact
 
 
 @router.callback_query(F.data == "admin:store:add")
-async def begin_store_product(callback: CallbackQuery, settings: Settings, state: FSMContext) -> None:
+async def begin_store_product(
+    callback: CallbackQuery, settings: Settings, state: FSMContext
+) -> None:
     if await _reject_callback(callback, settings):
         return
     await state.clear()
     await state.set_state(AdminStoreState.waiting_for_name)
     if callback.message:
-        await callback.message.answer("نام محصول را ارسال کنید:", reply_markup=cancel_keyboard())
+        await callback.message.answer(
+            "نام محصول را ارسال کنید:", reply_markup=cancel_keyboard()
+        )
     await callback.answer()
 
 
 @router.message(AdminStoreState.waiting_for_name, F.text)
-async def store_name_received(message: Message, state: FSMContext, settings: Settings) -> None:
+async def store_name_received(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
     if await _reject_message(message, settings):
         return
     name = (message.text or "").strip()
@@ -1145,7 +1219,9 @@ async def store_name_received(message: Message, state: FSMContext, settings: Set
 
 
 @router.message(AdminStoreState.waiting_for_description, F.text)
-async def store_description_received(message: Message, state: FSMContext, settings: Settings) -> None:
+async def store_description_received(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
     if await _reject_message(message, settings):
         return
     description = (message.text or "").strip()
@@ -1153,16 +1229,40 @@ async def store_description_received(message: Message, state: FSMContext, settin
         await message.answer("توضیحات باید بین ۲ تا ۲۰۰۰ نویسه باشد.")
         return
     await state.update_data(store_description=description)
+    await state.set_state(AdminStoreState.choosing_currency)
+    await message.answer(
+        "واحد قیمت محصول را انتخاب کنید:",
+        reply_markup=currency_selection_keyboard("admin:store:currency"),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:store:currency:"))
+async def store_currency_selected(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    currency = normalize_currency((callback.data or "").rsplit(":", 1)[1])
+    await state.update_data(store_currency=currency)
     await state.set_state(AdminStoreState.waiting_for_price)
-    await message.answer("قیمت محصول را به تومان و فقط با عدد وارد کنید:")
+    currency_text = "دلار" if currency == "USD" else "تومان"
+    if callback.message:
+        await callback.message.answer(
+            f"قیمت محصول را به {currency_text} و فقط با عدد وارد کنید:"
+        )
+    await callback.answer()
 
 
 @router.message(AdminStoreState.waiting_for_price, F.text)
-async def store_price_received(message: Message, state: FSMContext, settings: Settings) -> None:
+async def store_price_received(
+    message: Message, state: FSMContext, settings: Settings
+) -> None:
     if await _reject_message(message, settings):
         return
     try:
-        price = int((message.text or "").replace(",", "").strip())
+        price = _parse_integer(message.text)
     except ValueError:
         price = -1
     if price < 0:
@@ -1170,16 +1270,25 @@ async def store_price_received(message: Message, state: FSMContext, settings: Se
         return
     await state.update_data(store_price=price)
     await state.set_state(AdminStoreState.waiting_for_url)
-    await message.answer("لینک خرید را ارسال کنید؛ برای استفاده از آیدی پشتیبانی یک خط تیره (-) بفرستید:")
+    await message.answer(
+        "لینک خرید را ارسال کنید؛ برای استفاده از آیدی پشتیبانی یک خط تیره (-) بفرستید:"
+    )
 
 
 @router.message(AdminStoreState.waiting_for_url, F.text)
-async def store_url_received(message: Message, state: FSMContext, settings: Settings, session_factory: SessionFactory) -> None:
+async def store_url_received(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
     if await _reject_message(message, settings):
         return
     value = (message.text or "").strip()
     if value != "-" and not value.startswith(("https://", "http://")):
-        await message.answer("لینک باید با http:// یا https:// شروع شود؛ یا فقط - بفرستید.")
+        await message.answer(
+            "لینک باید با http:// یا https:// شروع شود؛ یا فقط - بفرستید."
+        )
         return
     data = await state.get_data()
     async with session_factory() as session:
@@ -1188,16 +1297,21 @@ async def store_url_received(message: Message, state: FSMContext, settings: Sett
                 name=data["store_name"],
                 description=data["store_description"],
                 price=data["store_price"],
+                price_currency=data.get("store_currency", "TOMAN"),
                 purchase_url=None if value == "-" else value,
             )
         )
         await session.commit()
     await state.clear()
-    await message.answer("محصول به فروشگاه افزوده شد. ✅", reply_markup=main_menu_keyboard(is_admin=True))
+    await message.answer(
+        "محصول به فروشگاه افزوده شد. ✅", reply_markup=main_menu_keyboard(is_admin=True)
+    )
 
 
 @router.callback_query(F.data.startswith("admin:store:delete:"))
-async def delete_store_product(callback: CallbackQuery, settings: Settings, session_factory: SessionFactory) -> None:
+async def delete_store_product(
+    callback: CallbackQuery, settings: Settings, session_factory: SessionFactory
+) -> None:
     if await _reject_callback(callback, settings):
         return
     product_id = int((callback.data or "").rsplit(":", 1)[1])
@@ -1208,6 +1322,482 @@ async def delete_store_product(callback: CallbackQuery, settings: Settings, sess
             await session.commit()
     await _show_admin_store(callback, session_factory)
     await callback.answer("محصول حذف شد. ✅")
+
+
+@router.callback_query(F.data == "admin:report_copy")
+async def begin_report_copy(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.clear()
+    await state.set_state(AdminReportCopyState.waiting_for_user_id)
+    if callback.message:
+        await callback.message.answer(
+            "شناسه عددی کاربر را بفرستید. سپس نوع گزارش‌هایی را که باید "
+            "برای مدیر رونوشت شوند انتخاب می‌کنید:",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminReportCopyState.waiting_for_user_id, F.text)
+async def finish_report_copy(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        user_id = _parse_integer(message.text)
+    except ValueError:
+        await message.answer("شناسه عددی معتبر ارسال کنید.")
+        return
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            await message.answer("این کاربر هنوز در ربات ثبت نشده است.")
+            return
+        if user.telegram_id == settings.admin_telegram_id:
+            await message.answer("گزارش‌های پیج‌های خود مدیر مستقیماً ارسال می‌شوند.")
+            return
+        categories = parse_admin_report_categories(user.admin_report_categories)
+        if user.admin_report_copy and not categories:
+            categories = set(ADMIN_REPORT_KEYS)
+            user.admin_report_categories = serialize_admin_report_categories(categories)
+        user.admin_report_copy = False
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        f"انتخاب رونوشت گزارش برای کاربر <code>{user_id}</code>\n\n"
+        "هر گزینه را جداگانه فعال یا غیرفعال کنید. کاربر از این تنظیم مطلع نمی‌شود.",
+        reply_markup=admin_report_copy_keyboard(user_id, categories),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:reportcopy:"))
+async def toggle_admin_report_copy(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        _, _, user_id_text, category = (callback.data or "").split(":", 3)
+        user_id = int(user_id_text)
+    except (TypeError, ValueError):
+        await callback.answer("درخواست نامعتبر است.", show_alert=True)
+        return
+    if category != "NONE" and category not in ADMIN_REPORT_KEYS:
+        await callback.answer("نوع گزارش نامعتبر است.", show_alert=True)
+        return
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            await callback.answer("کاربر پیدا نشد.", show_alert=True)
+            return
+        categories = parse_admin_report_categories(user.admin_report_categories)
+        if user.admin_report_copy and not categories:
+            categories = set(ADMIN_REPORT_KEYS)
+        if category == "NONE":
+            categories.clear()
+        elif category in categories:
+            categories.remove(category)
+        else:
+            categories.add(category)
+        user.admin_report_copy = False
+        user.admin_report_categories = serialize_admin_report_categories(categories)
+        await session.commit()
+    if callback.message:
+        await callback.message.edit_text(
+            f"انتخاب رونوشت گزارش برای کاربر <code>{user_id}</code>\n\n"
+            "فقط گزارش‌های علامت‌خورده برای مدیر ارسال می‌شوند و کاربر پیامی درباره این تنظیم نمی‌بیند.",
+            reply_markup=admin_report_copy_keyboard(user_id, categories),
+        )
+    await callback.answer("تنظیم رونوشت ذخیره شد. ✅")
+
+
+@router.callback_query(F.data.startswith("admin:users:"))
+async def list_users(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        page = max(0, int((callback.data or "").rsplit(":", 1)[1]))
+    except ValueError:
+        page = 0
+    page_size = 10
+    async with session_factory() as session:
+        total = int(await session.scalar(select(func.count(User.telegram_id))) or 0)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages - 1)
+        users = list(
+            await session.scalars(
+                select(User)
+                .order_by(User.created_at.desc(), User.telegram_id.desc())
+                .offset(page * page_size)
+                .limit(page_size)
+            )
+        )
+    text = (
+        "<b>مدیریت کاربران 👥</b>\n\n"
+        f"تعداد کل کاربران: <code>{_digits(total)}</code>\n"
+        f"صفحه: <code>{_digits(page + 1)}</code> از <code>{_digits(total_pages)}</code>\n\n"
+        "برای مشاهده اطلاعات کامل، خریدها و پیج‌ها یک کاربر را انتخاب کنید."
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_users_keyboard(users, page, total_pages),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:user:search")
+async def begin_user_search(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.clear()
+    await state.set_state(AdminUserState.waiting_for_user_id)
+    if callback.message:
+        await callback.message.answer(
+            "شناسه عددی تلگرام کاربر را ارسال کنید:",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminUserState.waiting_for_user_id, F.text)
+async def finish_user_search(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        user_id = _parse_integer(message.text)
+    except ValueError:
+        await message.answer("شناسه عددی معتبر ارسال کنید.")
+        return
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+    if user is None:
+        await message.answer("کاربری با این شناسه در ربات ثبت نشده است.")
+        return
+    await state.clear()
+    await _send_user_details(message, user_id, session_factory)
+
+
+async def _user_details_text(
+    user_id: int,
+    session_factory: SessionFactory,
+) -> tuple[str | None, bool]:
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            return None, False
+        subscription = await session.get(UserSubscription, user_id)
+        page_total = int(
+            await session.scalar(
+                select(func.count(TargetPage.id)).where(TargetPage.user_id == user_id)
+            )
+            or 0
+        )
+        active_pages = int(
+            await session.scalar(
+                select(func.count(TargetPage.id)).where(
+                    TargetPage.user_id == user_id,
+                    TargetPage.last_known_status == PageStatus.ACTIVE,
+                )
+            )
+            or 0
+        )
+        inactive_pages = int(
+            await session.scalar(
+                select(func.count(TargetPage.id)).where(
+                    TargetPage.user_id == user_id,
+                    TargetPage.last_known_status == PageStatus.DEACTIVATED,
+                )
+            )
+            or 0
+        )
+        receipt_total = int(
+            await session.scalar(
+                select(func.count(PaymentReceipt.id)).where(
+                    PaymentReceipt.user_id == user_id
+                )
+            )
+            or 0
+        )
+        approved_total = int(
+            await session.scalar(
+                select(func.coalesce(func.sum(PaymentReceipt.amount), 0)).where(
+                    PaymentReceipt.user_id == user_id,
+                    PaymentReceipt.status == ReceiptStatus.APPROVED,
+                )
+            )
+            or 0
+        )
+        report_categories = parse_admin_report_categories(user.admin_report_categories)
+        if user.admin_report_copy and not report_categories:
+            report_categories = set(ADMIN_REPORT_KEYS)
+
+    username = f"@{html.escape(user.username)}" if user.username else "ثبت نشده"
+    status_text = "مسدود ❌" if user.status == UserStatus.BANNED else "فعال ✅"
+    plan_name = (
+        html.escape(subscription.plan_name)
+        if subscription
+        else PLAN_NAMES[user.plan_tier]
+    )
+    expiry = subscription.expires_at if subscription else user.subscription_expiry
+    target_limit = (
+        subscription.target_limit if subscription else user.plan_tier.target_limit
+    )
+    text = (
+        "<b>پرونده کامل کاربر 👤</b>\n\n"
+        f"شناسه تلگرام: <code>{_digits(user.telegram_id)}</code>\n"
+        f"نام کاربری: <b>{username}</b>\n"
+        f"وضعیت حساب: <b>{status_text}</b>\n"
+        f"پلن فعلی: <b>{plan_name}</b>\n"
+        f"ظرفیت پیج: <code>{_digits(target_limit)}</code>\n"
+        f"پایان اعتبار:\n{format_datetime_dual(expiry)}\n\n"
+        f"پیج‌های ثبت‌شده: <code>{_digits(page_total)}</code>\n"
+        f"فعال: <code>{_digits(active_pages)}</code> | غیرفعال: <code>{_digits(inactive_pages)}</code>\n"
+        f"تعداد فیش‌ها: <code>{_digits(receipt_total)}</code>\n"
+        f"مجموع خریدهای تأییدشده: <b>{format_money(approved_total, 'TOMAN')}</b>\n"
+        f"انواع رونوشت فعال برای مدیر: <code>{_digits(len(report_categories))}</code>\n\n"
+        f"تاریخ عضویت:\n{format_datetime_dual(user.created_at)}"
+    )
+    return text, user.status == UserStatus.BANNED
+
+
+async def _send_user_details(
+    message: Message,
+    user_id: int,
+    session_factory: SessionFactory,
+) -> None:
+    text, banned = await _user_details_text(user_id, session_factory)
+    if text is None:
+        await message.answer("کاربر پیدا نشد.")
+        return
+    await message.answer(
+        text,
+        reply_markup=admin_user_detail_keyboard(user_id, banned=banned),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:user:view:"))
+async def view_user_details(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    user_id = int((callback.data or "").rsplit(":", 1)[1])
+    text, banned = await _user_details_text(user_id, session_factory)
+    if text is None:
+        await callback.answer("کاربر پیدا نشد.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_user_detail_keyboard(user_id, banned=banned),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:user:reports:"))
+async def user_report_copy_settings(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    user_id = int((callback.data or "").rsplit(":", 1)[1])
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            await callback.answer("کاربر پیدا نشد.", show_alert=True)
+            return
+        categories = parse_admin_report_categories(user.admin_report_categories)
+        if user.admin_report_copy and not categories:
+            categories = set(ADMIN_REPORT_KEYS)
+    if callback.message:
+        await callback.message.edit_text(
+            f"انتخاب رونوشت گزارش برای کاربر <code>{user_id}</code>\n\n"
+            "کاربر از فعال یا غیرفعال‌شدن این گزینه‌ها مطلع نمی‌شود.",
+            reply_markup=admin_report_copy_keyboard(user_id, categories),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:user:status:"))
+async def toggle_user_status(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    user_id = int((callback.data or "").rsplit(":", 1)[1])
+    if user_id == settings.admin_telegram_id:
+        await callback.answer("حساب مدیر اصلی قابل مسدودکردن نیست.", show_alert=True)
+        return
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        if user is None:
+            await callback.answer("کاربر پیدا نشد.", show_alert=True)
+            return
+        user.status = (
+            UserStatus.ACTIVE if user.status == UserStatus.BANNED else UserStatus.BANNED
+        )
+        banned = user.status == UserStatus.BANNED
+        await session.commit()
+    text, _ = await _user_details_text(user_id, session_factory)
+    if callback.message and text:
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_user_detail_keyboard(user_id, banned=banned),
+        )
+    await callback.answer("وضعیت کاربر تغییر کرد. ✅", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin:user:pages:"))
+async def view_user_pages(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    _, _, _, user_id_text, page_text = (callback.data or "").split(":")
+    user_id, page = int(user_id_text), max(0, int(page_text))
+    page_size = 10
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        pages = list(
+            await session.scalars(
+                select(TargetPage)
+                .where(TargetPage.user_id == user_id)
+                .order_by(TargetPage.id.desc())
+                .offset(page * page_size)
+                .limit(page_size + 1)
+            )
+        )
+    if user is None:
+        await callback.answer("کاربر پیدا نشد.", show_alert=True)
+        return
+    has_next = len(pages) > page_size
+    pages = pages[:page_size]
+    lines = [f"<b>پیج‌های کاربر <code>{user_id}</code> 📊</b>", ""]
+    if not pages:
+        lines.append("هیچ پیجی در این صفحه ثبت نشده است.")
+    for target in pages:
+        status = (
+            "فعال ✅"
+            if target.last_known_status == PageStatus.ACTIVE
+            else "غیرفعال ❌"
+            if target.last_known_status == PageStatus.DEACTIVATED
+            else "نامشخص"
+        )
+        lines.extend(
+            (
+                f"<b>@{html.escape(target.instagram_username)}</b>",
+                f"شناسه داخلی: <code>{_digits(target.id)}</code> | وضعیت: {status}",
+                f"شناسه اینستاگرام: <code>{html.escape(target.last_known_id or 'ثبت نشده')}</code>",
+                f"آخرین بررسی:\n{format_datetime_dual(target.last_checked_at)}",
+                "",
+            )
+        )
+    if callback.message:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=admin_user_section_keyboard(
+                user_id, page, has_next=has_next, section="pages"
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:user:payments:"))
+async def view_user_payments(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    _, _, _, user_id_text, page_text = (callback.data or "").split(":")
+    user_id, page = int(user_id_text), max(0, int(page_text))
+    page_size = 8
+    async with session_factory() as session:
+        user = await session.get(User, user_id)
+        subscription = await session.get(UserSubscription, user_id)
+        receipts = list(
+            await session.scalars(
+                select(PaymentReceipt)
+                .where(PaymentReceipt.user_id == user_id)
+                .order_by(PaymentReceipt.created_at.desc())
+                .offset(page * page_size)
+                .limit(page_size + 1)
+            )
+        )
+    if user is None:
+        await callback.answer("کاربر پیدا نشد.", show_alert=True)
+        return
+    has_next = len(receipts) > page_size
+    receipts = receipts[:page_size]
+    status_names = {
+        ReceiptStatus.PENDING: "در انتظار ⏳",
+        ReceiptStatus.APPROVED: "تأییدشده ✅",
+        ReceiptStatus.REJECTED: "ردشده ❌",
+    }
+    lines = [f"<b>خریدها و فیش‌های کاربر <code>{user_id}</code> 🧾</b>", ""]
+    if subscription:
+        lines.extend(
+            (
+                f"اشتراک فعلی: <b>{html.escape(subscription.plan_name)}</b>",
+                f"ظرفیت: <code>{_digits(subscription.target_limit)}</code>",
+                f"پایان اعتبار:\n{format_datetime_dual(subscription.expires_at)}",
+                "",
+            )
+        )
+    if not receipts:
+        lines.append("هیچ فیش خریدی در این صفحه ثبت نشده است.")
+    for receipt in receipts:
+        lines.extend(
+            (
+                f"فیش <code>#{_digits(receipt.id)}</code> — {status_names[receipt.status]}",
+                f"پلن: <b>{html.escape(receipt.plan_name)}</b>",
+                f"مبلغ: <b>{format_money(receipt.amount, 'TOMAN')}</b>",
+                f"تاریخ:\n{format_datetime_dual(receipt.created_at)}",
+                "",
+            )
+        )
+    if callback.message:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=admin_user_section_keyboard(
+                user_id, page, has_next=has_next, section="payments"
+            ),
+        )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "admin:add_target")
@@ -1248,9 +1838,7 @@ async def instagram_connection_health(
     )
     rendered = await profile_preview.inspect("instagram", use_cache=False)
     cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
-    proxy_failure_streak = int(
-        await redis.get(checker.PROXY_FAILURE_STREAK_KEY) or 0
-    )
+    proxy_failure_streak = int(await redis.get(checker.PROXY_FAILURE_STREAK_KEY) or 0)
 
     outcome_names = {
         CheckOutcome.ACTIVE: "پاسخ معتبر دریافت شد ✅",
@@ -1316,9 +1904,7 @@ async def _show_diagnostics(
     checker: InstagramChecker,
 ) -> None:
     entries = await checker.diagnostics.latest(500)
-    error_count = sum(
-        entry.level in {"ERROR", "CRITICAL"} for entry in entries
-    )
+    error_count = sum(entry.level in {"ERROR", "CRITICAL"} for entry in entries)
     warning_count = sum(entry.level == "WARNING" for entry in entries)
     lines = [
         "لاگ کامل و عیب‌یابی 🧰",
@@ -1386,9 +1972,7 @@ async def download_diagnostics(
         "توضیح امنیتی: اطلاعات محرمانه محیط در این خروجی ثبت نشده‌اند.",
     ]
     for index, entry in enumerate(entries, start=1):
-        sections.append(
-            f"رکورد {index}\n{_diagnostic_text(entry, compact=False)}"
-        )
+        sections.append(f"رکورد {index}\n{_diagnostic_text(entry, compact=False)}")
     content = ("\n\n" + "=" * 72 + "\n\n").join(sections)
     document = BufferedInputFile(
         content.encode("utf-8-sig"),
@@ -1414,8 +1998,7 @@ async def confirm_clear_diagnostics(
         return
     if callback.message:
         await callback.message.edit_text(
-            "همه ۵۰۰ رکورد اخیر عیب‌یابی پاک شوند؟\n\n"
-            "این عملیات قابل بازگشت نیست.",
+            "همه ۵۰۰ رکورد اخیر عیب‌یابی پاک شوند؟\n\nاین عملیات قابل بازگشت نیست.",
             reply_markup=admin_diagnostics_keyboard(confirm_clear=True),
         )
     await callback.answer()

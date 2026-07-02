@@ -3,6 +3,7 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
+from bot.money import format_money
 from bot.models import (
     DiscountCode,
     NotificationSettings,
@@ -11,7 +12,9 @@ from bot.models import (
     PageStatus,
     TargetPage,
     StoreProduct,
+    User,
 )
+from bot.reporting import ADMIN_REPORT_OPTIONS
 
 
 def _enabled_icon(enabled: bool) -> str:
@@ -237,6 +240,12 @@ def notification_settings_keyboard(
             ],
             [
                 InlineKeyboardButton(
+                    text=f"{_enabled_icon(settings.notify_verification_change)} اعلان دریافت/حذف تیک آبی",
+                    callback_data=f"toggle:{page_id}:verification",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text=f"{_enabled_icon(settings.notify_follower_change)} گزارش تغییر فالوور",
                     callback_data=f"toggle:{page_id}:follower",
                 )
@@ -400,7 +409,10 @@ def store_products_keyboard(products: list[StoreProduct]) -> InlineKeyboardMarku
     builder = InlineKeyboardBuilder()
     for product in products:
         builder.button(
-            text=f"🛍 {product.name}",
+            text=(
+                f"🛍 {product.name} — "
+                f"{format_money(product.price, product.price_currency)}"
+            ),
             callback_data=f"store:view:{product.id}",
         )
     builder.adjust(1)
@@ -468,7 +480,10 @@ def admin_store_keyboard(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"🗑 حذف {product.name}",
+                    text=(
+                        f"🗑 {product.name} — "
+                        f"{format_money(product.price, product.price_currency)}"
+                    ),
                     callback_data=f"admin:store:delete:{product.id}",
                 )
             ]
@@ -481,6 +496,169 @@ def admin_store_keyboard(
                 )
             ],
             [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def currency_selection_keyboard(callback_prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🇮🇷 تومان",
+                    callback_data=f"{callback_prefix}:TOMAN",
+                ),
+                InlineKeyboardButton(
+                    text="🇺🇸 دلار",
+                    callback_data=f"{callback_prefix}:USD",
+                ),
+            ],
+            [InlineKeyboardButton(text="لغو ↩️", callback_data="admin:cancel")],
+        ]
+    )
+
+
+def admin_report_copy_keyboard(
+    user_id: int,
+    selected: set[str],
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"{_enabled_icon(key in selected)} {label}",
+                callback_data=f"admin:reportcopy:{user_id}:{key}",
+            )
+        ]
+        for key, label in ADMIN_REPORT_OPTIONS
+    ]
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="❌ غیرفعال‌کردن همه رونوشت‌ها",
+                    callback_data=f"admin:reportcopy:{user_id}:NONE",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 اطلاعات کاربر",
+                    callback_data=f"admin:user:view:{user_id}",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_users_keyboard(
+    users: list[User],
+    page: int,
+    total_pages: int,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for user in users:
+        username = f"@{user.username}" if user.username else "بدون نام کاربری"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"👤 {username} — {_persian_number(user.telegram_id)}",
+                    callback_data=f"admin:user:view:{user.telegram_id}",
+                )
+            ]
+        )
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="صفحه قبل ⬅️",
+                callback_data=f"admin:users:{page - 1}",
+            )
+        )
+    if page + 1 < total_pages:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️ صفحه بعد",
+                callback_data=f"admin:users:{page + 1}",
+            )
+        )
+    if navigation:
+        rows.append(navigation)
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text="🔎 جست‌وجو با شناسه عددی",
+                    callback_data="admin:user:search",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_user_detail_keyboard(user_id: int, *, banned: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 پیج‌های ثبت‌شده",
+                    callback_data=f"admin:user:pages:{user_id}:0",
+                ),
+                InlineKeyboardButton(
+                    text="🧾 خریدها و فیش‌ها",
+                    callback_data=f"admin:user:payments:{user_id}:0",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📨 انتخاب رونوشت گزارش‌ها",
+                    callback_data=f"admin:user:reports:{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ رفع مسدودی" if banned else "⛔ مسدودکردن کاربر",
+                    callback_data=f"admin:user:status:{user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ فهرست کاربران",
+                    callback_data="admin:users:0",
+                )
+            ],
+        ]
+    )
+
+
+def admin_user_section_keyboard(
+    user_id: int, page: int, *, has_next: bool, section: str
+) -> InlineKeyboardMarkup:
+    navigation: list[InlineKeyboardButton] = []
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="صفحه قبل ⬅️",
+                callback_data=f"admin:user:{section}:{user_id}:{page - 1}",
+            )
+        )
+    if has_next:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️ صفحه بعد",
+                callback_data=f"admin:user:{section}:{user_id}:{page + 1}",
+            )
+        )
+    rows = [navigation] if navigation else []
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="↩️ اطلاعات کاربر",
+                callback_data=f"admin:user:view:{user_id}",
+            )
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -629,6 +807,18 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🛍 مدیریت فروشگاه",
                     callback_data="admin:store",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📨 رونوشت گزارش کاربران",
+                    callback_data="admin:report_copy",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👥 مدیریت کاربران",
+                    callback_data="admin:users:0",
                 )
             ],
             [InlineKeyboardButton(text="آمار سیستم 📈", callback_data="admin:stats")],

@@ -69,6 +69,7 @@ from bot.models import (
     UserSubscription,
     UserStatus,
 )
+from bot.money import format_money
 from bot.profile_preview import EmbedProfile, PreviewOutcome, ProfilePreviewService
 from bot.report_cards import AlertCardData, ReportCardRenderer
 from bot.time_utils import format_datetime_dual, format_datetime_dual_plain
@@ -1536,6 +1537,7 @@ async def toggle_notification(
         "deactivation": "notify_deactivation",
         "username": "notify_username_change",
         "follower": "notify_follower_change",
+        "verification": "notify_verification_change",
     }
     attribute = field_map.get(field)
     if attribute is None:
@@ -2120,7 +2122,7 @@ async def store_product_details(
     text = (
         f"<b>{html.escape(product.name)}</b> 🛍️\n\n"
         f"{html.escape(product.description)}\n\n"
-        f"قیمت: <b>{format_count(product.price)} تومان</b>"
+        f"قیمت: <b>{format_money(product.price, product.price_currency)}</b>"
     )
     if callback.message:
         await callback.message.edit_text(

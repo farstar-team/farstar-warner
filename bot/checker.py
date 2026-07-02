@@ -17,7 +17,7 @@ from urllib.parse import quote, urlsplit
 import httpx
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
 from redis.exceptions import LockError, RedisError
@@ -38,6 +38,7 @@ from bot.models import (
     UserStatus,
 )
 from bot.report_cards import AlertCardData, ProfileCardData, ReportCardRenderer
+from bot.reporting import ADMIN_REPORT_KEYS, parse_admin_report_categories
 
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ class NotificationPayload:
     secondary_label: str | None = None
     secondary_value: str | None = None
     accent: str = "gold"
+    reply_markup: InlineKeyboardMarkup | None = None
 
 
 class InstagramChecker:
@@ -117,6 +119,7 @@ class InstagramChecker:
     HEALTH_LOCK_KEY = "farstar:checker:health-monitor-lock"
     HEALTH_STATE_KEY = "farstar:checker:health-state"
     HEALTH_ALERT_KEY = "farstar:checker:health-alert"
+    REFERENCE_ALERT_KEY = "farstar:checker:reference-alert"
     LOCK_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 8_000_000
     CURL_EXECUTABLE = "curl"
@@ -150,6 +153,14 @@ class InstagramChecker:
             headers=INSTAGRAM_BROWSER_HEADERS,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
+        self._direct_http = httpx.AsyncClient(
+            http2=True,
+            follow_redirects=False,
+            trust_env=False,
+            timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
+            headers=INSTAGRAM_BROWSER_HEADERS,
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+        )
 
     def set_browser_probe(self, probe: object) -> None:
         """Retain startup compatibility; monitoring uses the curl transport only."""
@@ -157,6 +168,7 @@ class InstagramChecker:
 
     async def close(self) -> None:
         await self._http.aclose()
+        await self._direct_http.aclose()
 
     async def fetch_profile(
         self,
@@ -348,6 +360,36 @@ class InstagramChecker:
                 return http_response
             last_response = http_response
 
+            if self.settings.instagram_proxy_url:
+                direct_http_response = await self._execute_http2_once(
+                    username,
+                    use_proxy=False,
+                )
+                await self._record_transport_attempt(
+                    trace_id, username, attempt, direct_http_response
+                )
+                if self._response_is_authoritative(direct_http_response, username):
+                    await self._record_authoritative(
+                        trace_id, username, direct_http_response
+                    )
+                    return direct_http_response
+                last_response = direct_http_response
+
+                direct_curl_response = await self._execute_curl_once(
+                    username,
+                    force_http2=False,
+                    use_proxy=False,
+                )
+                await self._record_transport_attempt(
+                    trace_id, username, attempt, direct_curl_response
+                )
+                if self._response_is_authoritative(direct_curl_response, username):
+                    await self._record_authoritative(
+                        trace_id, username, direct_curl_response
+                    )
+                    return direct_curl_response
+                last_response = direct_curl_response
+
             curl_http2_response = await self._execute_curl_once(
                 username,
                 force_http2=True,
@@ -405,7 +447,12 @@ class InstagramChecker:
         )
         return final_response
 
-    async def _execute_http2_once(self, username: str) -> CurlResponse:
+    async def _execute_http2_once(
+        self,
+        username: str,
+        *,
+        use_proxy: bool = True,
+    ) -> CurlResponse:
         safe_username = quote(username.strip(), safe="")
         url = (
             f"{self.settings.instagram_base_url}"
@@ -413,14 +460,15 @@ class InstagramChecker:
         )
         started_at = time.perf_counter()
         try:
-            response = await self._http.get(url)
+            client = self._http if use_proxy else self._direct_http
+            response = await client.get(url)
         except httpx.HTTPError as exc:
             return CurlResponse(
                 None,
                 b"",
                 str(exc),
                 1,
-                "httpx-http2",
+                "httpx-http2-proxy" if use_proxy else "httpx-http2-direct",
                 int((time.perf_counter() - started_at) * 1000),
             )
         if len(response.content) > self.MAX_RESPONSE_BYTES:
@@ -429,7 +477,7 @@ class InstagramChecker:
                 b"",
                 "response exceeded safety limit",
                 63,
-                f"httpx-{response.http_version}",
+                f"httpx-{response.http_version}-{'proxy' if use_proxy else 'direct'}",
                 int((time.perf_counter() - started_at) * 1000),
             )
         return CurlResponse(
@@ -437,7 +485,7 @@ class InstagramChecker:
             response.content,
             f"httpx {response.http_version}",
             0,
-            f"httpx-{response.http_version}",
+            f"httpx-{response.http_version}-{'proxy' if use_proxy else 'direct'}",
             int((time.perf_counter() - started_at) * 1000),
         )
 
@@ -472,6 +520,7 @@ class InstagramChecker:
         username: str,
         *,
         force_http2: bool,
+        use_proxy: bool = True,
     ) -> CurlResponse:
         safe_username = quote(username.strip(), safe="")
         url = (
@@ -492,13 +541,17 @@ class InstagramChecker:
             status_marker,
             url,
         )
-        if self.settings.instagram_proxy_url:
+        if use_proxy and self.settings.instagram_proxy_url:
             proxy_url = self.settings.instagram_proxy_url
             if proxy_url.startswith("socks5://"):
                 proxy_url = proxy_url.replace("socks5://", "socks5h://", 1)
             command = (*command[:-1], "--proxy", proxy_url, command[-1])
         if not force_http2:
             command = tuple(part for part in command if part != "--http2")
+        transport = "curl-http2" if force_http2 else "curl"
+        transport += (
+            "-proxy" if use_proxy and self.settings.instagram_proxy_url else "-direct"
+        )
         started_at = time.perf_counter()
         try:
             process = await asyncio.create_subprocess_exec(
@@ -512,7 +565,7 @@ class InstagramChecker:
                 b"",
                 str(exc),
                 127,
-                "curl",
+                transport,
                 int((time.perf_counter() - started_at) * 1000),
             )
 
@@ -530,7 +583,7 @@ class InstagramChecker:
                 b"",
                 "curl execution timed out",
                 28,
-                "curl-http2" if force_http2 else "curl",
+                transport,
                 int((time.perf_counter() - started_at) * 1000),
             )
 
@@ -541,7 +594,7 @@ class InstagramChecker:
                 b"",
                 error,
                 process.returncode or 1,
-                "curl-http2" if force_http2 else "curl",
+                transport,
                 int((time.perf_counter() - started_at) * 1000),
             )
         if len(stdout) > self.MAX_RESPONSE_BYTES:
@@ -550,7 +603,7 @@ class InstagramChecker:
                 b"",
                 "response exceeded safety limit",
                 63,
-                "curl-http2" if force_http2 else "curl",
+                transport,
                 int((time.perf_counter() - started_at) * 1000),
             )
 
@@ -563,7 +616,7 @@ class InstagramChecker:
                 b"",
                 "curl did not return an HTTP status",
                 1,
-                "curl-http2" if force_http2 else "curl",
+                transport,
                 int((time.perf_counter() - started_at) * 1000),
             )
         return CurlResponse(
@@ -571,7 +624,7 @@ class InstagramChecker:
             body,
             error,
             process.returncode or 0,
-            "curl-http2" if force_http2 else "curl",
+            transport,
             int((time.perf_counter() - started_at) * 1000),
         )
 
@@ -861,7 +914,7 @@ class InstagramChecker:
             level="ERROR",
             event="proxy_preflight_failed",
             message=(
-                "چرخه پایش متوقف شد؛ مسیر WARP یا دسترسی اینستاگرام پاسخ سالم نداد."
+                "مسیر WARP پاسخ سالم نداد؛ تصمیم ادامه پایش با تست مرجع اینستاگرام انجام می‌شود."
             ),
             http_status=http_status,
             elapsed_ms=elapsed_ms,
@@ -884,6 +937,54 @@ class InstagramChecker:
                 )
         return False
 
+    async def reference_profile_preflight(self) -> bool:
+        result = await self.fetch_profile(
+            "instagram",
+            allow_stale=False,
+            force_refresh=True,
+        )
+        if result.outcome == CheckOutcome.ACTIVE and result.profile_id:
+            await self.redis.delete(self.REFERENCE_ALERT_KEY)
+            await self.diagnostics.add(
+                level="INFO",
+                event="reference_profile_succeeded",
+                message=(
+                    "پیج مرجع @instagram با پاسخ زنده و معتبر دیده شد؛ "
+                    "چرخه پایش مجاز به بررسی هدف‌ها است."
+                ),
+                username="instagram",
+                http_status=result.http_status,
+                detail=f"profile_id={result.profile_id}; from_cache={result.from_cache}",
+            )
+            return True
+
+        await self.diagnostics.add(
+            level="ERROR",
+            event="reference_profile_failed",
+            message=(
+                "پیج مرجع @instagram پاسخ زنده معتبر نداد؛ برای جلوگیری از هشدار اشتباه "
+                "وضعیت هیچ پیجی تغییر نمی‌کند."
+            ),
+            username="instagram",
+            http_status=result.http_status,
+            detail=f"outcome={result.outcome.value}; from_cache={result.from_cache}",
+        )
+        should_alert = await self.redis.set(
+            self.REFERENCE_ALERT_KEY,
+            "1",
+            ex=900,
+            nx=True,
+        )
+        if should_alert:
+            await self._notify(
+                self.settings.admin_telegram_id,
+                "تست مرجع اینستاگرام ناموفق بود. ⚠️\n\n"
+                "ربات نتوانست پیج ثابت <b>@instagram</b> را با پاسخ زنده ببیند؛ "
+                "بنابراین این چرخه بدون تغییر وضعیت پیج‌های کاربران متوقف شد. "
+                "جزئیات در بخش لاگ کامل ثبت شده است.",
+            )
+        return False
+
     async def health_monitor(self) -> None:
         lock = self.redis.lock(
             self.HEALTH_LOCK_KEY,
@@ -894,12 +995,14 @@ class InstagramChecker:
             return
         try:
             failure_reason: str | None = None
-            if not await self.proxy_preflight():
+            proxy_ok = await self.proxy_preflight()
+            reference_ok = await self.reference_profile_preflight()
+            if not reference_ok:
                 latest = await self.diagnostics.latest(1)
                 failure_reason = (
                     latest[0].detail
                     if latest and latest[0].detail
-                    else "مسیر WARP یا endpoint اینستاگرام پاسخ سالم نداد."
+                    else "پیج مرجع @instagram پاسخ زنده معتبر نداد."
                 )
             else:
                 result = await self.fetch_profile(
@@ -940,14 +1043,17 @@ class InstagramChecker:
                 await self.diagnostics.add(
                     level="INFO",
                     event="health_monitor_succeeded",
-                    message=("تست پنج‌دقیقه‌ای API، WARP و موتور گزارش تصویری موفق بود."),
+                    message=(
+                        "تست پنج‌دقیقه‌ای API مرجع و موتور گزارش تصویری موفق بود؛ "
+                        f"وضعیت WARP={'سالم' if proxy_ok else 'در حالت failover مستقیم'}."
+                    ),
                 )
                 if previous_state == "failed":
                     await self._notify(
                         self.settings.admin_telegram_id,
                         "سیستم پایش دوباره سالم شد. ✅\n\n"
-                        "دسترسی اینستاگرام، مسیر WARP و تولید گزارش تصویری "
-                        "با موفقیت آزمایش شدند.",
+                        "پیج مرجع اینستاگرام و تولید گزارش تصویری با موفقیت "
+                        "آزمایش شدند؛ مسیر اتصال نیز آماده پایش است.",
                     )
                 return
 
@@ -1021,8 +1127,18 @@ class InstagramChecker:
         renewal_task = asyncio.create_task(self._renew_lock(lock))
         try:
             self._rate_limited.clear()
-            if not await self.proxy_preflight():
+            proxy_ok = await self.proxy_preflight()
+            if not await self.reference_profile_preflight():
                 return
+            if not proxy_ok:
+                await self.diagnostics.add(
+                    level="WARNING",
+                    event="checker_direct_fallback_enabled",
+                    message=(
+                        "WARP سالم نبود اما پیج مرجع از مسیر جایگزین دیده شد؛ "
+                        "چرخه با failover مستقیم ادامه می‌یابد."
+                    ),
+                )
             target_ids = await self._eligible_target_ids()
             await self.diagnostics.add(
                 level="INFO",
@@ -1036,9 +1152,10 @@ class InstagramChecker:
             for target_id in target_ids:
                 queue.put_nowait(target_id)
 
-            # A single scheduler worker prevents queued background requests from
-            # starving interactive profile requests.
-            worker_count = 1
+            worker_count = min(
+                self.settings.check_concurrency,
+                len(target_ids),
+            )
             for _ in range(worker_count):
                 queue.put_nowait(None)
             workers = [
@@ -1169,6 +1286,7 @@ class InstagramChecker:
             if snapshot is None:
                 return
             username = snapshot.instagram_username
+            known_status = snapshot.last_known_status
 
         # Background state transitions must only use a live Instagram response.
         # Stale metadata is reserved for user-facing profile previews.
@@ -1201,44 +1319,61 @@ class InstagramChecker:
             return
 
         streak_key = f"{self.DEACTIVATION_STREAK_PREFIX}{target_id}"
-        if result.outcome == CheckOutcome.DEACTIVATED:
-            streak = await self.redis.incr(streak_key)
-            if streak == 1:
-                await self.redis.expire(streak_key, 86400)
-            if streak < self.settings.deactivation_confirmations:
-                logger.info(
-                    "Waiting for deactivation confirmation %s/%s for target %s",
-                    streak,
-                    self.settings.deactivation_confirmations,
-                    target_id,
+        await self.redis.delete(streak_key)
+        if (
+            result.outcome == CheckOutcome.DEACTIVATED
+            and known_status != PageStatus.DEACTIVATED
+        ):
+            confirmations = 1
+            while confirmations < self.settings.deactivation_confirmations:
+                await asyncio.sleep(random.uniform(2.0, 5.0))
+                confirmation = await self.fetch_profile(
+                    username,
+                    allow_stale=False,
+                    force_refresh=True,
                 )
-                await self.diagnostics.add(
-                    level="INFO",
-                    event="deactivation_confirmation_pending",
-                    message=(
-                        "پاسخ غیرفعال ثبت شد اما برای جلوگیری از هشدار اشتباه "
-                        "منتظر تأیید بعدی است."
-                    ),
-                    username=username,
-                    http_status=result.http_status,
-                    detail=(
-                        f"target_id={target_id}; confirmation={streak}/"
-                        f"{self.settings.deactivation_confirmations}"
-                    ),
-                )
-                return
-            await self.redis.delete(streak_key)
-        else:
-            await self.redis.delete(streak_key)
+                if confirmation.outcome != CheckOutcome.DEACTIVATED:
+                    await self.diagnostics.add(
+                        level="WARNING",
+                        event="deactivation_confirmation_rejected",
+                        message=(
+                            "پاسخ غیرفعال در تأیید فوری تکرار نشد؛ وضعیت ذخیره‌شده "
+                            "بدون تغییر باقی ماند."
+                        ),
+                        username=username,
+                        http_status=confirmation.http_status,
+                        detail=(
+                            f"target_id={target_id}; first=deactivated; "
+                            f"confirmation={confirmation.outcome.value}"
+                        ),
+                    )
+                    return
+                confirmations += 1
+            await self.diagnostics.add(
+                level="INFO",
+                event="deactivation_confirmed_immediately",
+                message=("غیرفعال‌شدن پیج با چند پاسخ قطعی در همان چرخه تأیید شد."),
+                username=username,
+                http_status=result.http_status,
+                detail=(f"target_id={target_id}; confirmations={confirmations}"),
+            )
 
         notifications: list[NotificationPayload] = []
         recipient_id: int | None = None
+        admin_report_categories: set[str] = set()
         async with self.session_factory() as session:
             target = await session.scalar(
                 select(TargetPage).where(TargetPage.id == target_id).with_for_update()
             )
             if target is None:
                 return
+            owner = await session.get(User, target.user_id)
+            if owner is not None:
+                admin_report_categories = parse_admin_report_categories(
+                    owner.admin_report_categories
+                )
+                if owner.admin_report_copy and not admin_report_categories:
+                    admin_report_categories = set(ADMIN_REPORT_KEYS)
 
             notification_settings = await session.get(
                 NotificationSettings,
@@ -1313,6 +1448,48 @@ class InstagramChecker:
                     session.add(snapshot)
                 else:
                     escaped_page = html.escape(target.instagram_username)
+                    if snapshot.is_verified != result.is_verified:
+                        verification_event = (
+                            "verification_added"
+                            if result.is_verified
+                            else "verification_removed"
+                        )
+                        verification_text = (
+                            "تیک آبی پیج دریافت شد."
+                            if result.is_verified
+                            else "تیک آبی پیج حذف شد."
+                        )
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type=verification_event,
+                                description=verification_text,
+                            )
+                        )
+                        if notification_settings.notify_verification_change:
+                            notifications.append(
+                                NotificationPayload(
+                                    message=(
+                                        f"{verification_text} {'✅' if result.is_verified else '⚠️'}\n\n"
+                                        f"پیج: <b>@{escaped_page}</b>"
+                                    ),
+                                    username=target.instagram_username,
+                                    title=(
+                                        "پیج تیک آبی گرفت"
+                                        if result.is_verified
+                                        else "تیک آبی پیج حذف شد"
+                                    ),
+                                    category="VERIFICATION",
+                                    primary_label="وضعیت تأیید",
+                                    primary_value=(
+                                        "دارای تیک آبی"
+                                        if result.is_verified
+                                        else "بدون تیک آبی"
+                                    ),
+                                    accent="blue" if result.is_verified else "red",
+                                )
+                            )
                     if (
                         picture_key
                         and snapshot.profile_picture_key
@@ -1334,7 +1511,7 @@ class InstagramChecker:
                                 ),
                                 username=target.instagram_username,
                                 title="عکس پروفایل تغییر کرد",
-                                category="IDENTITY",
+                                category="PROFILE",
                                 primary_label="رویداد",
                                 primary_value="تصویر جدید شناسایی شد",
                                 accent="blue",
@@ -1398,7 +1575,7 @@ class InstagramChecker:
                                 ),
                                 username=target.instagram_username,
                                 title="نام اصلی پیج عوض شد",
-                                category="IDENTITY",
+                                category="PROFILE",
                                 primary_label="نام جدید",
                                 primary_value=result.full_name,
                                 secondary_label="نام قبلی",
@@ -1427,7 +1604,7 @@ class InstagramChecker:
                                 ),
                                 username=target.instagram_username,
                                 title="بیوگرافی پیج تغییر کرد",
-                                category="IDENTITY",
+                                category="PROFILE",
                                 primary_label="وضعیت",
                                 primary_value="متن جدید ثبت شد",
                                 accent="blue",
@@ -1653,13 +1830,33 @@ class InstagramChecker:
             username=username,
             http_status=result.http_status,
             detail=(
-                f"target_id={target_id}; owner_id={recipient_id}; admin_copy=false"
+                f"target_id={target_id}; owner_id={recipient_id}; "
+                f"admin_categories={','.join(sorted(admin_report_categories)) or 'none'}"
             ),
         )
 
         if recipient_id is not None:
             for notification in notifications:
                 await self._notify(recipient_id, notification)
+            if (
+                admin_report_categories
+                and recipient_id != self.settings.admin_telegram_id
+            ):
+                for notification in notifications:
+                    if notification.category not in admin_report_categories:
+                        continue
+                    await self._notify(
+                        self.settings.admin_telegram_id,
+                        replace(
+                            notification,
+                            message=(
+                                "رونوشت گزارش کاربر "
+                                f"<code>{recipient_id}</code> 📨\n\n"
+                                f"{notification.message}"
+                            ),
+                            reply_markup=None,
+                        ),
+                    )
 
     async def _notify(
         self,
@@ -1697,6 +1894,7 @@ class InstagramChecker:
                 telegram_id,
                 BufferedInputFile(card, filename="farstar-security-report.jpg"),
                 caption=payload.message,
+                reply_markup=payload.reply_markup,
             )
             return
         except TelegramAPIError as exc:
@@ -1708,7 +1906,11 @@ class InstagramChecker:
         except Exception as exc:
             logger.warning("Could not render notification card: %s", exc)
         try:
-            await self.bot.send_message(telegram_id, payload.message)
+            await self.bot.send_message(
+                telegram_id,
+                payload.message,
+                reply_markup=payload.reply_markup,
+            )
         except TelegramAPIError as exc:
             logger.warning(
                 "Telegram notification failed for user %s: %s",

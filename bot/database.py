@@ -40,6 +40,10 @@ async def initialize_database(engine: AsyncEngine) -> None:
         await connection.run_sync(Base.metadata.create_all)
         if connection.dialect.name == "postgresql":
             migrations = (
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "admin_report_copy BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                "admin_report_categories VARCHAR(200) NOT NULL DEFAULT ''",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
                 "notify_follower_change BOOLEAN NOT NULL DEFAULT TRUE",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
@@ -50,6 +54,10 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 "follower_report_baseline BIGINT NULL",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
                 "last_follower_report_at TIMESTAMPTZ NULL",
+                "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
+                "notify_verification_change BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE store_products ADD COLUMN IF NOT EXISTS "
+                "price_currency VARCHAR(8) NOT NULL DEFAULT 'TOMAN'",
             )
             for statement in migrations:
                 await connection.execute(text(statement))
@@ -83,10 +91,47 @@ async def initialize_database(engine: AsyncEngine) -> None:
                     "ALTER TABLE notification_settings ADD COLUMN "
                     "last_follower_report_at DATETIME NULL"
                 ),
+                "notify_verification_change": (
+                    "ALTER TABLE notification_settings ADD COLUMN "
+                    "notify_verification_change BOOLEAN NOT NULL DEFAULT 1"
+                ),
             }
             for column, statement in sqlite_migrations.items():
                 if column not in existing_columns:
                     await connection.execute(text(statement))
+            user_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(text("PRAGMA table_info(users)"))
+                ).all()
+            }
+            if "admin_report_copy" not in user_columns:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN admin_report_copy "
+                        "BOOLEAN NOT NULL DEFAULT 0"
+                    )
+                )
+            if "admin_report_categories" not in user_columns:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN admin_report_categories "
+                        "VARCHAR(200) NOT NULL DEFAULT ''"
+                    )
+                )
+            store_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(text("PRAGMA table_info(store_products)"))
+                ).all()
+            }
+            if "price_currency" not in store_columns:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE store_products ADD COLUMN price_currency "
+                        "VARCHAR(8) NOT NULL DEFAULT 'TOMAN'"
+                    )
+                )
 
 
 @asynccontextmanager
