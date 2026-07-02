@@ -38,7 +38,11 @@ class Settings(BaseSettings):
     check_jitter_min_seconds: float = Field(default=0.5, ge=0, le=30)
     check_jitter_max_seconds: float = Field(default=3.0, ge=0, le=60)
     instagram_base_url: str = "https://www.instagram.com"
+    instagram_proxy_url: str | None = None
     instagram_request_timeout_seconds: float = Field(default=20.0, ge=5, le=60)
+    proxy_health_url: str = "https://www.cloudflare.com/cdn-cgi/trace"
+    page_check_delay_min_seconds: float = Field(default=15.0, ge=1, le=60)
+    page_check_delay_max_seconds: float = Field(default=45.0, ge=1, le=120)
     rate_limit_cooldown_seconds: int = Field(default=900, ge=60, le=86400)
     chromium_executable: str = "/usr/bin/chromium"
     profile_preview_timeout_seconds: int = Field(default=45, ge=10, le=60)
@@ -66,6 +70,24 @@ class Settings(BaseSettings):
             raise ValueError("instagram_base_url must use HTTPS")
         return value
 
+    @field_validator("instagram_proxy_url")
+    @classmethod
+    def validate_proxy_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().rstrip("/")
+        if not normalized.startswith(("socks5://", "http://", "https://")):
+            raise ValueError("instagram_proxy_url must use socks5, HTTP, or HTTPS")
+        return normalized
+
+    @field_validator("proxy_health_url")
+    @classmethod
+    def validate_proxy_health_url(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("https://"):
+            raise ValueError("proxy_health_url must use HTTPS")
+        return normalized
+
     @field_validator("log_level")
     @classmethod
     def normalize_log_level(cls, value: str) -> str:
@@ -79,6 +101,11 @@ class Settings(BaseSettings):
         if self.check_jitter_min_seconds > self.check_jitter_max_seconds:
             raise ValueError(
                 "check_jitter_min_seconds cannot exceed check_jitter_max_seconds"
+            )
+        if self.page_check_delay_min_seconds > self.page_check_delay_max_seconds:
+            raise ValueError(
+                "page_check_delay_min_seconds cannot exceed "
+                "page_check_delay_max_seconds"
             )
         return self
 

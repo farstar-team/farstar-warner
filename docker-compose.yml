@@ -38,6 +38,40 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  warp_proxy:
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: "2"
+      GOST_ARGS: "-L :1080 -F=127.0.0.1:40000"
+    expose:
+      - "1080"
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+    cap_add:
+      - NET_ADMIN
+      - MKNOD
+      - AUDIT_WRITE
+    device_cgroup_rules:
+      - "c 10:200 rwm"
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS --max-time 15 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -Eq 'warp=(on|plus)'",
+        ]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 45s
+    networks:
+      - outbound
+    security_opt:
+      - no-new-privileges:true
+
   bot-app:
     image: farstar-warner:latest
     init: true
@@ -52,6 +86,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      warp_proxy:
+        condition: service_healthy
+    environment:
+      INSTAGRAM_PROXY_URL: ${INSTAGRAM_PROXY_URL:-socks5://warp_proxy:1080}
     networks:
       - backend
       - outbound
@@ -68,6 +106,7 @@ services:
 volumes:
   postgres-data:
   redis-data:
+  warp-data:
 
 networks:
   backend:

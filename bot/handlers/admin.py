@@ -1239,6 +1239,7 @@ async def instagram_connection_health(
     if await _reject_callback(callback, settings):
         return
     await callback.answer("در حال آزمایش مسیر عمومی اینستاگرام…")
+    warp_ok = await checker.proxy_preflight()
     browser_ok, browser_version = await profile_preview.browser_health()
     result = await checker.fetch_profile(
         "instagram",
@@ -1247,6 +1248,9 @@ async def instagram_connection_health(
     )
     rendered = await profile_preview.inspect("instagram", use_cache=False)
     cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
+    proxy_failure_streak = int(
+        await redis.get(checker.PROXY_FAILURE_STREAK_KEY) or 0
+    )
 
     outcome_names = {
         CheckOutcome.ACTIVE: "پاسخ معتبر دریافت شد ✅",
@@ -1264,6 +1268,8 @@ async def instagram_connection_health(
         if cooldown_ttl > 0
         else "غیرفعال ✅"
     )
+    warp_text = "سالم و تأییدشده ✅" if warp_ok else "ناسالم یا مسدود ❌"
+    proxy_text = "فعال ✅" if settings.instagram_proxy_url else "غیرفعال ⚠️"
     http_text = _digits(result.http_status) if result.http_status else "ثبت نشد"
     render_names = {
         PreviewOutcome.ACTIVE: "جزئیات پیج رندر شد ✅",
@@ -1290,6 +1296,9 @@ async def instagram_connection_health(
         "حالت دسترسی: <b>نمای عمومی بدون ورود</b>\n"
         "وضعیت ورود: <b>وارد نشده</b>\n"
         "ذخیره رمز یا کوکی: <b>غیرفعال</b>\n"
+        f"پراکسی WARP: <b>{proxy_text}</b>\n"
+        f"سلامت مسیر WARP: <b>{warp_text}</b>\n"
+        f"شکست‌های متوالی مسیر: <b>{_digits(proxy_failure_streak)}</b>\n"
         f"Chromium: <b>{browser_text}</b>\n"
         f"نتیجه تست: <b>{outcome_names[result.outcome]}</b>\n"
         f"کد HTTP: <code>{http_text}</code>\n"

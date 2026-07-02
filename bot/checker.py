@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import logging
+import random
 import secrets
 import time
 from contextlib import suppress
@@ -54,6 +55,7 @@ INSTAGRAM_BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.instagram.com/",
 }
+PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 
 
 class CheckOutcome(str, Enum):
@@ -95,6 +97,8 @@ class InstagramChecker:
     LOCK_KEY = "farstar:checker:lock"
     STATUS_COOLDOWN_KEY = "farstar:checker:status-cooldown"
     DEACTIVATION_STREAK_PREFIX = "farstar:checker:deactivation-streak:"
+    PROXY_FAILURE_STREAK_KEY = "farstar:checker:proxy-failure-streak"
+    PROXY_ALERT_KEY = "farstar:checker:proxy-alert-sent"
     LOCK_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 8_000_000
     CURL_EXECUTABLE = "curl"
@@ -122,6 +126,8 @@ class InstagramChecker:
         self._http = httpx.AsyncClient(
             http2=True,
             follow_redirects=False,
+            proxy=settings.instagram_proxy_url,
+            trust_env=False,
             timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
             headers=INSTAGRAM_BROWSER_HEADERS,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
@@ -225,7 +231,8 @@ class InstagramChecker:
         status_code = response.status_code
         if status_code == 404 or self._body_indicates_deactivated(response.body):
             return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
-        if status_code == 429:
+        if status_code in {403, 429}:
+            self._rate_limited.set()
             await self._record_final_failure(username, response)
             return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
         if status_code != 200:
@@ -356,7 +363,8 @@ class InstagramChecker:
             last_response = curl_response
 
             if attempt < self.CURL_ATTEMPTS:
-                await asyncio.sleep(0.45 * attempt)
+                ceiling = min(45.0, 15.0 * (2**attempt))
+                await asyncio.sleep(random.uniform(15.0, ceiling))
 
         final_response = last_response or CurlResponse(
             None,
@@ -468,6 +476,11 @@ class InstagramChecker:
             status_marker,
             url,
         )
+        if self.settings.instagram_proxy_url:
+            proxy_url = self.settings.instagram_proxy_url
+            if proxy_url.startswith("socks5://"):
+                proxy_url = proxy_url.replace("socks5://", "socks5h://", 1)
+            command = (*command[:-1], "--proxy", proxy_url, command[-1])
         if not force_http2:
             command = tuple(part for part in command if part != "--http2")
         started_at = time.perf_counter()
@@ -746,6 +759,108 @@ class InstagramChecker:
             return f"{reason} بدنه پاسخ JSON معتبر نبود یا data.user نداشت."
         return reason
 
+    async def proxy_preflight(self) -> bool:
+        proxy_url = self.settings.instagram_proxy_url
+        if not proxy_url:
+            await self.diagnostics.add(
+                level="WARNING",
+                event="proxy_disabled",
+                message="پراکسی وارپ تنظیم نشده است؛ بررسی با مسیر مستقیم ادامه می‌یابد.",
+            )
+            return True
+
+        started_at = time.perf_counter()
+        try:
+            trace_response = await self._http.get(
+                self.settings.proxy_health_url,
+                headers={"User-Agent": USER_AGENTS[0]},
+            )
+        except httpx.HTTPError as exc:
+            return await self._register_proxy_failure(
+                f"اتصال به health endpoint وارپ ناموفق بود: {type(exc).__name__}: {exc}"
+            )
+
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        trace_body = trace_response.text.lower()
+        if trace_response.status_code != 200 or not any(
+            marker in trace_body for marker in ("warp=on", "warp=plus")
+        ):
+            return await self._register_proxy_failure(
+                "health endpoint تأیید نکرد که ترافیک از WARP عبور می‌کند.",
+                http_status=trace_response.status_code,
+                elapsed_ms=elapsed_ms,
+            )
+
+        instagram_response = await self._instagram_preflight_response()
+        if not self._response_is_authoritative(instagram_response, "instagram"):
+            return await self._register_proxy_failure(
+                self._response_diagnostic(instagram_response),
+                http_status=instagram_response.status_code,
+                elapsed_ms=instagram_response.elapsed_ms,
+            )
+
+        await self.redis.delete(self.PROXY_FAILURE_STREAK_KEY, self.PROXY_ALERT_KEY)
+        await self.diagnostics.add(
+            level="INFO",
+            event="proxy_preflight_succeeded",
+            message="سلامت WARP و دسترسی Web Profile اینستاگرام تأیید شد.",
+            transport=instagram_response.transport,
+            http_status=instagram_response.status_code,
+            elapsed_ms=instagram_response.elapsed_ms,
+            response_bytes=len(instagram_response.body),
+            detail=f"proxy={proxy_url}; warp=on",
+        )
+        return True
+
+    async def _instagram_preflight_response(self) -> CurlResponse:
+        responses = [await self._execute_http2_once("instagram")]
+        if not self._response_is_authoritative(responses[-1], "instagram"):
+            responses.append(
+                await self._execute_curl_once("instagram", force_http2=True)
+            )
+        if not self._response_is_authoritative(responses[-1], "instagram"):
+            responses.append(
+                await self._execute_curl_once("instagram", force_http2=False)
+            )
+        return responses[-1]
+
+    async def _register_proxy_failure(
+        self,
+        detail: str,
+        *,
+        http_status: int | None = None,
+        elapsed_ms: int | None = None,
+    ) -> bool:
+        streak = await self.redis.incr(self.PROXY_FAILURE_STREAK_KEY)
+        if streak == 1:
+            await self.redis.expire(self.PROXY_FAILURE_STREAK_KEY, 86400)
+        await self.diagnostics.add(
+            level="ERROR",
+            event="proxy_preflight_failed",
+            message=(
+                "چرخه پایش متوقف شد؛ مسیر WARP یا دسترسی اینستاگرام پاسخ سالم نداد."
+            ),
+            http_status=http_status,
+            elapsed_ms=elapsed_ms,
+            detail=f"failure_streak={streak}; {detail}",
+        )
+        if streak >= 3:
+            should_alert = await self.redis.set(
+                self.PROXY_ALERT_KEY,
+                "1",
+                ex=21600,
+                nx=True,
+            )
+            if should_alert:
+                await self._notify(
+                    self.settings.admin_telegram_id,
+                    "⚠️ سیستم وارپ یا مسیر دسترسی اینستاگرام با اختلال مواجه شده است!\n\n"
+                    "سه چرخه متوالی پاسخ سالم دریافت نشد و پایش برای جلوگیری از "
+                    "اعلان اشتباه متوقف ماند. جزئیات کامل در بخش «لاگ کامل و "
+                    "عیب‌یابی» پنل مدیریت ثبت شده است.",
+                )
+        return False
+
     async def run(self) -> None:
         if await self.redis.exists(self.STATUS_COOLDOWN_KEY):
             await self.redis.delete(self.STATUS_COOLDOWN_KEY)
@@ -770,6 +885,8 @@ class InstagramChecker:
         renewal_task = asyncio.create_task(self._renew_lock(lock))
         try:
             self._rate_limited.clear()
+            if not await self.proxy_preflight():
+                return
             target_ids = await self._eligible_target_ids()
             await self.diagnostics.add(
                 level="INFO",
@@ -847,6 +964,15 @@ class InstagramChecker:
                 )
             finally:
                 queue.task_done()
+            if target_id is not None and not (
+                self._rate_limited.is_set() or self._lock_lost.is_set()
+            ):
+                await asyncio.sleep(
+                    random.uniform(
+                        self.settings.page_check_delay_min_seconds,
+                        self.settings.page_check_delay_max_seconds,
+                    )
+                )
 
     async def _eligible_target_ids(self) -> list[int]:
         now = datetime.now(timezone.utc)
@@ -1047,23 +1173,109 @@ class InstagramChecker:
                         user_id=target.user_id,
                     )
                     session.add(snapshot)
-                elif (
-                    picture_key
-                    and snapshot.profile_picture_key
-                    and picture_key != snapshot.profile_picture_key
-                ):
-                    session.add(
-                        PageEvent(
-                            target_page_id=target.id,
-                            user_id=target.user_id,
-                            event_type="profile_picture_changed",
-                            description="تصویر پروفایل پیج تغییر کرد.",
+                else:
+                    escaped_page = html.escape(target.instagram_username)
+                    if (
+                        picture_key
+                        and snapshot.profile_picture_key
+                        and picture_key != snapshot.profile_picture_key
+                    ):
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="profile_picture_changed",
+                                description="تصویر پروفایل پیج تغییر کرد.",
+                            )
                         )
-                    )
-                    notifications.append(
-                        "عکس پروفایل پیج تغییر کرد! 🖼️\n\n"
-                        f"پیج: <b>@{html.escape(target.instagram_username)}</b>"
-                    )
+                        notifications.append(
+                            "عکس پروفایل پیج تغییر کرد! 🖼️\n\n"
+                            f"پیج: <b>@{escaped_page}</b>"
+                        )
+                    if (
+                        snapshot.follower_count is not None
+                        and result.follower_count is not None
+                        and snapshot.follower_count != result.follower_count
+                    ):
+                        previous_followers = snapshot.follower_count
+                        follower_delta = result.follower_count - previous_followers
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="follower_count_changed",
+                                description=(
+                                    f"تعداد فالوورها از {previous_followers} به "
+                                    f"{result.follower_count} تغییر کرد."
+                                ),
+                            )
+                        )
+                        notifications.append(
+                            "تعداد فالوورها تغییر کرد 📈\n\n"
+                            f"پیج: <b>@{escaped_page}</b>\n"
+                            f"مقدار قبلی: <code>{self._format_count(previous_followers)}</code>\n"
+                            f"مقدار جدید: <code>{self._format_count(result.follower_count)}</code>\n"
+                            f"میزان تغییر: <code>{self._format_count(follower_delta, signed=True)}</code>"
+                        )
+                    if (
+                        snapshot.post_count is not None
+                        and result.post_count is not None
+                        and snapshot.post_count != result.post_count
+                    ):
+                        previous_posts = snapshot.post_count
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="post_count_changed",
+                                description=(
+                                    f"تعداد پست‌ها از {previous_posts} به "
+                                    f"{result.post_count} تغییر کرد."
+                                ),
+                            )
+                        )
+                        notifications.append(
+                            "تعداد پست‌های پیج تغییر کرد 🗂️\n\n"
+                            f"پیج: <b>@{escaped_page}</b>\n"
+                            f"مقدار قبلی: <code>{self._format_count(previous_posts)}</code>\n"
+                            f"مقدار جدید: <code>{self._format_count(result.post_count)}</code>"
+                        )
+                    if (
+                        snapshot.full_name is not None
+                        and result.full_name is not None
+                        and snapshot.full_name != result.full_name
+                    ):
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="full_name_changed",
+                                description="نام نمایشی اصلی پیج تغییر کرد.",
+                            )
+                        )
+                        notifications.append(
+                            "نام اصلی پیج عوض شد 🔄\n\n"
+                            f"پیج: <b>@{escaped_page}</b>\n"
+                            f"نام قبلی: <b>{html.escape(snapshot.full_name)}</b>\n"
+                            f"نام جدید: <b>{html.escape(result.full_name)}</b>"
+                        )
+                    if (
+                        snapshot.biography is not None
+                        and snapshot.biography != result.biography
+                    ):
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="biography_changed",
+                                description="متن بیوگرافی پیج تغییر کرد.",
+                            )
+                        )
+                        notifications.append(
+                            "بیوگرافی پیج تغییر کرد 📝\n\n"
+                            f"پیج: <b>@{escaped_page}</b>\n"
+                            "نسخه جدید در بخش اطلاعات زنده پیج قابل مشاهده است."
+                        )
                 if picture_key:
                     snapshot.profile_picture_key = picture_key
                     snapshot.profile_picture_url = result.profile_picture_url
@@ -1212,6 +1424,11 @@ class InstagramChecker:
         if value is None:
             return None
         return value[:limit]
+
+    @staticmethod
+    def _format_count(value: int, *, signed: bool = False) -> str:
+        formatted = f"{value:+,}" if signed else f"{value:,}"
+        return formatted.translate(PERSIAN_DIGITS)
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> int | None:
