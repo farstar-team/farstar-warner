@@ -40,10 +40,9 @@ services:
 
   warp_proxy:
     image: caomingjun/warp:latest
-    restart: unless-stopped
+    restart: always
     environment:
-      WARP_SLEEP: "2"
-      GOST_ARGS: "-L :1080 -F=127.0.0.1:40000"
+      WARP_SLEEP: "5"
     expose:
       - "1080"
     volumes:
@@ -65,12 +64,10 @@ services:
         ]
       interval: 30s
       timeout: 20s
-      retries: 5
-      start_period: 45s
+      retries: 10
+      start_period: 90s
     networks:
       - outbound
-    security_opt:
-      - no-new-privileges:true
 
   bot-app:
     image: farstar-warner:latest
@@ -87,7 +84,7 @@ services:
       redis:
         condition: service_healthy
       warp_proxy:
-        condition: service_healthy
+        condition: service_started
     environment:
       INSTAGRAM_PROXY_URL: ${INSTAGRAM_PROXY_URL:-socks5://warp_proxy:1080}
     networks:

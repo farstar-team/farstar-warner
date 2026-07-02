@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.1.1"
 RELEASE_DATE = "۱۴۰۵/۰۴/۱۱"
-RELEASE_TITLE = "معماری پایدار WARP و اعلان تغییرات پیج"
+RELEASE_TITLE = "رفع خطای راه‌اندازی کانتینر WARP"
 RELEASE_NOTES = (
-    "افزودن پراکسی داخلی WARP با health-check و وابستگی سلامت Docker",
-    "افزودن preflight قبل از هر چرخه و توقف امن هنگام پاسخ ۴۰۳ یا ۴۲۹",
-    "افزودن هشدار زیرساختی مدیر پس از سه چرخه شکست متوالی مسیر WARP",
-    "افزودن فاصله تصادفی ۱۵ تا ۴۵ ثانیه و retry با backoff تصاعدی",
-    "افزودن اعلان تغییر فالوور، تعداد پست، نام اصلی و بیوگرافی پیج",
+    "حذف no-new-privileges ناسازگار با entrypoint و sudo داخلی تصویر WARP",
+    "حذف forward اشتباه GOST به پورت تنظیم‌نشده ۴۰۰۰۰",
+    "استفاده از پراکسی پیش‌فرض و خودکار WARP روی پورت داخلی ۱۰۸۰",
+    "افزایش مهلت health-check برای ثبت اولیه حساب و اتصال daemon",
+    "جلوگیری از متوقف‌شدن کل ربات هنگام تأخیر یا اختلال کانتینر WARP",
 )
 RELEASE_REDIS_KEY = "farstar:release:notified-version"
 
