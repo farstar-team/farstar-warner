@@ -115,10 +115,6 @@ valid_env_secret() {
   [[ "$1" =~ ^[A-Za-z0-9._~!@%+=:-]+$ ]]
 }
 
-generate_fernet_key() {
-  openssl rand -base64 32 | tr -d '\n' | tr '+/' '-_'
-}
-
 REUSE_EXISTING=false
 if [[ -f "${ENV_FILE}" || -L "${ENV_FILE}" ]] && "${SUDO[@]}" test -s "${ENV_FILE}"; then
   read -r -p "An existing .env configuration was found. Reuse it? [Y/n]: " reuse_answer
@@ -169,8 +165,15 @@ if [[ "${REUSE_EXISTING}" == "false" ]]; then
   printf '\n'
   REDIS_PASSWORD="${REDIS_PASSWORD:-${DEFAULT_REDIS_PASSWORD}}"
   valid_env_secret "${REDIS_PASSWORD}" || fail "The Redis password contains unsupported characters."
-  CREDENTIAL_ENCRYPTION_KEY="$(generate_fernet_key)"
-
+  read -r -p "Zarinpal Merchant ID [optional, press Enter to disable]: " ZARINPAL_MERCHANT_ID
+  ZARINPAL_CALLBACK_URL=""
+  if [[ -n "${ZARINPAL_MERCHANT_ID}" ]]; then
+    [[ "${ZARINPAL_MERCHANT_ID}" =~ ^[A-Za-z0-9-]{10,100}$ ]] \
+      || fail "The Zarinpal Merchant ID contains unsupported characters."
+    read -r -p "Zarinpal HTTPS callback URL: " ZARINPAL_CALLBACK_URL
+    [[ "${ZARINPAL_CALLBACK_URL}" == https://* ]] \
+      || fail "The Zarinpal callback URL must start with https://"
+  fi
   umask 077
   if [[ -L "${ENV_FILE}" ]]; then
     "${SUDO[@]}" rm -f -- "${ENV_FILE}"
@@ -190,8 +193,6 @@ REDIS_HOST=redis
 REDIS_PORT=6379
 REDIS_DB=0
 REDIS_PASSWORD=${REDIS_PASSWORD}
-CREDENTIAL_ENCRYPTION_KEY=${CREDENTIAL_ENCRYPTION_KEY}
-META_GRAPH_API_VERSION=v21.0
 CHECK_INTERVAL_SECONDS=300
 CHECK_CONCURRENCY=8
 DEACTIVATION_CONFIRMATIONS=2
@@ -204,20 +205,18 @@ INSTAGRAM_BASELINE_USERNAMES=farstar_vpn,instagram,nasa
 PROXY_HEALTH_URL=https://www.cloudflare.com/cdn-cgi/trace
 PAGE_CHECK_DELAY_MIN_SECONDS=15
 PAGE_CHECK_DELAY_MAX_SECONDS=45
+FOLLOWER_SPIKE_THRESHOLD=1000
+FOLLOWER_SPIKE_WINDOW_SECONDS=3600
+USD_TOMAN_FALLBACK_RATE=650000
+ZARINPAL_MERCHANT_ID=${ZARINPAL_MERCHANT_ID}
+ZARINPAL_CALLBACK_URL=${ZARINPAL_CALLBACK_URL}
+ZARINPAL_TIMEOUT_SECONDS=15
 FREE_TRIAL_DAYS=7
 LOG_LEVEL=INFO
 EOF
   chmod 600 "${ENV_FILE}"
 fi
 
-if ! "${SUDO[@]}" grep -q '^CREDENTIAL_ENCRYPTION_KEY=' "${ENV_FILE}"; then
-  printf 'CREDENTIAL_ENCRYPTION_KEY=%s\n' "$(generate_fernet_key)" \
-    | "${SUDO[@]}" tee -a "${ENV_FILE}" >/dev/null
-fi
-if ! "${SUDO[@]}" grep -q '^META_GRAPH_API_VERSION=' "${ENV_FILE}"; then
-  printf 'META_GRAPH_API_VERSION=v21.0\n' \
-    | "${SUDO[@]}" tee -a "${ENV_FILE}" >/dev/null
-fi
 "${SUDO[@]}" chmod 600 "${ENV_FILE}"
 
 log "Installing the Farstar server management command..."

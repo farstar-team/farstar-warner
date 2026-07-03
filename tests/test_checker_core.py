@@ -17,6 +17,7 @@ from bot.models import (
     Base,
     NotificationSettings,
     PageSnapshot,
+    PageSnapshotHistory,
     PageStatus,
     TargetPage,
     User,
@@ -43,6 +44,10 @@ def test_public_parser_reads_only_root_user_node() -> None:
                     "username": "mahdy.security",
                     "full_name": "Mahdy",
                     "biography": "security",
+                    "external_url": "https://security.example/report",
+                    "is_business_account": True,
+                    "is_professional_account": True,
+                    "category_name": "Security Service",
                     "edge_followed_by": {"count": 168727},
                     "edge_follow": {"count": 1175},
                     "edge_owner_to_timeline_media": {
@@ -61,6 +66,75 @@ def test_public_parser_reads_only_root_user_node() -> None:
     assert result.profile_id == "47796612144"
     assert result.post_count == 1
     assert result.metadata_complete is True
+    assert result.external_link == "https://security.example/report"
+    assert result.external_link_observed is True
+    assert result.account_type == "business"
+    assert result.account_type_observed is True
+    assert result.category_name == "Security Service"
+
+
+def test_embed_parser_extracts_security_metadata_from_root_profile_node() -> None:
+    payload = {
+        "require": [
+            {
+                "data": {
+                    "user": {
+                        "id": "55",
+                        "username": "secure.page",
+                        "full_name": "Secure Page",
+                        "is_private": False,
+                        "is_business_account": False,
+                        "is_professional_account": False,
+                        "external_url": "https://safe.example/home",
+                        "edge_followed_by": {"count": 25},
+                    }
+                }
+            }
+        ]
+    }
+    raw_html = f"""
+    <html><head>
+      <meta property="og:title" content="Secure Page (@secure.page) • Instagram" />
+      <meta property="og:description" content="25 Followers, 4 Following, 2 Posts" />
+    </head><body>@secure.page
+      <script type="application/json">{json.dumps(payload)}</script>
+    </body></html>
+    """
+
+    profile = ProfilePreviewService._parse_embed_html(raw_html, "secure.page")
+
+    assert profile is not None
+    assert profile.external_link == "https://safe.example/home"
+    assert profile.external_link_observed is True
+    assert profile.account_type == "personal"
+    assert profile.account_type_observed is True
+
+
+def test_malicious_link_radar_is_local_and_signature_based() -> None:
+    reasons = InstagramChecker._malicious_link_reasons(
+        "https://verify-wallet-connect.example/claim-bonus"
+    )
+
+    assert "الگوی ورود یا تأیید هویت" in reasons
+    assert "الگوی جایزه یا رمزارز مشکوک" in reasons
+
+
+def test_forensic_history_schema_contains_required_fields() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    columns = {
+        column["name"]
+        for column in inspect(engine).get_columns(PageSnapshotHistory.__tablename__)
+    }
+
+    assert {
+        "observed_at",
+        "username",
+        "follower_count",
+        "following_count",
+        "post_count",
+        "external_link",
+    } <= columns
 
 
 def test_graphql_search_exact_match_is_active() -> None:
@@ -124,8 +198,7 @@ def test_graphql_search_rejects_failed_or_malformed_payload() -> None:
     malformed = json.dumps({"status": "ok", "data": {}}).encode()
 
     assert (
-        InstagramChecker._parse_graphql_search_response(failed, "target", 200)
-        is None
+        InstagramChecker._parse_graphql_search_response(failed, "target", 200) is None
     )
     assert (
         InstagramChecker._parse_graphql_search_response(malformed, "target", 200)
@@ -199,17 +272,11 @@ def test_monitoring_account_table_is_part_of_schema() -> None:
 
 
 @pytest.mark.asyncio
-async def test_official_health_uses_bearer_header_without_token_in_url() -> None:
+async def test_official_health_is_disabled_in_osint_only_mode() -> None:
     token = "EAAB-secret-token-value"
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["Authorization"] == f"Bearer {token}"
-        assert token not in str(request.url)
-        assert request.url.params["fields"] == "id,username"
-        return httpx.Response(
-            200,
-            json={"id": "17841400000000000", "username": "admin.account"},
-        )
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise AssertionError("OSINT-only mode must not call Meta Graph API")
 
     checker = InstagramChecker.__new__(InstagramChecker)
     checker.settings = _settings(Fernet.generate_key().decode("ascii"))
@@ -229,8 +296,8 @@ async def test_official_health_uses_bearer_header_without_token_in_url() -> None
     finally:
         await checker._graph_http.aclose()
 
-    assert healthy is True
-    assert username == "admin.account"
+    assert healthy is False
+    assert username is None
 
 
 @pytest.mark.asyncio

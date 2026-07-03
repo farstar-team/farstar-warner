@@ -8,6 +8,7 @@ import re
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from enum import Enum
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import httpx
 from playwright.async_api import (
@@ -46,6 +47,11 @@ class EmbedProfile:
     post_count: int | None = None
     is_private: bool | None = None
     is_verified: bool = False
+    external_link: str | None = None
+    external_link_observed: bool = False
+    account_type: str | None = None
+    account_type_observed: bool = False
+    category_name: str | None = None
     diagnostic: str | None = None
 
 
@@ -122,6 +128,11 @@ class ProfilePreviewService:
                 post_count=profile.post_count,
                 is_private=profile.is_private,
                 is_verified=profile.is_verified,
+                external_link=profile.external_link,
+                external_link_observed=profile.external_link_observed,
+                account_type=profile.account_type,
+                account_type_observed=profile.account_type_observed,
+                category_name=profile.category_name,
                 http_status=200,
             )
         if profile.outcome == PreviewOutcome.DEACTIVATED:
@@ -250,15 +261,15 @@ class ProfilePreviewService:
 
         title = metadata.get("og:title", "")
         description = metadata.get("og:description", "")
-        visible = html.unescape(
-            re.sub(r"<[^>]+>", " ", raw_html, flags=re.DOTALL)
-        )
+        visible = html.unescape(re.sub(r"<[^>]+>", " ", raw_html, flags=re.DOTALL))
         combined = f"{title}\n{description}\n{visible[:200_000]}"
         exact_patterns = (
             rf"(?<![\w.])@{re.escape(username)}(?![\w.])",
-            rf'\"username\"\s*:\s*\"{re.escape(username)}\"',
+            rf"\"username\"\s*:\s*\"{re.escape(username)}\"",
         )
-        if not any(re.search(pattern, combined, re.IGNORECASE) for pattern in exact_patterns):
+        if not any(
+            re.search(pattern, combined, re.IGNORECASE) for pattern in exact_patterns
+        ):
             return None
 
         def metric(label: str) -> int | None:
@@ -277,25 +288,175 @@ class ProfilePreviewService:
         )
         if name_match:
             full_name = cls._normalize_text(name_match.group(1))
+        profile_node = cls._find_profile_node(raw_html, username)
+        external_link = cls._external_link_from_node(profile_node)
+        if external_link is None:
+            external_link = cls._external_link_from_anchors(raw_html)
+        account_type = cls._account_type_from_node(profile_node)
+        category_name = (
+            cls._normalize_text(
+                profile_node.get("category_name")
+                or profile_node.get("business_category_name")
+            )
+            if profile_node
+            else None
+        )
+        if profile_node:
+            full_name = cls._normalize_text(profile_node.get("full_name")) or full_name
+        biography = (
+            cls._normalize_text(profile_node.get("biography")) if profile_node else None
+        )
         private_marker = bool(
             "this account is private" in lowered
-            or re.search(r'\"is_private\"\s*:\s*true', raw_html, re.IGNORECASE)
+            or re.search(r"\"is_private\"\s*:\s*true", raw_html, re.IGNORECASE)
         )
         return EmbedProfile(
             PreviewOutcome.ACTIVE,
             username=username.lower(),
             full_name=full_name,
-            biography=None,
+            biography=biography,
             profile_picture_url=metadata.get("og:image"),
             follower_count=metric("followers"),
             following_count=metric("following"),
             post_count=metric("posts"),
             is_private=True if private_marker else None,
             is_verified=bool(
-                re.search(r'\"is_verified\"\s*:\s*true', raw_html, re.IGNORECASE)
+                re.search(r"\"is_verified\"\s*:\s*true", raw_html, re.IGNORECASE)
             ),
+            external_link=external_link,
+            external_link_observed=bool(
+                profile_node
+                and any(
+                    key in profile_node
+                    for key in ("external_url", "website_url", "bio_links")
+                )
+            ),
+            account_type=account_type,
+            account_type_observed=bool(
+                profile_node
+                and any(
+                    key in profile_node
+                    for key in (
+                        "is_business_account",
+                        "is_professional_account",
+                        "account_type",
+                    )
+                )
+            ),
+            category_name=category_name,
             diagnostic="http_embed",
         )
+
+    @classmethod
+    def _find_profile_node(
+        cls, raw_html: str, username: str
+    ) -> dict[str, object] | None:
+        wanted = username.strip().lower()
+
+        def walk(value: object) -> dict[str, object] | None:
+            if isinstance(value, dict):
+                candidate_username = str(value.get("username") or "").strip().lower()
+                if candidate_username == wanted and any(
+                    key in value
+                    for key in (
+                        "edge_followed_by",
+                        "follower_count",
+                        "is_private",
+                        "profile_pic_url",
+                    )
+                ):
+                    return value
+                for nested in value.values():
+                    found = walk(nested)
+                    if found is not None:
+                        return found
+            elif isinstance(value, list):
+                for nested in value:
+                    found = walk(nested)
+                    if found is not None:
+                        return found
+            return None
+
+        scripts = re.findall(
+            r"<script\b[^>]*type\s*=\s*(['\"])application/json\1[^>]*>(.*?)</script>",
+            raw_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for _, encoded in scripts:
+            try:
+                payload = json.loads(html.unescape(encoded).strip())
+            except (json.JSONDecodeError, TypeError):
+                continue
+            found = walk(payload)
+            if found is not None:
+                return found
+        return None
+
+    @classmethod
+    def _external_link_from_node(cls, node: dict[str, object] | None) -> str | None:
+        if not node:
+            return None
+        candidates: list[object] = [node.get("external_url"), node.get("website_url")]
+        bio_links = node.get("bio_links")
+        if isinstance(bio_links, list):
+            for entry in bio_links:
+                if isinstance(entry, dict):
+                    candidates.extend((entry.get("url"), entry.get("lynx_url")))
+        for candidate in candidates:
+            normalized = cls._normalize_external_link(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    @classmethod
+    def _external_link_from_anchors(cls, raw_html: str) -> str | None:
+        for raw_url in re.findall(
+            r"<a\b[^>]*href\s*=\s*(['\"])(.*?)\1",
+            raw_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            normalized = cls._normalize_external_link(html.unescape(raw_url[1]))
+            if normalized:
+                return normalized
+        return None
+
+    @staticmethod
+    def _normalize_external_link(value: object) -> str | None:
+        normalized = str(value or "").strip()
+        if normalized.startswith("//"):
+            normalized = f"https:{normalized}"
+        parsed = urlsplit(normalized)
+        if parsed.hostname and parsed.hostname.lower() == "l.instagram.com":
+            redirected = parse_qs(parsed.query).get("u", [])
+            if redirected:
+                normalized = unquote(redirected[0]).strip()
+                parsed = urlsplit(normalized)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        if parsed.hostname.lower().rstrip(".") in {
+            "instagram.com",
+            "www.instagram.com",
+        }:
+            return None
+        return normalized[:2000]
+
+    @staticmethod
+    def _account_type_from_node(node: dict[str, object] | None) -> str | None:
+        if not node:
+            return None
+        raw_type = str(node.get("account_type") or "").strip().lower()
+        if raw_type in {"business", "creator", "professional", "personal"}:
+            return raw_type
+        if node.get("is_business_account") is True:
+            return "business"
+        if node.get("is_professional_account") is True:
+            return "professional"
+        if (
+            node.get("is_business_account") is False
+            and node.get("is_professional_account") is False
+        ):
+            return "personal"
+        return None
 
     @staticmethod
     def _parse_metric(value: str) -> int | None:
@@ -435,8 +596,7 @@ class ProfilePreviewService:
                 )
             except PlaywrightTimeoutError:
                 body_text = (
-                    self._normalize_text(await page.locator("body").inner_text())
-                    or ""
+                    self._normalize_text(await page.locator("body").inner_text()) or ""
                 ).lower()
                 if "log in" in body_text or "login" in page.url:
                     return EmbedProfile(
@@ -492,22 +652,45 @@ class ProfilePreviewService:
                   const bio = usernameIndex >= 0 && followerIndex > usernameIndex
                     ? lines.slice(usernameIndex + 2, Math.max(usernameIndex + 2, followerIndex - 1)).join('\n')
                     : '';
-                  const lower = (document.body.innerText || '').toLowerCase();
-                  return {
+                   const lower = (document.body.innerText || '').toLowerCase();
+                   const externalAnchor = Array.from(document.querySelectorAll('a[href]')).find(anchor => {
+                     try {
+                       const host = new URL(anchor.href).hostname.toLowerCase();
+                       return host && !host.endsWith('instagram.com');
+                     } catch (_) { return false; }
+                   });
+                   return {
                     username: requested.toLowerCase(),
                     full_name: fullName && !/^\d/.test(fullName) ? fullName : null,
                     biography: bio || null,
                     profile_picture_url: avatar ? avatar.currentSrc || avatar.src : null,
                     follower_count: metric(followerLine),
                     follower_display: followerLine ? followerLine.split(/\s+followers/i)[0] : null,
-                    post_count: metric(postLine),
-                    is_private: lower.includes('this account is private'),
-                    is_verified: Boolean(document.querySelector('[aria-label="Verified"]'))
-                  };
+                     post_count: metric(postLine),
+                     is_private: lower.includes('this account is private'),
+                     is_verified: Boolean(document.querySelector('[aria-label="Verified"]')),
+                     external_link: externalAnchor ? externalAnchor.href : null,
+                     external_link_observed: false,
+                     account_type: null,
+                     account_type_observed: false,
+                     category_name: null
+                   };
                 }
                 """,
                 username,
             )
+            parsed_html = self._parse_embed_html(await page.content(), username)
+            if parsed_html is not None:
+                for field in (
+                    "external_link",
+                    "account_type",
+                    "category_name",
+                ):
+                    parsed_value = getattr(parsed_html, field)
+                    if parsed_value is not None:
+                        data[field] = parsed_value
+                data["external_link_observed"] = parsed_html.external_link_observed
+                data["account_type_observed"] = parsed_html.account_type_observed
             return EmbedProfile(
                 PreviewOutcome.ACTIVE,
                 diagnostic="rendered_embed",

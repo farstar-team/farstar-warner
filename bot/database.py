@@ -38,6 +38,8 @@ def create_database(settings: Settings) -> tuple[AsyncEngine, SessionFactory]:
 async def initialize_database(engine: AsyncEngine) -> None:
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # Version 5.1.0 is OSINT-only: erase legacy encrypted Meta credentials.
+        await connection.execute(text("DELETE FROM instagram_monitoring_accounts"))
         if connection.dialect.name == "postgresql":
             migrations = (
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
@@ -76,7 +78,23 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 "last_follower_report_at TIMESTAMPTZ NULL",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
                 "notify_verification_change BOOLEAN NOT NULL DEFAULT TRUE",
+                "ALTER TABLE page_snapshots ADD COLUMN IF NOT EXISTS "
+                "external_link VARCHAR(2000) NULL",
+                "ALTER TABLE page_snapshots ADD COLUMN IF NOT EXISTS "
+                "external_link_initialized BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE page_snapshots ADD COLUMN IF NOT EXISTS "
+                "account_type VARCHAR(32) NULL",
+                "ALTER TABLE page_snapshots ADD COLUMN IF NOT EXISTS "
+                "account_type_initialized BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE page_snapshots ADD COLUMN IF NOT EXISTS "
+                "category_name VARCHAR(255) NULL",
+                "ALTER TABLE page_snapshots ADD COLUMN IF NOT EXISTS "
+                "guest_searchable BOOLEAN NULL",
+                "ALTER TABLE page_snapshots ADD COLUMN IF NOT EXISTS "
+                "guest_searchable_initialized BOOLEAN NOT NULL DEFAULT FALSE",
                 "ALTER TABLE store_products ADD COLUMN IF NOT EXISTS "
+                "price_currency VARCHAR(8) NOT NULL DEFAULT 'TOMAN'",
+                "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS "
                 "price_currency VARCHAR(8) NOT NULL DEFAULT 'TOMAN'",
             )
             for statement in migrations:
@@ -146,8 +164,7 @@ async def initialize_database(engine: AsyncEngine) -> None:
                     "last_evidence_source VARCHAR(64) NULL"
                 ),
                 "last_evidence_at": (
-                    "ALTER TABLE target_pages ADD COLUMN "
-                    "last_evidence_at DATETIME NULL"
+                    "ALTER TABLE target_pages ADD COLUMN last_evidence_at DATETIME NULL"
                 ),
                 "last_deactivation_evidence_at": (
                     "ALTER TABLE target_pages ADD COLUMN "
@@ -168,6 +185,43 @@ async def initialize_database(engine: AsyncEngine) -> None:
             }
             for column, statement in target_migrations.items():
                 if column not in target_columns:
+                    await connection.execute(text(statement))
+            snapshot_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(text("PRAGMA table_info(page_snapshots)"))
+                ).all()
+            }
+            snapshot_migrations = {
+                "external_link": (
+                    "ALTER TABLE page_snapshots ADD COLUMN external_link "
+                    "VARCHAR(2000) NULL"
+                ),
+                "external_link_initialized": (
+                    "ALTER TABLE page_snapshots ADD COLUMN external_link_initialized "
+                    "BOOLEAN NOT NULL DEFAULT 0"
+                ),
+                "account_type": (
+                    "ALTER TABLE page_snapshots ADD COLUMN account_type VARCHAR(32) NULL"
+                ),
+                "account_type_initialized": (
+                    "ALTER TABLE page_snapshots ADD COLUMN account_type_initialized "
+                    "BOOLEAN NOT NULL DEFAULT 0"
+                ),
+                "category_name": (
+                    "ALTER TABLE page_snapshots ADD COLUMN category_name "
+                    "VARCHAR(255) NULL"
+                ),
+                "guest_searchable": (
+                    "ALTER TABLE page_snapshots ADD COLUMN guest_searchable BOOLEAN NULL"
+                ),
+                "guest_searchable_initialized": (
+                    "ALTER TABLE page_snapshots ADD COLUMN guest_searchable_initialized "
+                    "BOOLEAN NOT NULL DEFAULT 0"
+                ),
+            }
+            for column, statement in snapshot_migrations.items():
+                if column not in snapshot_columns:
                     await connection.execute(text(statement))
             user_columns = {
                 row[1]
@@ -199,6 +253,21 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 await connection.execute(
                     text(
                         "ALTER TABLE store_products ADD COLUMN price_currency "
+                        "VARCHAR(8) NOT NULL DEFAULT 'TOMAN'"
+                    )
+                )
+            plan_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(
+                        text("PRAGMA table_info(subscription_plans)")
+                    )
+                ).all()
+            }
+            if "price_currency" not in plan_columns:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE subscription_plans ADD COLUMN price_currency "
                         "VARCHAR(8) NOT NULL DEFAULT 'TOMAN'"
                     )
                 )

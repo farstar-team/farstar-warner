@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     profile_preview_timeout_seconds: int = Field(default=45, ge=10, le=60)
     profile_preview_cache_seconds: int = Field(default=900, ge=60, le=86400)
     profile_preview_concurrency: int = Field(default=2, ge=1, le=5)
+    follower_spike_threshold: int = Field(default=1000, ge=100, le=10_000_000)
+    follower_spike_window_seconds: int = Field(default=3600, ge=60, le=86400)
+    usd_toman_fallback_rate: int = Field(default=650_000, ge=10_000, le=10_000_000)
+    zarinpal_merchant_id: SecretStr | None = None
+    zarinpal_callback_url: str | None = None
+    zarinpal_timeout_seconds: float = Field(default=15.0, ge=5.0, le=60.0)
     free_trial_days: int = Field(default=7, ge=1, le=365)
     log_level: str = "INFO"
 
@@ -125,6 +131,16 @@ class Settings(BaseSettings):
         normalized = value.strip()
         if not normalized.startswith("https://"):
             raise ValueError("proxy_health_url must use HTTPS")
+        return normalized
+
+    @field_validator("zarinpal_callback_url")
+    @classmethod
+    def validate_zarinpal_callback_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip()
+        if not normalized.startswith(("https://", "http://")):
+            raise ValueError("zarinpal_callback_url must use HTTP or HTTPS")
         return normalized
 
     @field_validator("meta_graph_base_url")

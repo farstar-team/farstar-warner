@@ -23,6 +23,7 @@ from bot.database import SessionFactory, create_database, initialize_database
 from bot.diagnostics import DiagnosticStore, RedisDiagnosticLogHandler
 from bot.handlers import admin, user
 from bot.models import PlanTier, User, UserStatus
+from bot.payment_service import ZarinpalProvider
 from bot.profile_preview import ProfilePreviewService
 from bot.reminders import send_expiry_reminders
 from bot.version import APP_VERSION, RELEASE_REDIS_KEY, version_message
@@ -141,6 +142,11 @@ async def run() -> None:
                             if settings.credential_encryption_key
                             else ""
                         ),
+                        (
+                            settings.zarinpal_merchant_id.get_secret_value()
+                            if settings.zarinpal_merchant_id
+                            else ""
+                        ),
                     )
                     if value
                 ),
@@ -166,6 +172,14 @@ async def run() -> None:
     )
     checker = InstagramChecker(bot, session_factory, redis, settings)
     profile_preview = ProfilePreviewService(redis, settings)
+    zarinpal_provider = ZarinpalProvider(
+        (
+            settings.zarinpal_merchant_id.get_secret_value()
+            if settings.zarinpal_merchant_id
+            else None
+        ),
+        timeout_seconds=settings.zarinpal_timeout_seconds,
+    )
     checker.set_browser_probe(profile_preview.probe_status)
 
     try:
@@ -229,11 +243,13 @@ async def run() -> None:
             scheduler=scheduler,
             checker=checker,
             profile_preview=profile_preview,
+            zarinpal_provider=zarinpal_provider,
         )
     finally:
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await profile_preview.close()
+        await zarinpal_provider.close()
         await checker.close()
         logging.getLogger().removeHandler(diagnostic_handler)
         await diagnostic_handler.drain()

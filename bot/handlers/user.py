@@ -9,7 +9,7 @@ import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.enums import ChatMemberStatus
@@ -21,6 +21,7 @@ from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     InlineKeyboardMarkup,
+    InlineKeyboardButton,
     Message,
     TelegramObject,
 )
@@ -52,6 +53,7 @@ from bot.models import (
     DiscountCode,
     NotificationSettings,
     PaymentConfig,
+    PaymentInvoice,
     PaymentReceipt,
     PageEvent,
     PageSnapshot,
@@ -69,7 +71,13 @@ from bot.models import (
     UserSubscription,
     UserStatus,
 )
-from bot.money import format_money
+from bot.money import (
+    convert_usd_to_toman,
+    fetch_live_usd_rate,
+    format_money,
+    normalize_currency,
+)
+from bot.payment_service import ZarinpalProvider
 from bot.profile_preview import EmbedProfile, PreviewOutcome, ProfilePreviewService
 from bot.report_cards import AlertCardData, ReportCardRenderer
 from bot.time_utils import format_datetime_dual, format_datetime_dual_plain
@@ -100,6 +108,48 @@ EVIDENCE_SOURCE_NAMES = {
     "playwright_public_embed": "رندر عمومی مرورگر",
     "playwright_explicit_absence": "نبودن قطعی در رندر عمومی",
 }
+
+
+async def _amount_in_toman(
+    amount: int,
+    currency: str | None,
+    redis: Redis,
+) -> tuple[int, int | None]:
+    normalized_currency = normalize_currency(currency)
+    if normalized_currency == "USD":
+        rate = await fetch_live_usd_rate(redis)
+        return convert_usd_to_toman(float(amount), rate), rate
+    return max(0, int(amount)), None
+
+
+def _zarinpal_callback_url(base_url: str, invoice_id: int) -> str:
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["invoice_id"] = str(invoice_id)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
+def _zarinpal_payment_keyboard(
+    payment_url: str,
+    invoice_id: int,
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="💳 ورود به درگاه امن زرین‌پال",
+                    url=payment_url,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 بررسی و تأیید پرداخت",
+                    callback_data=f"buy:zarinpal:verify:{invoice_id}",
+                )
+            ],
+            [InlineKeyboardButton(text="↩️ بازگشت", callback_data="buy:list")],
+        ]
+    )
 
 
 class AddPageState(StatesGroup):
@@ -291,9 +341,7 @@ def profile_result_to_embed(
         post_count=result.post_count,
         is_private=result.is_private,
         is_verified=bool(result.is_verified),
-        diagnostic=(
-            f"{result.source}_cache" if result.from_cache else result.source
-        ),
+        diagnostic=(f"{result.source}_cache" if result.from_cache else result.source),
     )
 
 
@@ -965,15 +1013,11 @@ def _profile_details_caption(details: EmbedProfile) -> str:
     else:
         lines.extend(("", "بیوگرافی در نمای عمومی اینستاگرام ارائه نشده است."))
     if (details.diagnostic or "").endswith("_cache"):
-        source_text = (
-            "آخرین پاسخ سالم ذخیره‌شده نمایش داده شد؛ provider زنده موقتاً پاسخ قطعی نداد."
-        )
+        source_text = "آخرین پاسخ سالم ذخیره‌شده نمایش داده شد؛ provider زنده موقتاً پاسخ قطعی نداد."
     elif details.diagnostic == "meta_business_discovery":
         source_text = "اطلاعات از Business Discovery رسمی Meta دریافت شد."
     elif details.diagnostic == "graphql_username_search":
-        source_text = (
-            "فعال‌بودن پیج با جست‌وجوی مستقل و تطابق دقیق نام کاربری تأیید شد."
-        )
+        source_text = "فعال‌بودن پیج با جست‌وجوی مستقل و تطابق دقیق نام کاربری تأیید شد."
     else:
         source_text = (
             "اطلاعات از fallback عمومی Web Profile و بدون ورود به حساب دریافت شد."
@@ -1834,6 +1878,9 @@ async def purchase_plan_list(
 async def purchase_plan_details(
     callback: CallbackQuery,
     session_factory: SessionFactory,
+    redis: Redis,
+    settings: Settings,
+    zarinpal_provider: ZarinpalProvider,
 ) -> None:
     plan_id = int((callback.data or "").rsplit(":", 1)[1])
     async with session_factory() as session:
@@ -1842,12 +1889,23 @@ async def purchase_plan_details(
     if plan is None or not plan.is_active:
         await callback.answer("این پلن دیگر فعال نیست.", show_alert=True)
         return
-    price = format_count(plan.price)
+    toman_amount, live_rate = await _amount_in_toman(
+        plan.price,
+        plan.price_currency,
+        redis,
+    )
+    price_text = format_money(plan.price, plan.price_currency)
+    conversion_text = (
+        f"\nمعادل لحظه‌ای: <b>{format_money(toman_amount, 'TOMAN')}</b>"
+        f"\nنرخ دلار: <code>{format_money(live_rate, 'TOMAN')}</code>"
+        if live_rate is not None
+        else ""
+    )
     text = (
         f"پلن <b>{html.escape(plan.name)}</b> 💎\n\n"
         f"مدت اعتبار: <b>{to_persian_digits(plan.duration_days)} روز</b>\n"
         f"ظرفیت پایش: <b>{to_persian_digits(plan.target_limit)} پیج</b>\n"
-        f"مبلغ: <b>{price} تومان</b>\n\n"
+        f"مبلغ: <b>{price_text}</b>{conversion_text}\n\n"
         "اگر اشتراک فعال دارید، مدت این خرید به تاریخ پایان فعلی اضافه می‌شود.\n\n"
         "روش پرداخت را انتخاب کنید:"
     )
@@ -1858,6 +1916,7 @@ async def purchase_plan_details(
                 plan.id,
                 payment.support_username if payment else None,
                 bool(payment and payment.card_number),
+                bool(zarinpal_provider.enabled and settings.zarinpal_callback_url),
             ),
         )
     await callback.answer()
@@ -1892,6 +1951,9 @@ async def apply_discount_code(
     state: FSMContext,
     db_user: User,
     session_factory: SessionFactory,
+    redis: Redis,
+    settings: Settings,
+    zarinpal_provider: ZarinpalProvider,
 ) -> None:
     data = await state.get_data()
     plan_id = data.get("purchase_plan_id")
@@ -1919,6 +1981,14 @@ async def apply_discount_code(
                     ),
                 )
             )
+            if already_used is None:
+                already_used = await session.scalar(
+                    select(PaymentInvoice.id).where(
+                        PaymentInvoice.discount_code_id == discount.id,
+                        PaymentInvoice.user_id == db_user.telegram_id,
+                        PaymentInvoice.is_paid.is_(True),
+                    )
+                )
         payment = await session.get(PaymentConfig, 1)
     valid = bool(
         plan
@@ -1935,22 +2005,31 @@ async def apply_discount_code(
         return
     discount_amount = plan.price * discount.percent // 100
     final_amount = max(0, plan.price - discount_amount)
+    final_toman, live_rate = await _amount_in_toman(
+        final_amount,
+        plan.price_currency,
+        redis,
+    )
     await state.update_data(
         purchase_discount_code_id=discount.id,
         purchase_original_amount=plan.price,
         purchase_discount_amount=discount_amount,
         purchase_final_amount=final_amount,
+        purchase_final_amount_toman=final_toman,
+        purchase_exchange_rate=live_rate,
     )
     await state.set_state(None)
     await message.answer(
         "کد تخفیف اعمال شد. ✅\n\n"
         f"تخفیف: <b>{to_persian_digits(discount.percent)}٪</b>\n"
-        f"مبلغ نهایی: <b>{format_count(final_amount)} تومان</b>\n\n"
+        f"مبلغ نهایی: <b>{format_money(final_amount, plan.price_currency)}</b>\n"
+        f"مبلغ قابل پرداخت: <b>{format_money(final_toman, 'TOMAN')}</b>\n\n"
         "روش پرداخت را انتخاب کنید:",
         reply_markup=purchase_methods_keyboard(
             plan.id,
             payment.support_username if payment else None,
             bool(payment and payment.card_number),
+            bool(zarinpal_provider.enabled and settings.zarinpal_callback_url),
         ),
     )
 
@@ -1960,6 +2039,7 @@ async def begin_card_payment(
     callback: CallbackQuery,
     state: FSMContext,
     session_factory: SessionFactory,
+    redis: Redis,
 ) -> None:
     plan_id = int((callback.data or "").rsplit(":", 1)[1])
     async with session_factory() as session:
@@ -1974,10 +2054,21 @@ async def begin_card_payment(
         if purchase_data.get("purchase_plan_id") == plan.id
         else None
     )
-    amount = discounted_amount if isinstance(discounted_amount, int) else plan.price
+    original_amount = (
+        discounted_amount if isinstance(discounted_amount, int) else plan.price
+    )
+    amount, exchange_rate = await _amount_in_toman(
+        original_amount,
+        plan.price_currency,
+        redis,
+    )
     if purchase_data.get("purchase_plan_id") != plan.id:
         await state.clear()
-    await state.update_data(purchase_plan_id=plan.id, purchase_amount=amount)
+    await state.update_data(
+        purchase_plan_id=plan.id,
+        purchase_amount=amount,
+        purchase_exchange_rate=exchange_rate,
+    )
     await state.set_state(PurchaseState.waiting_for_receipt)
     card_number = html.escape(payment.card_number)
     card_holder = html.escape(payment.card_holder or "ثبت نشده")
@@ -1992,6 +2083,331 @@ async def begin_card_payment(
             reply_markup=cancel_keyboard(),
         )
     await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^buy:zarinpal:\d+$"))
+async def begin_zarinpal_payment(
+    callback: CallbackQuery,
+    state: FSMContext,
+    db_user: User,
+    session_factory: SessionFactory,
+    redis: Redis,
+    settings: Settings,
+    zarinpal_provider: ZarinpalProvider,
+) -> None:
+    try:
+        plan_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("درخواست پرداخت نامعتبر است.", show_alert=True)
+        return
+    if not zarinpal_provider.enabled or not settings.zarinpal_callback_url:
+        await callback.answer("درگاه زرین‌پال تنظیم نشده است.", show_alert=True)
+        return
+
+    state_data = await state.get_data()
+    requested_discount_id = (
+        state_data.get("purchase_discount_code_id")
+        if state_data.get("purchase_plan_id") == plan_id
+        else None
+    )
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id)
+        discount = (
+            await session.get(DiscountCode, requested_discount_id)
+            if isinstance(requested_discount_id, int)
+            else None
+        )
+        discount_valid = bool(
+            discount
+            and discount.is_active
+            and 1 <= discount.percent <= 100
+            and (discount.expires_at is None or discount.expires_at > now)
+            and (discount.max_uses is None or discount.used_count < discount.max_uses)
+        )
+        if discount_valid and discount is not None:
+            used_invoice = await session.scalar(
+                select(PaymentInvoice.id).where(
+                    PaymentInvoice.discount_code_id == discount.id,
+                    PaymentInvoice.user_id == db_user.telegram_id,
+                    PaymentInvoice.is_paid.is_(True),
+                )
+            )
+            used_receipt = await session.scalar(
+                select(ReceiptDiscount.receipt_id)
+                .join(PaymentReceipt, PaymentReceipt.id == ReceiptDiscount.receipt_id)
+                .where(
+                    ReceiptDiscount.discount_code_id == discount.id,
+                    ReceiptDiscount.user_id == db_user.telegram_id,
+                    PaymentReceipt.status.in_(
+                        [ReceiptStatus.PENDING, ReceiptStatus.APPROVED]
+                    ),
+                )
+            )
+            discount_valid = used_invoice is None and used_receipt is None
+        if plan is None or not plan.is_active:
+            plan_data = None
+        else:
+            discount_percent = discount.percent if discount_valid and discount else 0
+            plan_data = {
+                "id": plan.id,
+                "name": plan.name,
+                "days": plan.duration_days,
+                "limit": plan.target_limit,
+                "price": plan.price,
+                "currency": normalize_currency(plan.price_currency),
+                "discount_id": discount.id if discount_valid and discount else None,
+                "discount_percent": discount_percent,
+            }
+    if plan_data is None:
+        await callback.answer("این پلن دیگر فعال نیست.", show_alert=True)
+        return
+
+    discount_amount = plan_data["price"] * plan_data["discount_percent"] // 100
+    payable_original = max(0, plan_data["price"] - discount_amount)
+    amount_toman, exchange_rate = await _amount_in_toman(
+        payable_original,
+        plan_data["currency"],
+        redis,
+    )
+    if amount_toman <= 0:
+        await callback.answer(
+            "مبلغ نهایی برای ارسال به درگاه معتبر نیست.", show_alert=True
+        )
+        return
+
+    recent_cutoff = now - timedelta(minutes=30)
+    async with session_factory() as session:
+        existing = await session.scalar(
+            select(PaymentInvoice)
+            .where(
+                PaymentInvoice.user_id == db_user.telegram_id,
+                PaymentInvoice.plan_id == plan_data["id"],
+                PaymentInvoice.amount_toman == amount_toman,
+                PaymentInvoice.discount_code_id == plan_data["discount_id"],
+                PaymentInvoice.is_paid.is_(False),
+                PaymentInvoice.zarinpal_authority.is_not(None),
+                PaymentInvoice.created_at >= recent_cutoff,
+            )
+            .order_by(PaymentInvoice.id.desc())
+        )
+        if existing is None:
+            invoice = PaymentInvoice(
+                user_id=db_user.telegram_id,
+                plan_id=plan_data["id"],
+                plan_name=plan_data["name"],
+                duration_days=plan_data["days"],
+                target_limit=plan_data["limit"],
+                original_amount=plan_data["price"],
+                original_currency=plan_data["currency"],
+                exchange_rate=exchange_rate,
+                amount_toman=amount_toman,
+                discount_code_id=plan_data["discount_id"],
+                discount_amount=discount_amount,
+                is_paid=False,
+            )
+            session.add(invoice)
+            await session.flush()
+            invoice_id = invoice.id
+            existing_authority = None
+            await session.commit()
+        else:
+            invoice_id = existing.id
+            existing_authority = existing.zarinpal_authority
+
+    if existing_authority:
+        authority = existing_authority
+        payment_url = zarinpal_provider.START_PAY_URL.format(authority=authority)
+    else:
+        callback_url = _zarinpal_callback_url(
+            settings.zarinpal_callback_url,
+            invoice_id,
+        )
+        authority, payment_url = await zarinpal_provider.request_payment(
+            amount_toman,
+            f"خرید اشتراک {plan_data['name']} - فاکتور {invoice_id}",
+            callback_url,
+        )
+        if authority is None or payment_url is None:
+            async with session_factory() as session:
+                failed_invoice = await session.get(PaymentInvoice, invoice_id)
+                if (
+                    failed_invoice is not None
+                    and failed_invoice.zarinpal_authority is None
+                    and not failed_invoice.is_paid
+                ):
+                    await session.delete(failed_invoice)
+                    await session.commit()
+            await callback.answer(
+                "درگاه در این لحظه پاسخ معتبر نداد؛ کمی بعد دوباره تلاش کنید.",
+                show_alert=True,
+            )
+            return
+        try:
+            async with session_factory() as session:
+                invoice = await session.scalar(
+                    select(PaymentInvoice)
+                    .where(PaymentInvoice.id == invoice_id)
+                    .with_for_update()
+                )
+                if invoice is None or invoice.user_id != db_user.telegram_id:
+                    raise LookupError("invoice_not_found")
+                invoice.zarinpal_authority = authority
+                await session.commit()
+        except LookupError:
+            await callback.answer("فاکتور پیدا نشد.", show_alert=True)
+            return
+        except IntegrityError:
+            await callback.answer(
+                "شناسه درگاه تکراری بود؛ لطفاً دوباره تلاش کنید.", show_alert=True
+            )
+            return
+
+    await state.clear()
+    if callback.message:
+        await callback.message.answer(
+            "فاکتور آنلاین زرین‌پال ساخته شد. ✅\n\n"
+            f"شماره فاکتور: <code>{to_persian_digits(invoice_id)}</code>\n"
+            f"پلن: <b>{html.escape(plan_data['name'])}</b>\n"
+            f"مبلغ قابل پرداخت: <b>{format_money(amount_toman, 'TOMAN')}</b>\n\n"
+            "پس از پرداخت به ربات برگردید و دکمه «بررسی و تأیید پرداخت» را بزنید.",
+            reply_markup=_zarinpal_payment_keyboard(payment_url, invoice_id),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("buy:zarinpal:verify:"))
+async def verify_zarinpal_payment(
+    callback: CallbackQuery,
+    db_user: User,
+    session_factory: SessionFactory,
+    zarinpal_provider: ZarinpalProvider,
+) -> None:
+    try:
+        invoice_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("شماره فاکتور معتبر نیست.", show_alert=True)
+        return
+
+    async with session_factory() as session:
+        invoice = await session.get(PaymentInvoice, invoice_id)
+        if invoice is None or invoice.user_id != db_user.telegram_id:
+            invoice_data = None
+        else:
+            invoice_data = {
+                "is_paid": invoice.is_paid,
+                "authority": invoice.zarinpal_authority,
+                "amount": invoice.amount_toman,
+            }
+    if invoice_data is None:
+        await callback.answer("فاکتور پیدا نشد.", show_alert=True)
+        return
+    if invoice_data["is_paid"]:
+        await callback.answer("این پرداخت قبلاً تأیید شده است. ✅", show_alert=True)
+        return
+    if not invoice_data["authority"]:
+        await callback.answer("شناسه پرداخت فاکتور ثبت نشده است.", show_alert=True)
+        return
+
+    verified, ref_id = await zarinpal_provider.verify_payment(
+        invoice_data["amount"],
+        invoice_data["authority"],
+    )
+    if not verified:
+        await callback.answer(
+            "پرداخت هنوز توسط زرین‌پال تأیید نشده است.",
+            show_alert=True,
+        )
+        return
+
+    now = datetime.now(timezone.utc)
+    already_finalized = False
+    try:
+        async with session_factory() as session:
+            invoice = await session.scalar(
+                select(PaymentInvoice)
+                .where(PaymentInvoice.id == invoice_id)
+                .with_for_update()
+            )
+            if invoice is None or invoice.user_id != db_user.telegram_id:
+                raise LookupError("invoice_not_found")
+            if invoice.is_paid:
+                already_finalized = True
+            else:
+                user = await session.scalar(
+                    select(User)
+                    .where(User.telegram_id == invoice.user_id)
+                    .with_for_update()
+                )
+                if user is None:
+                    raise LookupError("user_not_found")
+                current_expiry = user.subscription_expiry
+                if current_expiry.tzinfo is None:
+                    current_expiry = current_expiry.replace(tzinfo=timezone.utc)
+                starts_from = max(now, current_expiry)
+                new_expiry = starts_from + timedelta(days=invoice.duration_days)
+                subscription = await session.get(UserSubscription, user.telegram_id)
+                if subscription is None:
+                    subscription = UserSubscription(
+                        user_id=user.telegram_id,
+                        plan_id=invoice.plan_id,
+                        plan_name=invoice.plan_name,
+                        target_limit=invoice.target_limit,
+                        starts_at=now,
+                        expires_at=new_expiry,
+                    )
+                    session.add(subscription)
+                else:
+                    subscription.plan_id = invoice.plan_id
+                    subscription.plan_name = invoice.plan_name
+                    subscription.target_limit = invoice.target_limit
+                    subscription.expires_at = new_expiry
+                user.subscription_expiry = new_expiry
+                user.status = UserStatus.ACTIVE
+                user.plan_tier = (
+                    PlanTier.PREMIUM if invoice.target_limit <= 100 else PlanTier.VIP
+                )
+                if invoice.discount_code_id is not None:
+                    discount = await session.scalar(
+                        select(DiscountCode)
+                        .where(DiscountCode.id == invoice.discount_code_id)
+                        .with_for_update()
+                    )
+                    if discount is not None:
+                        discount.used_count += 1
+                invoice.is_paid = True
+                invoice.zarinpal_ref_id = ref_id
+                invoice.paid_at = now
+                plan_name = invoice.plan_name
+                duration_days = invoice.duration_days
+                await session.commit()
+    except LookupError as exc:
+        message = (
+            "حساب کاربری پیدا نشد."
+            if str(exc) == "user_not_found"
+            else "فاکتور پیدا نشد."
+        )
+        await callback.answer(message, show_alert=True)
+        return
+    except IntegrityError:
+        await callback.answer(
+            "کد رهگیری این پرداخت قبلاً ثبت شده است؛ با پشتیبانی تماس بگیرید.",
+            show_alert=True,
+        )
+        return
+
+    if already_finalized:
+        await callback.answer("این پرداخت قبلاً تأیید شده است. ✅", show_alert=True)
+        return
+
+    if callback.message:
+        await callback.message.answer(
+            "پرداخت با موفقیت تأیید و اشتراک فعال شد. ✅\n\n"
+            f"پلن: <b>{html.escape(plan_name)}</b>\n"
+            f"مدت افزوده‌شده: <b>{to_persian_digits(duration_days)} روز</b>\n"
+            f"کد رهگیری: <code>{html.escape(str(ref_id))}</code>"
+        )
+    await callback.answer("پرداخت تأیید شد. ✅", show_alert=True)
 
 
 @router.message(PurchaseState.waiting_for_receipt, F.photo | F.document)
@@ -2028,13 +2444,14 @@ async def receive_payment_receipt(
         await message.answer("فیش را به‌صورت تصویر یا فایل PDF ارسال کنید.")
         return
 
+    async with session_factory() as session:
+        plan = await session.get(SubscriptionPlan, plan_id)
+    if plan is None or not plan.is_active:
+        await state.clear()
+        await message.answer("پلن انتخاب‌شده دیگر فعال نیست.")
+        return
     try:
         async with session_factory() as session:
-            plan = await session.get(SubscriptionPlan, plan_id)
-            if plan is None or not plan.is_active:
-                await state.clear()
-                await message.answer("پلن انتخاب‌شده دیگر فعال نیست.")
-                return
             receipt = PaymentReceipt(
                 user_id=db_user.telegram_id,
                 plan_id=plan.id,
@@ -2201,6 +2618,7 @@ async def store_list_callback(
 async def store_product_details(
     callback: CallbackQuery,
     session_factory: SessionFactory,
+    redis: Redis,
 ) -> None:
     product_id = int((callback.data or "").rsplit(":", 1)[1])
     async with session_factory() as session:
@@ -2210,10 +2628,22 @@ async def store_product_details(
     if config is None or not config.enabled or product is None or not product.is_active:
         await callback.answer("این محصول در دسترس نیست.", show_alert=True)
         return
+    product_toman, product_rate = await _amount_in_toman(
+        product.price,
+        product.price_currency,
+        redis,
+    )
+    conversion_text = (
+        f"\nمعادل لحظه‌ای: <b>{format_money(product_toman, 'TOMAN')}</b>"
+        f"\nنرخ دلار: <code>{format_money(product_rate, 'TOMAN')}</code>"
+        if product_rate is not None
+        else ""
+    )
     text = (
         f"<b>{html.escape(product.name)}</b> 🛍️\n\n"
         f"{html.escape(product.description)}\n\n"
         f"قیمت: <b>{format_money(product.price, product.price_currency)}</b>"
+        f"{conversion_text}"
     )
     if callback.message:
         await callback.message.edit_text(

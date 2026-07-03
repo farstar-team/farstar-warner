@@ -148,9 +148,7 @@ class TargetPage(Base):
     )
     last_check_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    last_evidence_source: Mapped[str | None] = mapped_column(
-        String(64), nullable=True
-    )
+    last_evidence_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_evidence_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -184,6 +182,11 @@ class TargetPage(Base):
         uselist=False,
     )
     events: Mapped[list[PageEvent]] = relationship(
+        back_populates="target_page",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    snapshot_history: Mapped[list[PageSnapshotHistory]] = relationship(
         back_populates="target_page",
         cascade="all, delete-orphan",
         passive_deletes=True,
@@ -282,6 +285,19 @@ class PageSnapshot(Base):
     profile_picture_url: Mapped[str | None] = mapped_column(String(2000))
     full_name: Mapped[str | None] = mapped_column(String(255))
     biography: Mapped[str | None] = mapped_column(String(2000))
+    external_link: Mapped[str | None] = mapped_column(String(2000))
+    external_link_initialized: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    account_type: Mapped[str | None] = mapped_column(String(32))
+    account_type_initialized: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    category_name: Mapped[str | None] = mapped_column(String(255))
+    guest_searchable: Mapped[bool | None] = mapped_column(Boolean)
+    guest_searchable_initialized: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     follower_count: Mapped[int | None] = mapped_column(BigInteger)
     following_count: Mapped[int | None] = mapped_column(BigInteger)
     post_count: Mapped[int | None] = mapped_column(Integer)
@@ -293,6 +309,52 @@ class PageSnapshot(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+class PageSnapshotHistory(Base):
+    __tablename__ = "page_snapshot_history"
+    __table_args__ = (
+        Index(
+            "ix_page_snapshot_history_target_observed",
+            "target_page_id",
+            "observed_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    target_page_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("target_pages.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, index=True
+    )
+    status: Mapped[PageStatus] = mapped_column(
+        Enum(
+            PageStatus,
+            name="page_status",
+            values_callable=lambda e: [item.value for item in e],
+        ),
+        nullable=False,
+    )
+    username: Mapped[str] = mapped_column(String(30), nullable=False)
+    follower_count: Mapped[int | None] = mapped_column(BigInteger)
+    following_count: Mapped[int | None] = mapped_column(BigInteger)
+    post_count: Mapped[int | None] = mapped_column(Integer)
+    external_link: Mapped[str | None] = mapped_column(String(2000))
+    account_type: Mapped[str | None] = mapped_column(String(32))
+    guest_searchable: Mapped[bool | None] = mapped_column(Boolean)
+    evidence_source: Mapped[str | None] = mapped_column(String(64))
+
+    target_page: Mapped[TargetPage] = relationship(back_populates="snapshot_history")
 
 
 class InstagramMonitoringAccount(Base):
@@ -343,6 +405,9 @@ class SubscriptionPlan(Base):
     name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
     duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
     price: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    price_currency: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="TOMAN"
+    )
     target_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -437,6 +502,60 @@ class PaymentReceipt(Base):
     )
     reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
+    )
+
+
+class PaymentInvoice(Base):
+    __tablename__ = "payment_invoices"
+    __table_args__ = (
+        UniqueConstraint(
+            "zarinpal_authority", name="uq_payment_invoices_zarinpal_authority"
+        ),
+        Index("ix_payment_invoices_user_created", "user_id", "created_at"),
+        Index("ix_payment_invoices_paid_created", "is_paid", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plan_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("subscription_plans.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    plan_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_limit: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    original_currency: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="TOMAN"
+    )
+    exchange_rate: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    amount_toman: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    discount_code_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("discount_codes.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    discount_amount: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    zarinpal_authority: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
+    zarinpal_ref_id: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, unique=True
+    )
+    is_paid: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, index=True
+    )
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), index=True
     )

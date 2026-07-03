@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import json
 import logging
 import random
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -13,7 +15,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from enum import Enum
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import httpx
 from aiogram import Bot
@@ -22,7 +24,7 @@ from aiogram.types import BufferedInputFile, InlineKeyboardMarkup
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
 from redis.exceptions import LockError, RedisError
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, delete, func, select
 
 from bot.config import Settings
 from bot.credential_store import CredentialStore, CredentialStoreError
@@ -33,6 +35,7 @@ from bot.models import (
     InstagramMonitoringAccount,
     PageEvent,
     PageSnapshot,
+    PageSnapshotHistory,
     PageStatus,
     PlanTier,
     TargetPage,
@@ -86,6 +89,12 @@ class ProfileResult:
     post_count: int | None = None
     is_private: bool | None = None
     is_verified: bool | None = None
+    external_link: str | None = None
+    external_link_observed: bool = False
+    account_type: str | None = None
+    account_type_observed: bool = False
+    category_name: str | None = None
+    guest_searchable: bool | None = None
     retry_after: int | None = None
     http_status: int | None = None
     from_cache: bool = False
@@ -113,6 +122,20 @@ class NotificationPayload:
     secondary_value: str | None = None
     accent: str = "gold"
     reply_markup: InlineKeyboardMarkup | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class ProfileTimelineEntry:
+    observed_at: datetime
+    status: PageStatus
+    username: str
+    follower_count: int | None
+    following_count: int | None
+    post_count: int | None
+    external_link: str | None
+    account_type: str | None
+    guest_searchable: bool | None
+    evidence_source: str | None
 
 
 class InstagramChecker:
@@ -222,18 +245,6 @@ class InstagramChecker:
                 )
                 if cached is not None:
                     return replace(cached, from_cache=True)
-            official = await self._fetch_profile_official(
-                normalized_username,
-                expected_profile_id=expected_profile_id,
-            )
-            if official is not None:
-                if official.outcome == CheckOutcome.ACTIVE:
-                    await self._cache_profile(official, normalized_username)
-                    return official
-                if official.outcome == CheckOutcome.DEACTIVATED:
-                    await self._cache_deactivated(official, normalized_username)
-                    return official
-
             cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
             if cooldown_ttl > 0 and not bypass_cooldown:
                 if allow_stale:
@@ -281,29 +292,6 @@ class InstagramChecker:
             )
 
     async def official_provider_preflight(self, *, force: bool = False) -> bool:
-        if not self.credentials.available:
-            self._official_ready = False
-            return False
-        accounts = [account for account in await self.monitoring_accounts() if account.is_active]
-        for account in accounts:
-            try:
-                token = self.credentials.decrypt(account.access_token_encrypted)
-            except CredentialStoreError as exc:
-                await self._set_monitoring_account_health(
-                    account.id,
-                    healthy=False,
-                    error=str(exc),
-                )
-                continue
-            healthy, _, _ = await self.validate_monitoring_account(
-                account.instagram_user_id,
-                token,
-                account_id=account.id,
-                force=force,
-            )
-            if healthy:
-                self._official_ready = True
-                return True
         self._official_ready = False
         return False
 
@@ -315,6 +303,12 @@ class InstagramChecker:
         account_id: int | None = None,
         force: bool = True,
     ) -> tuple[bool, str, str | None]:
+        return (
+            False,
+            "دریافت و استفاده از توکن Meta در نسخه ۵.۱.۰ غیرفعال است.",
+            None,
+        )
+
         if account_id is not None and not force:
             cached = await self.redis.get(f"{self.GRAPH_HEALTH_PREFIX}{account_id}")
             if cached == "healthy":
@@ -342,7 +336,9 @@ class InstagramChecker:
         username = self._optional_text(payload.get("username")) if payload else None
         returned_id = str(payload.get("id") or "") if payload else ""
         healthy = response.status_code == 200 and returned_id == instagram_user_id
-        error = None if healthy else self._graph_error_text(payload, response.status_code)
+        error = (
+            None if healthy else self._graph_error_text(payload, response.status_code)
+        )
         if account_id is not None:
             await self._set_monitoring_account_health(
                 account_id,
@@ -382,9 +378,15 @@ class InstagramChecker:
         *,
         expected_profile_id: str | None,
     ) -> ProfileResult | None:
+        # Kept as a compatibility stub for older admin code. Version 5.1.0 is
+        # strictly OSINT-only and never reads or transmits stored credentials.
+        return None
+
         if not self.credentials.available:
             return None
-        accounts = [account for account in await self.monitoring_accounts() if account.is_active]
+        accounts = [
+            account for account in await self.monitoring_accounts() if account.is_active
+        ]
         if not accounts:
             return None
 
@@ -528,13 +530,19 @@ class InstagramChecker:
         requested_username: str,
     ) -> ProfileResult | None:
         profile_id = str(data.get("id") or "").strip()
-        canonical_username = str(data.get("username") or requested_username).strip().lower()
+        canonical_username = (
+            str(data.get("username") or requested_username).strip().lower()
+        )
         if not profile_id.isdigit() or not canonical_username:
             return None
 
         def count(name: str) -> int | None:
             value = data.get(name)
-            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+            return (
+                value
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                else None
+            )
 
         return ProfileResult(
             outcome=CheckOutcome.ACTIVE,
@@ -682,7 +690,11 @@ class InstagramChecker:
         self,
         username: str,
     ) -> ProfileResult | None:
-        routes = [True, False] if self.settings.instagram_proxy_url else [False]
+        routes = (
+            [True, False]
+            if getattr(self.settings, "instagram_proxy_url", None)
+            else [False]
+        )
         for use_proxy in routes:
             response = await self._execute_graphql_search_once(
                 username,
@@ -694,11 +706,7 @@ class InstagramChecker:
                 response.status_code,
             )
             await self.diagnostics.add(
-                level=(
-                    "INFO"
-                    if result is not None
-                    else "WARNING"
-                ),
+                level=("INFO" if result is not None else "WARNING"),
                 event="graphql_discovery_attempt",
                 message=(
                     "جست‌وجوی مستقل نام کاربری نتیجه قطعی داد."
@@ -721,6 +729,22 @@ class InstagramChecker:
                 return result
         return None
 
+    async def _audit_guest_searchability(self, username: str) -> bool | None:
+        """Return only authoritative guest-search visibility; blocks stay unknown."""
+        if not hasattr(self, "_direct_http"):
+            return None
+        discovery = await self._search_profile_via_graphql(username)
+        if discovery is None:
+            return None
+        if discovery.outcome == CheckOutcome.ACTIVE:
+            return True
+        if (
+            discovery.outcome == CheckOutcome.DEACTIVATED
+            and discovery.source == "graphql_username_search_absence"
+        ):
+            return False
+        return None
+
     async def _execute_graphql_search_once(
         self,
         username: str,
@@ -736,9 +760,7 @@ class InstagramChecker:
         started_at = time.perf_counter()
         client = self._http if use_proxy else self._direct_http
         transport = (
-            "graphql-search-http2-proxy"
-            if use_proxy
-            else "graphql-search-http2-direct"
+            "graphql-search-http2-proxy" if use_proxy else "graphql-search-http2-direct"
         )
         try:
             response = await client.post(
@@ -810,7 +832,9 @@ class InstagramChecker:
         for entry in users:
             if not isinstance(entry, dict):
                 continue
-            user_data = entry.get("user") if isinstance(entry.get("user"), dict) else entry
+            user_data = (
+                entry.get("user") if isinstance(entry.get("user"), dict) else entry
+            )
             raw_username = user_data.get("username")
             if not isinstance(raw_username, str) or raw_username.lower() != normalized:
                 continue
@@ -840,6 +864,25 @@ class InstagramChecker:
                     else None
                 ),
                 is_verified=verified if isinstance(verified, bool) else None,
+                external_link=cls._extract_external_link(user_data),
+                external_link_observed=any(
+                    key in user_data
+                    for key in ("external_url", "website_url", "bio_links")
+                ),
+                account_type=cls._extract_account_type(user_data),
+                account_type_observed=any(
+                    key in user_data
+                    for key in (
+                        "is_business_account",
+                        "is_professional_account",
+                        "account_type",
+                    )
+                ),
+                category_name=cls._optional_text(
+                    user_data.get("category_name")
+                    or user_data.get("business_category_name")
+                ),
+                guest_searchable=True,
                 http_status=200,
             )
 
@@ -1267,8 +1310,79 @@ class InstagramChecker:
                 else None
             ),
             is_verified=bool(user_data.get("is_verified", False)),
+            external_link=cls._extract_external_link(user_data),
+            external_link_observed=True,
+            account_type=cls._extract_account_type(user_data),
+            account_type_observed=any(
+                key in user_data
+                for key in (
+                    "is_business_account",
+                    "is_professional_account",
+                    "account_type",
+                )
+            ),
+            category_name=cls._optional_text(
+                user_data.get("category_name")
+                or user_data.get("business_category_name")
+            ),
             http_status=status_code,
         )
+
+    @classmethod
+    def _extract_external_link(cls, user_data: dict[object, object]) -> str | None:
+        candidates: list[object] = [
+            user_data.get("external_url"),
+            user_data.get("website_url"),
+        ]
+        bio_links = user_data.get("bio_links")
+        if isinstance(bio_links, list):
+            for entry in bio_links:
+                if isinstance(entry, dict):
+                    candidates.extend(
+                        (entry.get("url"), entry.get("lynx_url"), entry.get("link_url"))
+                    )
+        for candidate in candidates:
+            normalized = cls._normalize_external_link(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    @classmethod
+    def _normalize_external_link(cls, value: object) -> str | None:
+        normalized = str(value or "").strip()
+        if not normalized:
+            return None
+        if normalized.startswith("//"):
+            normalized = f"https:{normalized}"
+        parsed = urlsplit(normalized)
+        if parsed.hostname and parsed.hostname.lower() == "l.instagram.com":
+            redirected = parse_qs(parsed.query).get("u", [])
+            if redirected:
+                normalized = unquote(redirected[0]).strip()
+                parsed = urlsplit(normalized)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return None
+        if parsed.hostname.lower().rstrip(".") in {
+            "instagram.com",
+            "www.instagram.com",
+        }:
+            return None
+        return cls._truncate(normalized, 2000)
+
+    @staticmethod
+    def _extract_account_type(user_data: dict[object, object]) -> str | None:
+        raw_type = str(user_data.get("account_type") or "").strip().lower()
+        if raw_type in {"business", "creator", "professional", "personal"}:
+            return raw_type
+        business = user_data.get("is_business_account")
+        professional = user_data.get("is_professional_account")
+        if business is True:
+            return "business"
+        if professional is True:
+            return "professional"
+        if business is False and professional is False:
+            return "personal"
+        return None
 
     @staticmethod
     def _body_indicates_deactivated(body: bytes) -> bool:
@@ -1901,6 +2015,46 @@ class InstagramChecker:
             return None
         return await self._check_target(target_id)
 
+    async def get_profile_timeline(
+        self,
+        target_id: int,
+        *,
+        user_id: int | None = None,
+        limit: int = 30,
+    ) -> list[ProfileTimelineEntry]:
+        """Return detached forensic entries without keeping a DB session open."""
+        safe_limit = max(1, min(limit, 30))
+        conditions = [PageSnapshotHistory.target_page_id == target_id]
+        if user_id is not None:
+            conditions.append(PageSnapshotHistory.user_id == user_id)
+        async with self.session_factory() as session:
+            rows = list(
+                await session.scalars(
+                    select(PageSnapshotHistory)
+                    .where(*conditions)
+                    .order_by(
+                        PageSnapshotHistory.observed_at.desc(),
+                        PageSnapshotHistory.id.desc(),
+                    )
+                    .limit(safe_limit)
+                )
+            )
+        return [
+            ProfileTimelineEntry(
+                observed_at=row.observed_at,
+                status=row.status,
+                username=self._normalize_text(row.username),
+                follower_count=row.follower_count,
+                following_count=row.following_count,
+                post_count=row.post_count,
+                external_link=self._normalize_text(row.external_link) or None,
+                account_type=self._normalize_account_type(row.account_type),
+                guest_searchable=row.guest_searchable,
+                evidence_source=self._normalize_text(row.evidence_source) or None,
+            )
+            for row in rows
+        ]
+
     async def _record_inconclusive_check(
         self,
         target_id: int,
@@ -1935,6 +2089,13 @@ class InstagramChecker:
             force_refresh=True,
             expected_profile_id=snapshot.last_known_id,
         )
+        if result.outcome == CheckOutcome.ACTIVE:
+            searchable = (
+                True
+                if result.source == "graphql_username_search"
+                else await self._audit_guest_searchability(username)
+            )
+            result = replace(result, guest_searchable=searchable)
         await self.diagnostics.add(
             level=(
                 "INFO"
@@ -2015,6 +2176,7 @@ class InstagramChecker:
         notifications: list[NotificationPayload] = []
         recipient_id: int | None = None
         admin_report_categories: set[str] = set()
+        searchability_issue = False
         async with self.session_factory() as session:
             target = await session.scalar(
                 select(TargetPage).where(TargetPage.id == target_id).with_for_update()
@@ -2073,6 +2235,7 @@ class InstagramChecker:
                 target.last_status_changed_at = checked_at
             username_changed = False
             identity_changed = False
+            follower_spike_detected = False
 
             if result.outcome == CheckOutcome.ACTIVE and result.profile_id:
                 canonical_username = (
@@ -2129,10 +2292,85 @@ class InstagramChecker:
                     current_full_name = self._normalize_text(result.full_name)
                     previous_biography = self._normalize_text(snapshot.biography)
                     current_biography = self._normalize_text(result.biography)
+                    previous_external_link = self._normalize_text(
+                        snapshot.external_link
+                    )
+                    current_external_link = self._normalize_text(result.external_link)
+                    previous_account_type = self._normalize_account_type(
+                        snapshot.account_type
+                    )
+                    current_account_type = self._normalize_account_type(
+                        result.account_type
+                    )
+                    if (
+                        snapshot.follower_count is not None
+                        and result.follower_count is not None
+                    ):
+                        observed_before = snapshot.updated_at or checked_at
+                        if observed_before.tzinfo is None:
+                            observed_before = observed_before.replace(
+                                tzinfo=timezone.utc
+                            )
+                        follower_velocity_delta = (
+                            result.follower_count - snapshot.follower_count
+                        )
+                        elapsed_seconds = max(
+                            1,
+                            int((checked_at - observed_before).total_seconds()),
+                        )
+                        follower_spike_detected = bool(
+                            follower_velocity_delta
+                            >= getattr(self.settings, "follower_spike_threshold", 1000)
+                            and elapsed_seconds
+                            <= getattr(
+                                self.settings,
+                                "follower_spike_window_seconds",
+                                3600,
+                            )
+                        )
+                        if follower_spike_detected:
+                            session.add(
+                                PageEvent(
+                                    target_page_id=target.id,
+                                    user_id=target.user_id,
+                                    event_type="follower_spike_detected",
+                                    description=(
+                                        "جهش غیرعادی فالوور شناسایی شد؛ "
+                                        f"افزایش {follower_velocity_delta} در "
+                                        f"{elapsed_seconds} ثانیه."
+                                    ),
+                                )
+                            )
+                            notifications.append(
+                                NotificationPayload(
+                                    message=(
+                                        "🚨 جهش بحرانی فالوور شناسایی شد\n\n"
+                                        f"پیج: <b>@{html.escape(target.instagram_username)}</b>\n"
+                                        f"افزایش: <code>{self._format_count(follower_velocity_delta, signed=True)}</code>\n"
+                                        f"بازه زمانی: <code>{self._format_duration(elapsed_seconds)}</code>\n\n"
+                                        "رشد فالوور با سرعت غیرعادی در حال رخ‌دادن است. "
+                                        "احتمال حمله فالوور فیک یا اسپم وجود دارد. پیشنهاد می‌کنیم "
+                                        "برای کاهش ریسک جریمه الگوریتمی یا موج مسدودسازی خودکار، "
+                                        "پیج را موقتاً خصوصی کنید."
+                                    ),
+                                    username=target.instagram_username,
+                                    title="هشدار امنیتی جهش فالوور",
+                                    category="CRITICAL",
+                                    primary_label="افزایش ناگهانی",
+                                    primary_value=self._format_count(
+                                        follower_velocity_delta,
+                                        signed=True,
+                                    ),
+                                    secondary_label="بازه تشخیص",
+                                    secondary_value=self._format_duration(
+                                        elapsed_seconds
+                                    ),
+                                    accent="red",
+                                )
+                            )
                     if (
                         not effective_private
-                        and
-                        result.is_verified is not None
+                        and result.is_verified is not None
                         and snapshot.is_verified != result.is_verified
                     ):
                         verification_event = (
@@ -2178,8 +2416,7 @@ class InstagramChecker:
                             )
                     if (
                         not effective_private
-                        and
-                        picture_key
+                        and picture_key
                         and snapshot.profile_picture_key
                         and picture_key != snapshot.profile_picture_key
                     ):
@@ -2273,16 +2510,13 @@ class InstagramChecker:
                                     result.following_count
                                 ),
                                 secondary_label="مقدار قبلی",
-                                secondary_value=self._format_count(
-                                    previous_following
-                                ),
+                                secondary_value=self._format_count(previous_following),
                                 accent="blue",
                             )
                         )
                     if (
                         not effective_private
-                        and
-                        previous_full_name
+                        and previous_full_name
                         and (result.metadata_complete or result.full_name is not None)
                         and previous_full_name != current_full_name
                     ):
@@ -2314,12 +2548,8 @@ class InstagramChecker:
                         )
                     if (
                         not effective_private
-                        and
-                        snapshot.biography is not None
-                        and (
-                            result.metadata_complete
-                            or result.biography is not None
-                        )
+                        and snapshot.biography is not None
+                        and (result.metadata_complete or result.biography is not None)
                         and previous_biography != current_biography
                     ):
                         session.add(
@@ -2345,12 +2575,116 @@ class InstagramChecker:
                                 accent="blue",
                             )
                         )
+                    if result.external_link_observed:
+                        if not snapshot.external_link_initialized:
+                            snapshot.external_link_initialized = True
+                        elif previous_external_link != current_external_link:
+                            suspicious_reasons = self._malicious_link_reasons(
+                                current_external_link
+                            )
+                            reason_text = (
+                                "، ".join(suspicious_reasons)
+                                if suspicious_reasons
+                                else "الگوی مخرب شناخته‌شده‌ای دیده نشد"
+                            )
+                            session.add(
+                                PageEvent(
+                                    target_page_id=target.id,
+                                    user_id=target.user_id,
+                                    event_type="external_link_changed",
+                                    description=(
+                                        "لینک خارجی بیو تغییر کرد؛ "
+                                        f"ارزیابی: {reason_text}."
+                                    ),
+                                )
+                            )
+                            notifications.append(
+                                NotificationPayload(
+                                    message=(
+                                        "🚨 لینک خارجی بیو تغییر کرد\n\n"
+                                        f"پیج: <b>@{escaped_page}</b>\n"
+                                        f"لینک قبلی: <code>{html.escape(previous_external_link or 'نداشت')}</code>\n"
+                                        f"لینک جدید: <code>{html.escape(current_external_link or 'حذف شده')}</code>\n"
+                                        f"ارزیابی امنیتی: <b>{html.escape(reason_text)}</b>\n\n"
+                                        "اگر این تغییر را انجام نداده‌اید، دسترسی‌های پیج را فوراً بررسی کنید."
+                                    ),
+                                    username=target.instagram_username,
+                                    title="تغییر امنیتی لینک بیو",
+                                    category="CRITICAL",
+                                    primary_label="وضعیت لینک جدید",
+                                    primary_value=(
+                                        "مشکوک" if suspicious_reasons else "تغییر کرده"
+                                    ),
+                                    secondary_label="نشانه‌های خطر",
+                                    secondary_value=reason_text,
+                                    accent="red",
+                                )
+                            )
+                    if result.account_type_observed:
+                        if not snapshot.account_type_initialized:
+                            snapshot.account_type_initialized = True
+                        elif (
+                            previous_account_type
+                            in {"business", "creator", "professional"}
+                            and current_account_type == "personal"
+                        ):
+                            session.add(
+                                PageEvent(
+                                    target_page_id=target.id,
+                                    user_id=target.user_id,
+                                    event_type="professional_account_downgraded",
+                                    description=(
+                                        "نوع حساب از حالت حرفه‌ای/تجاری به شخصی تغییر کرد."
+                                    ),
+                                )
+                            )
+                            notifications.append(
+                                NotificationPayload(
+                                    message=(
+                                        "🚨 نوع حساب پیج تغییر کرد\n\n"
+                                        f"پیج: <b>@{escaped_page}</b>\n"
+                                        f"نوع قبلی: <b>{self._account_type_fa(previous_account_type)}</b>\n"
+                                        "نوع جدید: <b>شخصی</b>\n\n"
+                                        "اگر این تغییر را انجام نداده‌اید، تنظیمات حرفه‌ای و دسترسی‌های پیج را بررسی کنید."
+                                    ),
+                                    username=target.instagram_username,
+                                    title="تبدیل حساب حرفه‌ای به شخصی",
+                                    category="CRITICAL",
+                                    primary_label="نوع جدید",
+                                    primary_value="شخصی",
+                                    secondary_label="نوع قبلی",
+                                    secondary_value=self._account_type_fa(
+                                        previous_account_type
+                                    ),
+                                    accent="red",
+                                )
+                            )
+                    if result.guest_searchable is not None:
+                        if not snapshot.guest_searchable_initialized:
+                            snapshot.guest_searchable_initialized = True
+                        elif (
+                            snapshot.guest_searchable is True
+                            and result.guest_searchable is False
+                        ):
+                            session.add(
+                                PageEvent(
+                                    target_page_id=target.id,
+                                    user_id=target.user_id,
+                                    event_type="searchability_throttling_suspected",
+                                    description=(
+                                        "پیج فعال است اما در جست‌وجوی عمومی مهمان دیده نشد؛ "
+                                        "احتمال محدودسازی جست‌وجو یا Shadowban وجود دارد."
+                                    ),
+                                )
+                            )
+                            searchability_issue = True
                 if result.follower_count is not None:
                     follower_now = datetime.now(timezone.utc)
                     follower_baseline = notification_settings.follower_report_baseline
                     if (
                         follower_baseline is None
                         or not notification_settings.notify_follower_change
+                        or follower_spike_detected
                     ):
                         notification_settings.follower_report_baseline = (
                             result.follower_count
@@ -2374,7 +2708,9 @@ class InstagramChecker:
                             follower_mode != "hourly"
                             and abs(follower_delta) >= threshold
                         )
-                        if hourly_due or threshold_due:
+                        if (
+                            hourly_due or threshold_due
+                        ) and not follower_spike_detected:
                             event_type = (
                                 "follower_hourly_report"
                                 if hourly_due
@@ -2440,6 +2776,24 @@ class InstagramChecker:
                         self._normalize_text(result.biography) or None,
                         2000,
                     )
+                if result.external_link_observed:
+                    snapshot.external_link = self._truncate(
+                        self._normalize_text(result.external_link) or None,
+                        2000,
+                    )
+                    snapshot.external_link_initialized = True
+                if result.account_type_observed:
+                    snapshot.account_type = self._normalize_account_type(
+                        result.account_type
+                    )
+                    snapshot.account_type_initialized = True
+                    snapshot.category_name = self._truncate(
+                        self._normalize_text(result.category_name) or None,
+                        255,
+                    )
+                if result.guest_searchable is not None:
+                    snapshot.guest_searchable = result.guest_searchable
+                    snapshot.guest_searchable_initialized = True
                 if result.metadata_complete or result.follower_count is not None:
                     snapshot.follower_count = result.follower_count
                 if result.metadata_complete or result.following_count is not None:
@@ -2450,6 +2804,7 @@ class InstagramChecker:
                     snapshot.is_private = result.is_private
                 if result.is_verified is not None:
                     snapshot.is_verified = result.is_verified
+                snapshot.updated_at = checked_at
 
             escaped_current = html.escape(target.instagram_username)
             escaped_previous = html.escape(previous_username)
@@ -2571,9 +2926,87 @@ class InstagramChecker:
                         )
                     )
 
+            current_snapshot = await session.get(PageSnapshot, target.id)
+            session.add(
+                PageSnapshotHistory(
+                    target_page_id=target.id,
+                    user_id=target.user_id,
+                    observed_at=checked_at,
+                    status=new_status,
+                    username=self._normalize_text(target.instagram_username),
+                    follower_count=(
+                        result.follower_count
+                        if result.outcome == CheckOutcome.ACTIVE
+                        and result.follower_count is not None
+                        else (
+                            current_snapshot.follower_count
+                            if current_snapshot is not None
+                            else None
+                        )
+                    ),
+                    following_count=(
+                        result.following_count
+                        if result.outcome == CheckOutcome.ACTIVE
+                        and result.following_count is not None
+                        else (
+                            current_snapshot.following_count
+                            if current_snapshot is not None
+                            else None
+                        )
+                    ),
+                    post_count=(
+                        result.post_count
+                        if result.outcome == CheckOutcome.ACTIVE
+                        and result.post_count is not None
+                        else current_snapshot.post_count
+                        if current_snapshot
+                        else None
+                    ),
+                    external_link=(
+                        current_snapshot.external_link if current_snapshot else None
+                    ),
+                    account_type=(
+                        current_snapshot.account_type if current_snapshot else None
+                    ),
+                    guest_searchable=(
+                        current_snapshot.guest_searchable if current_snapshot else None
+                    ),
+                    evidence_source=result.source,
+                )
+            )
+            await session.flush()
+            if hasattr(session, "scalars"):
+                stale_history_ids = list(
+                    await session.scalars(
+                        select(PageSnapshotHistory.id)
+                        .where(PageSnapshotHistory.target_page_id == target.id)
+                        .order_by(
+                            PageSnapshotHistory.observed_at.desc(),
+                            PageSnapshotHistory.id.desc(),
+                        )
+                        .offset(30)
+                    )
+                )
+                if stale_history_ids:
+                    await session.execute(
+                        delete(PageSnapshotHistory).where(
+                            PageSnapshotHistory.id.in_(stale_history_ids)
+                        )
+                    )
             recipient_id = target.user_id
             await session.commit()
 
+        if searchability_issue:
+            await self.diagnostics.add(
+                level="WARNING",
+                event="searchability_throttling_suspected",
+                message="پیج فعال است اما در ممیزی جست‌وجوی مهمان دیده نشد.",
+                username=username,
+                detail=(
+                    f"target_id={target_id}; tag="
+                    "Potential Search Shadowban / Throttling"
+                ),
+            )
         await self.diagnostics.add(
             level="INFO",
             event="target_state_synchronized",
@@ -2725,6 +3158,69 @@ class InstagramChecker:
     def _format_count(value: int, *, signed: bool = False) -> str:
         formatted = f"{value:+,}" if signed else f"{value:,}"
         return formatted.translate(PERSIAN_DIGITS)
+
+    @staticmethod
+    def _format_duration(seconds: int) -> str:
+        if seconds >= 3600:
+            value = f"{seconds / 3600:.1f} ساعت"
+        elif seconds >= 60:
+            value = f"{seconds / 60:.1f} دقیقه"
+        else:
+            value = f"{seconds} ثانیه"
+        return value.replace(".0", "").translate(PERSIAN_DIGITS)
+
+    @staticmethod
+    def _normalize_account_type(value: object) -> str | None:
+        normalized = str(value or "").strip().lower()
+        aliases = {
+            "business": "business",
+            "creator": "creator",
+            "professional": "professional",
+            "personal": "personal",
+        }
+        return aliases.get(normalized)
+
+    @staticmethod
+    def _account_type_fa(value: str | None) -> str:
+        return {
+            "business": "تجاری",
+            "creator": "تولیدکننده محتوا",
+            "professional": "حرفه‌ای",
+            "personal": "شخصی",
+        }.get(value or "", "نامشخص")
+
+    @staticmethod
+    def _malicious_link_reasons(value: str | None) -> list[str]:
+        if not value:
+            return []
+        parsed = urlsplit(value)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        searchable = f"{hostname}{parsed.path}?{parsed.query}".lower()
+        reasons: list[str] = []
+        signatures = {
+            r"(?:^|[.\-_/])(login|signin|verify|verification)(?:[.\-_/]|$)": (
+                "الگوی ورود یا تأیید هویت"
+            ),
+            r"(?:casino|gambl|betting|sportsbet|jackpot)": "الگوی قمار یا شرط‌بندی",
+            r"(?:airdrop|claim[-_]?bonus|free[-_]?crypto|wallet[-_]?connect)": (
+                "الگوی جایزه یا رمزارز مشکوک"
+            ),
+            r"(?:phish|account[-_]?recovery|copyright[-_]?appeal)": (
+                "الگوی فیشینگ یا بازیابی جعلی"
+            ),
+        }
+        for pattern, label in signatures.items():
+            if re.search(pattern, searchable, flags=re.IGNORECASE):
+                reasons.append(label)
+        if hostname.startswith("xn--") or ".xn--" in hostname:
+            reasons.append("دامنه بین‌المللی رمزگذاری‌شده")
+        try:
+            ipaddress.ip_address(hostname.strip("[]"))
+        except ValueError:
+            pass
+        else:
+            reasons.append("استفاده مستقیم از نشانی آی‌پی")
+        return list(dict.fromkeys(reasons))
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> int | None:

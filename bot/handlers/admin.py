@@ -143,6 +143,7 @@ class AdminPlanEditorState(StatesGroup):
     waiting_for_name = State()
     waiting_for_days = State()
     waiting_for_price = State()
+    waiting_for_currency = State()
     waiting_for_limit = State()
 
 
@@ -446,7 +447,8 @@ async def _show_admin_plans(
             state_text = "فعال" if plan.is_active else "غیرفعال"
             lines.append(
                 f"• <b>{plan.name}</b> — {_digits(plan.duration_days)} روز — "
-                f"{_digits(f'{plan.price:,}')} تومان — {_digits(plan.target_limit)} پیج — {state_text}"
+                f"{format_money(plan.price, plan.price_currency)} — "
+                f"{_digits(plan.target_limit)} پیج — {state_text}"
             )
     else:
         lines.append("هنوز پلنی تعریف نشده است.")
@@ -548,7 +550,7 @@ async def receive_plan_days(
         return
     await state.update_data(plan_days=days)
     await state.set_state(AdminPlanEditorState.waiting_for_price)
-    await message.answer("قیمت پلن را به تومان و فقط به‌صورت عدد وارد کنید.")
+    await message.answer("قیمت پلن را فقط به‌صورت عدد وارد کنید.")
 
 
 @router.message(AdminPlanEditorState.waiting_for_price)
@@ -564,9 +566,28 @@ async def receive_plan_price(
         if not 0 <= price <= 10_000_000_000:
             raise ValueError
     except ValueError:
-        await message.answer("قیمت معتبر نیست؛ فقط عدد تومان را وارد کنید.")
+        await message.answer("قیمت معتبر نیست؛ فقط عدد را وارد کنید.")
         return
     await state.update_data(plan_price=price)
+    await state.set_state(AdminPlanEditorState.waiting_for_currency)
+    await message.answer(
+        "واحد قیمت را ارسال کنید: <code>TOMAN</code> یا <code>USD</code>"
+    )
+
+
+@router.message(AdminPlanEditorState.waiting_for_currency)
+async def receive_plan_currency(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    currency = normalize_currency(message.text)
+    if (message.text or "").strip().upper() not in {"TOMAN", "USD"}:
+        await message.answer("واحد معتبر نیست؛ فقط TOMAN یا USD ارسال کنید.")
+        return
+    await state.update_data(plan_currency=currency)
     await state.set_state(AdminPlanEditorState.waiting_for_limit)
     await message.answer(
         "حداکثر تعداد پیج این پلن را وارد کنید؛ برای Premium عدد ۱۰۰ پیشنهاد می‌شود."
@@ -600,6 +621,7 @@ async def finish_plan_editor(
             plan.name = data["plan_name"]
             plan.duration_days = data["plan_days"]
             plan.price = data["plan_price"]
+            plan.price_currency = data.get("plan_currency", "TOMAN")
             plan.target_limit = target_limit
             plan.is_active = True
             await session.commit()
@@ -2048,17 +2070,11 @@ async def begin_monitoring_account_add(
 ) -> None:
     if await _reject_callback(callback, settings):
         return
-    if not checker.credentials.available:
-        await callback.answer("رمزگذاری امن روی سرور تنظیم نشده است.", show_alert=True)
-        return
     await state.clear()
-    await state.set_state(AdminMonitoringAccountState.waiting_for_label)
-    if callback.message:
-        await callback.message.answer(
-            "یک نام داخلی برای حساب مانیتورینگ بفرستید؛ نمونه: حساب اصلی امنیت",
-            reply_markup=cancel_keyboard(),
-        )
-    await callback.answer()
+    await callback.answer(
+        "در نسخه ۵.۱.۰ دریافت توکن و حساب مانیتورینگ کاملاً غیرفعال است.",
+        show_alert=True,
+    )
 
 
 @router.message(AdminMonitoringAccountState.waiting_for_label, F.text)
@@ -2109,55 +2125,12 @@ async def monitoring_account_token(
 ) -> None:
     if await _reject_message(message, settings):
         return
-    token = (message.text or "").strip()
     with suppress(TelegramAPIError):
         await message.delete()
-    if len(token) < 20 or len(token) > 3000:
-        await message.answer("توکن از نظر طول معتبر نیست؛ دوباره ارسال کنید.")
-        return
-    data = await state.get_data()
-    instagram_user_id = str(data.get("instagram_user_id") or "")
-    healthy, error, graph_username = await checker.validate_monitoring_account(
-        instagram_user_id,
-        token,
-        force=True,
-    )
-    if not healthy:
-        await message.answer(
-            "اتصال رسمی تأیید نشد. ❌\n\n"
-            f"علت: <code>{html.escape(error[:500])}</code>\n\n"
-            "توکن یا IG User ID را اصلاح کنید و توکن را دوباره بفرستید."
-        )
-        return
-    try:
-        encrypted = checker.credentials.encrypt(token)
-    except CredentialStoreError as exc:
-        await state.clear()
-        await message.answer(f"ذخیره امن انجام نشد: <code>{html.escape(str(exc))}</code>")
-        return
-    async with session_factory() as session:
-        account = InstagramMonitoringAccount(
-            label=str(data.get("label") or graph_username or "حساب مانیتورینگ"),
-            instagram_user_id=instagram_user_id,
-            access_token_encrypted=encrypted,
-            is_active=True,
-            last_health_status="healthy",
-            last_error=None,
-            last_checked_at=datetime.now(timezone.utc),
-        )
-        session.add(account)
-        try:
-            await session.commit()
-        except IntegrityError:
-            await session.rollback()
-            await state.clear()
-            await message.answer("این IG User ID قبلاً ثبت شده است.")
-            return
     await state.clear()
     await message.answer(
-        "اتصال رسمی Meta با موفقیت آزمایش، رمزگذاری و فعال شد. ✅\n\n"
-        f"حساب متصل: <b>@{html.escape(graph_username or 'نامشخص')}</b>",
-        reply_markup=main_menu_keyboard(is_admin=True),
+        "این قابلیت در نسخه ۵.۱.۰ به‌دلیل سیاست حریم خصوصی حذف شده است؛ "
+        "هیچ توکن، کوکی یا رمز عبوری دریافت و ذخیره نمی‌شود."
     )
 
 
@@ -2170,6 +2143,11 @@ async def test_monitoring_account(
 ) -> None:
     if await _reject_callback(callback, settings):
         return
+    await callback.answer(
+        "اتصال توکنی Meta در نسخه ۵.۱.۰ غیرفعال است.",
+        show_alert=True,
+    )
+    return
     try:
         account_id = int((callback.data or "").rsplit(":", 1)[1])
     except (ValueError, IndexError):
@@ -2194,7 +2172,9 @@ async def test_monitoring_account(
     )
     if callback.message:
         await callback.message.answer(
-            "اتصال رسمی سالم است. ✅" if healthy else f"اتصال رسمی نامعتبر است. ❌\n<code>{html.escape(error[:500])}</code>"
+            "اتصال رسمی سالم است. ✅"
+            if healthy
+            else f"اتصال رسمی نامعتبر است. ❌\n<code>{html.escape(error[:500])}</code>"
         )
     await _show_monitoring_accounts(callback, checker, answer_callback=False)
 

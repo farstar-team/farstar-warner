@@ -327,9 +327,8 @@ def required_channels_keyboard(
 def purchase_plans_keyboard(plans: list[SubscriptionPlan]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     for plan in plans:
-        price = f"{plan.price:,}".replace(",", "٬")
         builder.button(
-            text=f"◈ {plan.name} — {price} تومان",
+            text=f"◈ {plan.name} — {format_money(plan.price, plan.price_currency)}",
             callback_data=f"buy:plan:{plan.id}",
         )
     builder.adjust(1)
@@ -340,6 +339,7 @@ def purchase_methods_keyboard(
     plan_id: int,
     support_username: str | None,
     card_enabled: bool,
+    zarinpal_enabled: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if card_enabled:
@@ -348,6 +348,15 @@ def purchase_methods_keyboard(
                 InlineKeyboardButton(
                     text="💳 پرداخت کارت‌به‌کارت",
                     callback_data=f"buy:card:{plan_id}",
+                )
+            ]
+        )
+    if zarinpal_enabled:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🌐 پرداخت آنلاین با زرین‌پال",
+                    callback_data=f"buy:zarinpal:{plan_id}",
                 )
             ]
         )
@@ -801,12 +810,6 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="◈ افزودن پیج هدف مدیر",
                     callback_data="admin:add_target",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🔐 حساب‌های رسمی مانیتورینگ",
-                    callback_data="admin:monitoring_accounts",
                 )
             ],
             [
