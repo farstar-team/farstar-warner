@@ -1,6 +1,6 @@
 # Farstar Warner | فارستار وارنر
 
-ربات تلگرام فارسی برای پایش وضعیت پیج‌های اینستاگرام با مسیر رسمی Meta برای حساب‌های حرفه‌ای و fallback محدودِ عمومی؛ بدون ذخیره رمز عبور یا session cookie اینستاگرام.
+ربات تلگرام فارسی برای پایش OSINT ویژگی‌های عمومی پیج‌های اینستاگرام؛ بدون دریافت یا ذخیره رمز عبور، کوکی، sessionid یا توکن Meta.
 
 [راهنمای فارسی](#راهنمای-فارسی) · [English guide](#english-guide)
 
@@ -12,14 +12,16 @@
 
 فارستار وارنر یک سامانه ناهمگام برای پایش پیج‌های عمومی اینستاگرام است. کاربران می‌توانند پیج‌های موردنظرشان را به ربات اضافه کنند و برای فعال‌شدن، دی‌اکتیوشدن یا تغییر نام کاربری آن‌ها اعلان بگیرند. تمام پیام‌ها، دکمه‌ها، هشدارها و منوهای ربات به زبان فارسی هستند.
 
-این سامانه رمز عبور یا کوکی حساب شخصی دریافت نمی‌کند. مدیر می‌تواند یک یا چند Instagram Business/Creator را با IG User ID و Instagram User Access Token رسمی Meta متصل کند؛ توکن‌ها با کلید سرور رمزگذاری می‌شوند و هرگز در پنل یا لاگ نمایش داده نمی‌شوند.
+نسخه ۵.۲.۰ کاملاً OSINT-only است و فقط داده‌هایی را تحلیل می‌کند که در Web Profile، Embed، جست‌وجوی مهمان یا HTML عمومی دیده می‌شوند. مسیر دریافت توکن حذف شده و داده‌های اتصال قدیمی هنگام مهاجرت پاک می‌شوند.
 
 ![نمونه کارت تأیید پیج](docs/profile-preview-example.jpg)
 
 ### امکانات
 
 - رابط کاربری کاملاً فارسی با `aiogram 3`
-- موتور اجماع Business Discovery، Web Profile، جست‌وجوی GraphQL و رندر عمومی Playwright
+- موتور اجماع Web Profile، جست‌وجوی مهمان، Embed و رندر عمومی Playwright
+- رادار جهش غیرعادی فالوور، تغییر لینک بیو و تبدیل حساب حرفه‌ای به شخصی
+- خط زمانی جرم‌شناسی دیجیتال با ۳۰ ارزیابی اخیر هر پیج
 - تشخیص تغییر وضعیت فعال و دی‌اکتیو
 - تنظیم جداگانه اعلان‌ها برای هر پیج
 - نمایش زنده عکس پروفایل، تعداد دنبال‌کننده، پست‌ها و عمومی یا خصوصی‌بودن پیج
@@ -28,6 +30,8 @@
 - امکان ثبت نام کاربری غیرفعال برای کاربرانی که منتظر فعال‌شدن آن هستند
 - پلن رایگان دائمی با ۱ پیج، Premium با ظرفیت پایه ۱۰۰ پیج و VIP با ظرفیت پایه ۵۰۰ پیج
 - پلن‌های مدت‌دار قابل افزودن، ویرایش و حذف با نام، قیمت، تعداد روز و ظرفیت دلخواه مدیر
+- قیمت‌گذاری پلن و محصول با تومان یا دلار و تبدیل زنده دلار آزاد بدون API پولی
+- پرداخت آنلاین زرین‌پال با Authority یکتا، تأیید دستی و تمدید idempotent اشتراک
 - عضویت اجباری در یک یا چند کانال قابل‌مدیریت از پنل مدیر
 - پرداخت از طریق آیدی پشتیبانی یا کارت‌به‌کارت با فیش یکتا و تأیید یا رد دستی مدیر
 - تشخیص و اعلان تغییر عکس پروفایل با fingerprint پایدار مسیر تصویر
@@ -63,12 +67,10 @@ flowchart LR
     B --> P[("PostgreSQL")]
     B --> R[("Redis")]
     S["APScheduler"] --> C["InstagramChecker"]
-    C --> M["Meta Graph API / Business Discovery"]
     C --> G["GraphQL username discovery"]
     C --> W["پراکسی داخلی WARP"]
     W --> H["HTTPX و curl / fallback عمومی"]
     B --> X["Chromium اختیاری برای پیش‌نمایش"]
-    M --> I["حساب حرفه‌ای اینستاگرام"]
     G --> I
     H --> I["نمای عمومی اینستاگرام"]
     X --> I
@@ -213,7 +215,7 @@ farstar update
 
 پس از نصب، وارد گفت‌وگوی ربات شوید و دستور `/start` را ارسال کنید.
 
-نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **5.0.1** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
+نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **5.2.0** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
 
 منوی اصلی شامل این گزینه‌هاست:
 
@@ -235,7 +237,7 @@ https://www.instagram.com/instagram/
 
 از دکمه `مرکز امنیت و شواهد پیج` نیز می‌توان ۱۰ ابزار دفاعی و گزارش‌گیری را اجرا کرد. خط مبنای هویت در Redis ذخیره می‌شود و اثر فعلی نام، بیوگرافی، تصویر، نوع پیج و نشان تأیید را با آن مقایسه می‌کند.
 
-هنگام افزودن یا بررسی پیج، ربات ابتدا Business Discovery رسمی را با حساب‌های مانیتورینگ سالم امتحان می‌کند. سپس Web Profile عمومی اجرا می‌شود و اگر پاسخ آن 401، ناقص یا نامعتبر باشد، جست‌وجوی مستقل GraphQL نام کاربری پیش از فعال‌شدن مدار محافظ اجرا می‌شود:
+هنگام افزودن یا بررسی پیج، ربات Web Profile عمومی را اجرا می‌کند و اگر پاسخ آن ناقص یا نامعتبر باشد، جست‌وجوی مستقل مهمان، Embed و Playwright عمومی به‌ترتیب به‌عنوان شاهدهای کمکی اجرا می‌شوند:
 
 - اگر پیج فعال باشد، نام، بیوگرافی، تصویر، دنبال‌کننده، دنبال‌شونده، تعداد پست، نوع پیج و نشان تأیید مستقیماً از JSON استخراج می‌شود. ربات اطلاعات فارسی و کارت تصویری اختصاصی را برای تأیید می‌فرستد؛ شکست ساخت یا ارسال عکس مانع نمایش متن و دکمه تأیید نمی‌شود.
 - اگر پاسخ `404` باشد، گزینه «ثبت به‌عنوان پیج غیرفعال» نمایش داده می‌شود. این پیج با وضعیت غیرفعال ذخیره می‌شود و به‌محض بازگشت پاسخ `200`، اعلان فعال‌شدن ارسال خواهد شد.
@@ -264,7 +266,6 @@ https://www.instagram.com/instagram/
 - مدیریت کاربران همراه جست‌وجوی شناسه، مشاهده اشتراک، خریدها، فیش‌ها، پیج‌ها و مسدودسازی حساب
 - کنترل مستقیم اشتراک هر کاربر، شامل تغییر پلن و روزها، تمدید سریع و بازگرداندن به پلن رایگان
 - مشاهده وضعیت Chromium، endpoint عمومی، cooldown و حالت ورود/عدم ورود
-- افزودن، تست، توقف و حذف چند اتصال رسمی Meta؛ توکن ورودی فوراً از چت حذف و در PostgreSQL رمزگذاری می‌شود
 - مشاهده مرکز لاگ فنی شامل نتیجه هر مسیر HTTPX/HTTP2 و curl، کد HTTP، زمان پاسخ، اندازه پاسخ، علت رد پاسخ و شناسه رهگیری
 - دریافت فایل UTF-8 از ۵۰۰ رخداد اخیر برای گزارش خطا و امکان پاک‌سازی لاگ با تأیید دوباره
 
@@ -285,7 +286,7 @@ https://www.instagram.com/instagram/
 
 ### منطق پایش
 
-پیش از هر چرخه، سه پیج مرجع `@instagram`، `@cristiano` و `@nasa` از مسیرهای موجود بررسی می‌شوند. اگر هیچ‌کدام شاهد فعال معتبر ندهند، کل چرخه کاربران بدون تغییر وضعیت متوقف می‌شود. حساب‌های حرفه‌ای ابتدا با Business Discovery و سپس Web Profile، جست‌وجوی GraphQL و در نهایت Playwright عمومی بررسی می‌شوند. جست‌وجو با `doc_id` مورد استفاده نسخه فعال Instaloader و تطابق دقیق username انجام می‌شود؛ پیشنهادهای مشابه پذیرفته نمی‌شوند:
+پیش از هر چرخه، پیج‌های مرجع تنظیم‌شده از مسیرهای عمومی بررسی می‌شوند. اگر هیچ‌کدام شاهد فعال معتبر ندهند، کل چرخه کاربران بدون تغییر وضعیت متوقف می‌شود. سپس Web Profile، جست‌وجوی مهمان، Embed و در نهایت Playwright عمومی با تطابق دقیق username بررسی می‌شوند؛ پیشنهادهای مشابه پذیرفته نمی‌شوند:
 
 - انتقال وضعیت از دی‌اکتیو به فعال، اعلان `پیج فعال شد! 🎉` ایجاد می‌کند.
 - انتقال وضعیت از فعال به دی‌اکتیو پس از دو شاهد قطعی با فاصله پیش‌فرض حدود ۱۵ ثانیه، اعلان `پیج دی‌اکتیو شد! ⚠️` ایجاد می‌کند.
@@ -306,24 +307,21 @@ https://www.instagram.com/instagram/
 - هدف‌ها با workerهای محدودشده توسط `CHECK_CONCURRENCY` و `queue.join()` پردازش می‌شوند؛ sentinel وجود ندارد و workerها پس از تخلیه کامل صف cancel و جمع‌آوری می‌شوند.
 - تمام تماس‌های HTTP و Playwright خارج از transaction دیتابیس انجام می‌شوند؛ session فقط برای خواندن اولیه یا commit نهایی باز می‌شود.
 - نام و بیو پیش از مقایسه با `strip` و تبدیل `None`/رشته خالی نرمال می‌شوند.
-- پاسخ `401` همراه `Please wait`، پاسخ `403` و پاسخ `429` در Web Profile ابتدا باعث اجرای GraphQL discovery می‌شوند. فقط اگر discovery نیز پاسخ قطعی ندهد، مدار محافظ عمومی تا ۱۵ دقیقه باز می‌شود؛ provider رسمی سالم همچنان ادامه می‌دهد.
+- افزایش بیش از آستانه امنیتی فالوور در یک چرخه کوتاه، هشدار قرمز حمله اسپم ایجاد می‌کند.
+- تغییر لینک خارجی بیو همراه مقدار قبلی/جدید و تحلیل محلی الگوهای فیشینگ، قمار و رمزارز گزارش می‌شود؛ ربات لینک را باز نمی‌کند.
+- تبدیل حساب تجاری/حرفه‌ای به شخصی فوراً گزارش و قطع‌شدن نمایه از جست‌وجوی مهمان در لاگ امنیتی ثبت می‌شود.
+- فقط ۳۰ ارزیابی اخیر هر پیج نگهداری می‌شود تا گزارش رشد و دسترس‌پذیری بدون رشد نامحدود دیتابیس ساخته شود.
+- پاسخ `401` همراه `Please wait`، پاسخ `403` و پاسخ `429` در Web Profile ابتدا باعث اجرای مسیرهای عمومی مستقل می‌شوند. فقط اگر همه مسیرها نامشخص باشند، مدار محافظ عمومی باز می‌شود.
 - هر چرخه و تست پنج‌دقیقه‌ای baselineهای تنظیم‌شده، مسیر اتصال و توانایی ساخت کارت تصویری را بررسی می‌کند؛ baseline نخست بهتر است یک پیج عمومی، پایدار و کم‌ترافیک متعلق به مدیر باشد.
 
 سلامت WARP فقط با Cloudflare Trace و مقدار `warp=on` سنجیده می‌شود و دیگر پاسخ 401 اینستاگرام به‌اشتباه «خرابی WARP» گزارش نمی‌شود. `warp-supervisor.sh` هنگام سه شکست واقعی Trace، همان تونل ثبت‌شده را reconnect می‌کند. برنامه برای دورزدن rate limit، ثبت حساب WARP تازه یا تعویض اجباری IP انجام نمی‌دهد و Docker socket نیز در اختیار ربات قرار نمی‌گیرد.
 
 > [!IMPORTANT]
-> اینستاگرام می‌تواند ساختار صفحات عمومی یا سیاست‌های دسترسی خود را بدون اطلاع قبلی تغییر دهد. Meta Business Discovery فقط حساب‌های حرفه‌ای Business/Creator را پوشش می‌دهد و حساب شخصی/خصوصی را تضمین نمی‌کند. fallback عمومی نیز تضمین دائمی ندارد.
+> اینستاگرام می‌تواند ساختار صفحات عمومی یا سیاست‌های دسترسی خود را بدون اطلاع قبلی تغییر دهد. هیچ روش عمومی و بدون ورود، دسترسی دائمی یا نمایش تمام فیلدهای پیج خصوصی را تضمین نمی‌کند.
 
-### اتصال حساب حرفه‌ای مدیر
+### سیاست حریم خصوصی OSINT
 
-مطابق مستندات Meta، حساب مانیتورینگ باید Instagram Business یا Creator باشد، به Facebook Page متصل شود و اپ Meta مجوزهای لازم و Instagram User Access Token داشته باشد. سپس:
-
-1. در ربات وارد «پنل مدیریت» و «حساب‌های رسمی مانیتورینگ» شوید.
-2. «افزودن اتصال رسمی Meta» را بزنید.
-3. یک نام داخلی، IG User ID عددی و توکن رسمی را ارسال کنید.
-4. ربات پیش از ذخیره، خود حساب را از Graph API آزمایش می‌کند؛ پیام توکن حذف و مقدار آن با کلید اختصاصی سرور رمزگذاری می‌شود.
-
-رمز عبور، sessionid و کوکی مرورگر در این مسیر پذیرفته یا ذخیره نمی‌شوند. می‌توانید چند حساب رسمی ثبت کنید؛ اتصال خراب کنار گذاشته می‌شود و اتصال سالم بعدی استفاده خواهد شد.
+ربات هیچ فرم یا منویی برای دریافت رمز عبور، کوکی، sessionid یا توکن Meta ندارد. داده‌های امنیتی فقط از خروجی عمومی اینستاگرام استخراج می‌شوند و لینک‌های مشکوک نیز برای تحلیل باز نمی‌شوند. مهاجرت نسخه ۵.۱.۰ رکوردهای اتصال توکنی باقی‌مانده از نسخه‌های قبلی را پاک می‌کند.
 
 ### متغیرهای محیطی
 
@@ -344,10 +342,14 @@ https://www.instagram.com/instagram/
 | `REDIS_PORT` | خیر | `6379` | پورت Redis |
 | `REDIS_DB` | خیر | `0` | شماره دیتابیس Redis |
 | `REDIS_PASSWORD` | بله | — | رمز Redis |
-| `CREDENTIAL_ENCRYPTION_KEY` | برای اتصال رسمی | ساخته‌شده توسط نصب‌کننده | کلید Fernet برای رمزگذاری توکن‌های Meta؛ پس از ثبت توکن تغییر ندهید |
-| `META_GRAPH_API_VERSION` | خیر | `v21.0` | نسخه Graph API؛ هنگام ارتقای اپ Meta قابل تغییر است |
 | `CHECK_INTERVAL_SECONDS` | خیر | `300` | فاصله اولیه بررسی‌ها؛ حداقل ۳۰ ثانیه |
 | `CHECK_CONCURRENCY` | خیر | `8` | تعداد بررسی هم‌زمان؛ بین ۱ تا ۵۰ |
+| `FOLLOWER_SPIKE_THRESHOLD` | خیر | `1000` | حداقل افزایش فالوور برای هشدار جهش امنیتی |
+| `FOLLOWER_SPIKE_WINDOW_SECONDS` | خیر | `3600` | بیشترین بازه زمانی تشخیص جهش |
+| `USD_TOMAN_FALLBACK_RATE` | خیر | `650000` | نرخ پشتیبان تومان در صورت قطع TGJU |
+| `ZARINPAL_MERCHANT_ID` | برای درگاه | — | شناسه پذیرنده زرین‌پال |
+| `ZARINPAL_CALLBACK_URL` | برای درگاه | — | نشانی HTTPS بازگشت پرداخت |
+| `ZARINPAL_TIMEOUT_SECONDS` | خیر | `15` | مهلت درخواست و تأیید زرین‌پال |
 | `DEACTIVATION_CONFIRMATIONS` | خیر | `2` | تعداد پاسخ قطعی متوالی پیش از ثبت دی‌اکتیوشدن |
 | `DEACTIVATION_CONFIRMATION_DELAY_SECONDS` | خیر | `15` | فاصله میان شواهد تأیید غیرفعال‌شدن |
 | `CHECK_JITTER_MIN_SECONDS` | خیر | `0.5` | کمترین تأخیر تصادفی |
@@ -367,6 +369,8 @@ https://www.instagram.com/instagram/
 | `PROFILE_PREVIEW_CONCURRENCY` | خیر | `2` | حداکثر رندر هم‌زمان Chromium |
 | `FREE_TRIAL_DAYS` | خیر | `7` | اعتبار اولیه کاربر جدید |
 | `LOG_LEVEL` | خیر | `INFO` | سطح ثبت رویدادها |
+
+نرخ دلار از شاخص عمومی `price_dollar_rl` در TGJU خوانده می‌شود. مقدار منبع ریال است و ربات پس از اعتبارسنجی آن را بر ۱۰ تقسیم، به تومان تبدیل و برای ۷۲۰۰ ثانیه در Redis نگهداری می‌کند. در صورت قطع منبع، مقدار `USD_TOMAN_FALLBACK_RATE` استفاده می‌شود.
 
 برای تغییر امن تنظیمات نمونه اصلی از پنل استفاده کنید؛ در پایان، پنل درباره بازسازی کانتینر سؤال می‌کند:
 
@@ -413,7 +417,7 @@ docker compose logs --tail=100 bot-app
 farstar doctor warner
 ```
 
-سپس بخش «وضعیت اتصال اینستاگرام»، «حساب‌های رسمی مانیتورینگ» و «لاگ کامل و عیب‌یابی» پنل مدیر را بررسی کنید. پاسخ `401`، `403` یا `429` به معنی ردشدن درخواست توسط اینستاگرام است، نه اثبات خرابی فایروال؛ چنین پاسخی وضعیت ذخیره‌شده پیج‌ها را تغییر نمی‌دهد.
+سپس بخش «وضعیت اتصال اینستاگرام» و «لاگ کامل و عیب‌یابی» پنل مدیر را بررسی کنید. پاسخ `401`، `403` یا `429` به معنی ردشدن درخواست توسط اینستاگرام است، نه اثبات خرابی فایروال؛ چنین پاسخی وضعیت ذخیره‌شده پیج‌ها را تغییر نمی‌دهد.
 
 مشاهده علت دقیق سلامت WARP:
 
@@ -465,13 +469,17 @@ farstar-warner/
 
 ## English guide
 
-Farstar Warner is an asynchronous Telegram bot with a multi-source evidence engine: official Meta Business Discovery, Web Profile metadata, and exact-match GraphQL username discovery. It never stores Instagram passwords or session cookies. The Telegram interface is entirely in Persian; the Ubuntu installer is in English.
+Farstar Warner is an asynchronous, OSINT-only Telegram bot using public Web Profile metadata, exact-match guest search, Embed HTML, and Playwright fallback. It never collects Instagram passwords, cookies, sessions, or Meta tokens. The Telegram interface is entirely in Persian; the Ubuntu installer is in English.
 
 ### Main features
 
 - Asynchronous Telegram UI with aiogram 3
-- Multiple encrypted Meta Business/Creator monitoring connections managed by the administrator
-- Official Business Discovery plus exact-match GraphQL discovery before opening the public circuit breaker
+- Public multi-source consensus without authenticated Instagram credentials
+- Free TGJU open-market USD/Toman retrieval with a two-hour Redis cache and safe fallback
+- Dynamic USD pricing for plans and products
+- Asynchronous Zarinpal IRT checkout with unique authorities and idempotent verification
+- Follower-spike, bio-link defacement, account-type flip, and searchability radars
+- A rolling 30-evaluation forensic timeline for every target
 - Activation and confirmed deactivation notifications with image evidence
 - Per-profile hourly or threshold-based follower reports
 - Black-and-gold bilingual live cards and image reports for monitoring events
@@ -490,7 +498,7 @@ Farstar Warner is an asynchronous Telegram bot with a multi-source evidence engi
 - Mandatory membership checks for administrator-configured Telegram channels
 - Support-contact and card-transfer checkout with duplicate-resistant receipts and manual approval
 - Stable profile-picture change detection and richer incident snapshots
-- Restricted administrator panel with admin target onboarding, official-provider health, and separated WARP/direct diagnostics
+- Restricted administrator panel with admin target onboarding and separated WARP/direct diagnostics
 - Ten defensive per-profile tools for identity baselines, audit evidence, history, risk scoring, test alerts, health, and incident reports
 - Automatic primary-administrator provisioning with a dedicated menu
 - PostgreSQL persistence and Redis coordination
@@ -531,6 +539,6 @@ Open the bot and send `/start`. The configured administrator can access the rest
 
 ### Operational note
 
-Instagram can change public behavior or apply temporary restrictions at any time. Login redirects, malformed JSON, challenge pages, and network errors never become deactivation evidence. Web Profile denial triggers independent username discovery first; the public circuit breaker opens only when both sources are inconclusive. WARP health is measured independently through Cloudflare Trace. Business Discovery covers professional Business/Creator targets, not every personal or private account.
+Instagram can change public behavior or apply temporary restrictions at any time. Login redirects, malformed JSON, challenge pages, and network errors never become deactivation evidence. Web Profile denial triggers independent public discovery and Embed checks first; the circuit breaker opens when all public sources are inconclusive. WARP health is measured independently through Cloudflare Trace.
 
 Use the software only for public profiles and in accordance with applicable law and platform terms.
