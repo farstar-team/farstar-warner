@@ -116,7 +116,6 @@ class NotificationPayload:
 
 
 class InstagramChecker:
-    BASELINE_USERNAMES = ("instagram", "cristiano", "nasa")
     LOCK_KEY = "farstar:checker:lock"
     STATUS_COOLDOWN_KEY = "farstar:checker:status-cooldown"
     DEACTIVATION_STREAK_PREFIX = "farstar:checker:deactivation-streak:"
@@ -1515,6 +1514,7 @@ class InstagramChecker:
         return False
 
     async def reference_profile_preflight(self) -> bool:
+        baseline_usernames = self.settings.baseline_usernames
         results = await asyncio.gather(
             *(
                 self.fetch_profile(
@@ -1523,13 +1523,13 @@ class InstagramChecker:
                     force_refresh=True,
                     bypass_cooldown=True,
                 )
-                for username in self.BASELINE_USERNAMES
+                for username in baseline_usernames
             ),
             return_exceptions=True,
         )
         active_results: list[tuple[str, ProfileResult]] = []
         baseline_details: list[str] = []
-        for username, result in zip(self.BASELINE_USERNAMES, results, strict=True):
+        for username, result in zip(baseline_usernames, results, strict=True):
             if isinstance(result, BaseException):
                 baseline_details.append(
                     f"@{username}=exception:{type(result).__name__}"
@@ -1555,7 +1555,7 @@ class InstagramChecker:
                 level="INFO",
                 event="baseline_consensus_succeeded",
                 message=(
-                    f"{len(active_results)} پیج از سه پیج مرجع با شاهد زنده "
+                    f"{len(active_results)} پیج از baselineهای مرجع با شاهد زنده "
                     "دیده شدند؛ چرخه پایش مجاز است."
                 ),
                 detail="; ".join(baseline_details),
@@ -1580,9 +1580,9 @@ class InstagramChecker:
         if should_alert:
             await self._notify(
                 self.settings.admin_telegram_id,
-                "آزمون سه‌گانه اینستاگرام ناموفق بود. ⚠️\n\n"
-                "هیچ‌یک از پیج‌های مرجع <b>@instagram</b>، <b>@cristiano</b> "
-                "و <b>@nasa</b> پاسخ فعال معتبر ندادند. چرخه کاربران متوقف شد "
+                "آزمون baseline اینستاگرام ناموفق بود. ⚠️\n\n"
+                "هیچ‌یک از پیج‌های مرجع تنظیم‌شده پاسخ فعال معتبر ندادند. "
+                "چرخه کاربران متوقف شد "
                 "و هیچ وضعیتی تغییر نکرد. سلامت WARP جداگانه در لاگ ثبت شده است.",
             )
         return False
@@ -2113,6 +2113,10 @@ class InstagramChecker:
 
                 snapshot = await session.get(PageSnapshot, target.id)
                 picture_key = self._profile_picture_key(result.profile_picture_url)
+                effective_private = bool(
+                    result.is_private is True
+                    or (snapshot is not None and snapshot.is_private is True)
+                )
                 if snapshot is None:
                     snapshot = PageSnapshot(
                         target_page_id=target.id,
@@ -2126,6 +2130,8 @@ class InstagramChecker:
                     previous_biography = self._normalize_text(snapshot.biography)
                     current_biography = self._normalize_text(result.biography)
                     if (
+                        not effective_private
+                        and
                         result.is_verified is not None
                         and snapshot.is_verified != result.is_verified
                     ):
@@ -2171,6 +2177,8 @@ class InstagramChecker:
                                 )
                             )
                     if (
+                        not effective_private
+                        and
                         picture_key
                         and snapshot.profile_picture_key
                         and picture_key != snapshot.profile_picture_key
@@ -2233,6 +2241,47 @@ class InstagramChecker:
                             )
                         )
                     if (
+                        snapshot.following_count is not None
+                        and result.following_count is not None
+                        and snapshot.following_count != result.following_count
+                    ):
+                        previous_following = snapshot.following_count
+                        session.add(
+                            PageEvent(
+                                target_page_id=target.id,
+                                user_id=target.user_id,
+                                event_type="following_count_changed",
+                                description=(
+                                    f"تعداد دنبال‌شونده‌ها از {previous_following} "
+                                    f"به {result.following_count} تغییر کرد."
+                                ),
+                            )
+                        )
+                        notifications.append(
+                            NotificationPayload(
+                                message=(
+                                    "تعداد دنبال‌شونده‌های پیج تغییر کرد 🔄\n\n"
+                                    f"پیج: <b>@{escaped_page}</b>\n"
+                                    f"مقدار قبلی: <code>{self._format_count(previous_following)}</code>\n"
+                                    f"مقدار جدید: <code>{self._format_count(result.following_count)}</code>"
+                                ),
+                                username=target.instagram_username,
+                                title="تعداد دنبال‌شونده‌ها تغییر کرد",
+                                category="CONTENT",
+                                primary_label="تعداد فعلی",
+                                primary_value=self._format_count(
+                                    result.following_count
+                                ),
+                                secondary_label="مقدار قبلی",
+                                secondary_value=self._format_count(
+                                    previous_following
+                                ),
+                                accent="blue",
+                            )
+                        )
+                    if (
+                        not effective_private
+                        and
                         previous_full_name
                         and (result.metadata_complete or result.full_name is not None)
                         and previous_full_name != current_full_name
@@ -2264,6 +2313,8 @@ class InstagramChecker:
                             )
                         )
                     if (
+                        not effective_private
+                        and
                         snapshot.biography is not None
                         and (
                             result.metadata_complete
@@ -2382,7 +2433,9 @@ class InstagramChecker:
                         self._normalize_text(result.full_name) or None,
                         255,
                     )
-                if result.metadata_complete or result.biography is not None:
+                if not effective_private and (
+                    result.metadata_complete or result.biography is not None
+                ):
                     snapshot.biography = self._truncate(
                         self._normalize_text(result.biography) or None,
                         2000,

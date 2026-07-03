@@ -1,18 +1,18 @@
 from __future__ import annotations
 
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.0.1"
 RELEASE_DATE = "۱۴۰۵/۰۴/۱۲"
-RELEASE_TITLE = "موتور اجماع چندمنبعی و شواهد قطعی وضعیت پیج"
+RELEASE_TITLE = "موتور اجماع مقاوم برای پیج‌های عمومی و خصوصی"
 RELEASE_NOTES = (
-    "افزودن baseline سه‌گانه @instagram، @cristiano و @nasa پیش از اهداف",
-    "تشخیص با اجماع Meta رسمی، Web Profile، GraphQL و Playwright عمومی",
+    "افزودن baseline قابل‌تنظیم با اولویت پیج عمومی کم‌ترافیک",
+    "افزودن HTTP Embed خام پیش از fallback کنترل‌شده Playwright",
+    "پشتیبانی از آمار عمومی پیج خصوصی بدون مقایسه بیوگرافی پنهان",
+    "محدودکردن delta خصوصی به نام کاربری، فالوور، فالووینگ و پست",
+    "تشخیص با اجماع Meta رسمی، Web Profile، GraphQL و Embed عمومی",
     "جلوگیری از بازشدن مدار محافظ پیش از تکمیل fallbackهای مستقل",
-    "ثبت منبع و زمان آخرین شاهد قطعی برای هر پیج در PostgreSQL",
-    "تأیید دوباره غیرفعال‌شدن با فاصله زمانی برای حذف هشدار کاذب",
     "بازنویسی worker queue بدون sentinel و با join/cancel کنترل‌شده",
     "نرمال‌سازی نام و بیو برای حذف اعلان‌های کاذب None و رشته خالی",
-    "حذف سقف polling و بازنویسی سبک سرویس پیش‌نمایش مرورگر",
 )
 RELEASE_REDIS_KEY = "farstar:release:notified-version"
 

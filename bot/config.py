@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     instagram_base_url: str = "https://www.instagram.com"
     instagram_proxy_url: str | None = None
     instagram_search_doc_id: str = "26347858941511777"
+    instagram_baseline_usernames: str = "farstar_vpn,instagram,nasa"
     meta_graph_base_url: str = "https://graph.facebook.com"
     meta_graph_api_version: str = "v21.0"
     credential_encryption_key: SecretStr | None = None
@@ -94,6 +95,29 @@ class Settings(BaseSettings):
         if not normalized.isdigit() or len(normalized) > 32:
             raise ValueError("instagram_search_doc_id must be numeric")
         return normalized
+
+    @field_validator("instagram_baseline_usernames")
+    @classmethod
+    def validate_instagram_baselines(cls, value: str) -> str:
+        usernames = [item.strip().lower().lstrip("@") for item in value.split(",")]
+        usernames = [item for item in usernames if item]
+        if not 1 <= len(usernames) <= 5:
+            raise ValueError("instagram_baseline_usernames must contain 1 to 5 names")
+        for username in usernames:
+            if (
+                len(username) > 30
+                or ".." in username
+                or not all(
+                    char.isascii() and (char.isalnum() or char in "._")
+                    for char in username
+                )
+            ):
+                raise ValueError("instagram baseline username is invalid")
+        return ",".join(dict.fromkeys(usernames))
+
+    @property
+    def baseline_usernames(self) -> tuple[str, ...]:
+        return tuple(self.instagram_baseline_usernames.split(","))
 
     @field_validator("proxy_health_url")
     @classmethod

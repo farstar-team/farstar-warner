@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
+import re
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -64,6 +66,19 @@ class ProfilePreviewService:
             trust_env=False,
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
+        self._embed_http = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
+            follow_redirects=False,
+            trust_env=False,
+            proxy=settings.instagram_proxy_url,
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+        )
+        self._embed_direct_http = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
+            follow_redirects=False,
+            trust_env=False,
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
+        )
 
     async def close(self) -> None:
         if self._browser is not None:
@@ -75,6 +90,8 @@ class ProfilePreviewService:
                 await self._playwright.stop()
             self._playwright = None
         await self._http.aclose()
+        await self._embed_http.aclose()
+        await self._embed_direct_http.aclose()
 
     async def browser_health(self) -> tuple[bool, str | None]:
         try:
@@ -87,9 +104,14 @@ class ProfilePreviewService:
     async def probe_status(self, username: str) -> ProfileResult:
         profile = await self.inspect(username, use_cache=False)
         if profile.outcome == PreviewOutcome.ACTIVE:
+            source = (
+                "http_public_embed"
+                if profile.diagnostic == "http_embed"
+                else "playwright_public_embed"
+            )
             return ProfileResult(
                 CheckOutcome.ACTIVE,
-                source="playwright_public_embed",
+                source=source,
                 metadata_complete=False,
                 canonical_username=profile.username.lower(),
                 full_name=self._normalize_text(profile.full_name),
@@ -103,9 +125,14 @@ class ProfilePreviewService:
                 http_status=200,
             )
         if profile.outcome == PreviewOutcome.DEACTIVATED:
+            source = (
+                "http_embed_explicit_absence"
+                if (profile.diagnostic or "").startswith("http_embed")
+                else "playwright_explicit_absence"
+            )
             return ProfileResult(
                 CheckOutcome.DEACTIVATED,
-                source="playwright_explicit_absence",
+                source=source,
                 http_status=404,
             )
         return ProfileResult(
@@ -127,7 +154,9 @@ class ProfilePreviewService:
                     await self.redis.delete(cache_key)
 
         async with self._semaphore:
-            profile = await self._inspect_with_browser(normalized_username)
+            profile = await self._inspect_with_http(normalized_username)
+            if profile.outcome == PreviewOutcome.UNKNOWN:
+                profile = await self._inspect_with_browser(normalized_username)
         if profile.outcome == PreviewOutcome.ACTIVE:
             payload = asdict(profile)
             payload["outcome"] = profile.outcome.value
@@ -137,6 +166,154 @@ class ProfilePreviewService:
                 ex=self.settings.profile_preview_cache_seconds,
             )
         return profile
+
+    async def _inspect_with_http(self, username: str) -> EmbedProfile:
+        clients = (
+            (("proxy", self._embed_http), ("direct", self._embed_direct_http))
+            if self.settings.instagram_proxy_url
+            else (("direct", self._embed_direct_http),)
+        )
+        diagnostics: list[str] = []
+        url = f"{self.settings.instagram_base_url}/{username}/embed/"
+        for route, client in clients:
+            try:
+                response = await client.get(
+                    url,
+                    headers={
+                        "User-Agent": USER_AGENTS[0],
+                        "Accept": "text/html,application/xhtml+xml",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Referer": "https://www.instagram.com/",
+                    },
+                )
+            except httpx.HTTPError as exc:
+                diagnostics.append(f"{route}:{type(exc).__name__}")
+                continue
+            diagnostics.append(f"{route}:http_{response.status_code}")
+            if response.status_code == 404:
+                return EmbedProfile(
+                    PreviewOutcome.DEACTIVATED,
+                    username=username,
+                    diagnostic="http_embed_404",
+                )
+            if response.status_code != 200:
+                continue
+            if len(response.content) > self.MAX_AVATAR_BYTES:
+                diagnostics.append(f"{route}:body_too_large")
+                continue
+            profile = self._parse_embed_html(response.text, username)
+            if profile is not None:
+                return profile
+        return EmbedProfile(
+            PreviewOutcome.UNKNOWN,
+            username=username,
+            diagnostic="embed_" + "_".join(diagnostics[-4:]),
+        )
+
+    @classmethod
+    def _parse_embed_html(
+        cls,
+        raw_html: str,
+        username: str,
+    ) -> EmbedProfile | None:
+        lowered = raw_html.lower()
+        if any(
+            marker in lowered
+            for marker in (
+                "sorry, this page isn't available",
+                "page isn't available",
+                "page not found",
+            )
+        ):
+            return EmbedProfile(
+                PreviewOutcome.DEACTIVATED,
+                username=username,
+                diagnostic="http_embed_not_available",
+            )
+        if "accounts/login" in lowered and username.lower() not in lowered:
+            return None
+
+        metadata: dict[str, str] = {}
+        for tag in re.findall(r"<meta\b[^>]*>", raw_html, flags=re.IGNORECASE):
+            attributes = {
+                key.lower(): html.unescape(value)
+                for key, _, value in re.findall(
+                    r"([:\w-]+)\s*=\s*(['\"])(.*?)\2",
+                    tag,
+                    flags=re.DOTALL,
+                )
+            }
+            key = attributes.get("property") or attributes.get("name")
+            content = attributes.get("content")
+            if key and content:
+                metadata[key.lower()] = content.strip()
+
+        title = metadata.get("og:title", "")
+        description = metadata.get("og:description", "")
+        visible = html.unescape(
+            re.sub(r"<[^>]+>", " ", raw_html, flags=re.DOTALL)
+        )
+        combined = f"{title}\n{description}\n{visible[:200_000]}"
+        exact_patterns = (
+            rf"(?<![\w.])@{re.escape(username)}(?![\w.])",
+            rf'\"username\"\s*:\s*\"{re.escape(username)}\"',
+        )
+        if not any(re.search(pattern, combined, re.IGNORECASE) for pattern in exact_patterns):
+            return None
+
+        def metric(label: str) -> int | None:
+            match = re.search(
+                rf"([\d.,]+\s*[KMB]?)\s+{label}\b",
+                combined,
+                flags=re.IGNORECASE,
+            )
+            return cls._parse_metric(match.group(1)) if match else None
+
+        full_name: str | None = None
+        name_match = re.search(
+            rf"^\s*(.*?)\s*\(@{re.escape(username)}\)",
+            title,
+            flags=re.IGNORECASE,
+        )
+        if name_match:
+            full_name = cls._normalize_text(name_match.group(1))
+        private_marker = bool(
+            "this account is private" in lowered
+            or re.search(r'\"is_private\"\s*:\s*true', raw_html, re.IGNORECASE)
+        )
+        return EmbedProfile(
+            PreviewOutcome.ACTIVE,
+            username=username.lower(),
+            full_name=full_name,
+            biography=None,
+            profile_picture_url=metadata.get("og:image"),
+            follower_count=metric("followers"),
+            following_count=metric("following"),
+            post_count=metric("posts"),
+            is_private=True if private_marker else None,
+            is_verified=bool(
+                re.search(r'\"is_verified\"\s*:\s*true', raw_html, re.IGNORECASE)
+            ),
+            diagnostic="http_embed",
+        )
+
+    @staticmethod
+    def _parse_metric(value: str) -> int | None:
+        normalized = value.replace(",", "").replace(" ", "").upper()
+        multiplier = 1
+        if normalized.endswith("B"):
+            multiplier = 1_000_000_000
+            normalized = normalized[:-1]
+        elif normalized.endswith("M"):
+            multiplier = 1_000_000
+            normalized = normalized[:-1]
+        elif normalized.endswith("K"):
+            multiplier = 1_000
+            normalized = normalized[:-1]
+        try:
+            return round(float(normalized) * multiplier)
+        except ValueError:
+            return None
 
     async def render_card(self, profile: EmbedProfile) -> bytes:
         avatar_bytes: bytes | None = None

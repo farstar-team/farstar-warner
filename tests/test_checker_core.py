@@ -16,10 +16,12 @@ from bot.credential_store import CredentialStore
 from bot.models import (
     Base,
     NotificationSettings,
+    PageSnapshot,
     PageStatus,
     TargetPage,
     User,
 )
+from bot.profile_preview import PreviewOutcome, ProfilePreviewService
 
 
 def _settings(key: str) -> Settings:
@@ -399,7 +401,10 @@ async def test_three_profile_baseline_accepts_one_verified_active_result() -> No
     checker.redis = Redis()
     checker.diagnostics = Diagnostics()
     checker._notify = AsyncMock()
-    checker.settings = SimpleNamespace(admin_telegram_id=999)
+    checker.settings = SimpleNamespace(
+        admin_telegram_id=999,
+        baseline_usernames=("instagram", "cristiano", "nasa"),
+    )
 
     assert await checker.reference_profile_preflight() is True
     assert checker.fetch_profile.await_count == 3
@@ -410,3 +415,130 @@ def test_text_delta_normalization_coerces_none_and_empty_string() -> None:
     assert InstagramChecker._normalize_text(None) == ""
     assert InstagramChecker._normalize_text("") == ""
     assert InstagramChecker._normalize_text("  Name  ") == "Name"
+
+
+def test_embed_html_parser_extracts_private_profile_metrics() -> None:
+    raw_html = """
+    <html><head>
+      <meta property="og:title" content="Private User (@private.user) • Instagram" />
+      <meta property="og:description" content="137 Followers, 158 Following, 12 Posts" />
+      <meta property="og:image" content="https://example.invalid/avatar.jpg" />
+    </head><body>@private.user This account is private "is_private":true</body></html>
+    """
+
+    profile = ProfilePreviewService._parse_embed_html(raw_html, "private.user")
+
+    assert profile is not None
+    assert profile.outcome is PreviewOutcome.ACTIVE
+    assert profile.is_private is True
+    assert profile.follower_count == 137
+    assert profile.following_count == 158
+    assert profile.post_count == 12
+    assert profile.biography is None
+
+
+@pytest.mark.asyncio
+async def test_private_profile_skips_bio_name_picture_and_badge_deltas() -> None:
+    target = TargetPage(
+        id=11,
+        instagram_username="private.user",
+        user_id=123,
+        last_known_status=PageStatus.ACTIVE,
+        last_known_id="555",
+        status_confirmed=True,
+        consecutive_active_checks=2,
+        consecutive_deactivated_checks=0,
+    )
+    owner = User(telegram_id=123)
+    owner.admin_report_copy = False
+    owner.admin_report_categories = ""
+    notification = NotificationSettings(user_id=123, target_page_id=11)
+    notification.notify_follower_change = False
+    notification.notify_verification_change = True
+    notification.follower_report_baseline = 100
+    snapshot = PageSnapshot(
+        target_page_id=11,
+        user_id=123,
+        profile_picture_key="/old.jpg",
+        profile_picture_url="https://example.invalid/old.jpg",
+        full_name="Old Name",
+        biography="Old private biography",
+        follower_count=100,
+        following_count=50,
+        post_count=10,
+        is_private=True,
+        is_verified=True,
+    )
+
+    class Session:
+        async def __aenter__(self) -> "Session":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def get(self, model: object, _: object) -> object | None:
+            return {
+                TargetPage: target,
+                User: owner,
+                NotificationSettings: notification,
+                PageSnapshot: snapshot,
+            }.get(model)
+
+        async def scalar(self, _: object) -> TargetPage:
+            return target
+
+        def add(self, _: object) -> None:
+            return None
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    class Redis:
+        async def delete(self, *_: object) -> None:
+            return None
+
+    class Diagnostics:
+        async def add(self, **_: object) -> None:
+            return None
+
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.session_factory = Session
+    checker.redis = Redis()
+    checker.diagnostics = Diagnostics()
+    checker.settings = SimpleNamespace(
+        deactivation_confirmations=2,
+        deactivation_confirmation_delay_seconds=0,
+        admin_telegram_id=999,
+    )
+    checker.fetch_profile = AsyncMock(
+        return_value=ProfileResult(
+            CheckOutcome.ACTIVE,
+            source="http_public_embed",
+            metadata_complete=True,
+            canonical_username="private.user",
+            profile_id="555",
+            full_name="New Name",
+            biography=None,
+            profile_picture_url="https://example.invalid/new.jpg",
+            follower_count=100,
+            following_count=51,
+            post_count=10,
+            is_private=True,
+            is_verified=False,
+            http_status=200,
+        )
+    )
+    checker._notify = AsyncMock()
+
+    await checker._check_target(target.id)
+
+    assert snapshot.biography == "Old private biography"
+    assert snapshot.full_name == "New Name"
+    checker._notify.assert_awaited_once()
+    notification_payload = checker._notify.await_args.args[1]
+    assert notification_payload.category == "CONTENT"
+    assert "دنبال‌شونده" in notification_payload.message
