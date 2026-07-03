@@ -62,7 +62,13 @@ from bot.models import (
     UserSubscription,
     PlanTier,
 )
-from bot.money import format_money, normalize_currency
+from bot.money import (
+    USD_RATE_CACHE_KEY,
+    USD_RATE_FALLBACK_KEY,
+    fetch_live_usd_rate,
+    format_money,
+    normalize_currency,
+)
 from bot.profile_preview import PreviewOutcome, ProfilePreviewService
 from bot.reporting import (
     ADMIN_REPORT_KEYS,
@@ -151,6 +157,9 @@ class AdminPaymentState(StatesGroup):
     waiting_for_support = State()
     waiting_for_card_number = State()
     waiting_for_card_holder = State()
+    waiting_for_zarinpal_merchant = State()
+    waiting_for_zarinpal_callback = State()
+    waiting_for_usd_fallback = State()
 
 
 class AdminDiscountState(StatesGroup):
@@ -217,10 +226,14 @@ async def _reject_callback(callback: CallbackQuery, settings: Settings) -> bool:
         AdminPlanEditorState.waiting_for_name,
         AdminPlanEditorState.waiting_for_days,
         AdminPlanEditorState.waiting_for_price,
+        AdminPlanEditorState.waiting_for_currency,
         AdminPlanEditorState.waiting_for_limit,
         AdminPaymentState.waiting_for_support,
         AdminPaymentState.waiting_for_card_number,
         AdminPaymentState.waiting_for_card_holder,
+        AdminPaymentState.waiting_for_zarinpal_merchant,
+        AdminPaymentState.waiting_for_zarinpal_callback,
+        AdminPaymentState.waiting_for_usd_fallback,
         AdminDiscountState.waiting_for_code,
         AdminDiscountState.waiting_for_percent,
         AdminDiscountState.waiting_for_max_uses,
@@ -661,11 +674,22 @@ async def admin_payment_config(
     callback: CallbackQuery,
     settings: Settings,
     session_factory: SessionFactory,
+    redis: Redis,
 ) -> None:
     if await _reject_callback(callback, settings):
         return
     async with session_factory() as session:
         payment = await session.get(PaymentConfig, 1)
+    configured_fallback = await redis.get(USD_RATE_FALLBACK_KEY)
+    cached_live_rate = await redis.get(USD_RATE_CACHE_KEY)
+    try:
+        fallback_rate = int(configured_fallback or settings.usd_toman_fallback_rate)
+    except (TypeError, ValueError):
+        fallback_rate = settings.usd_toman_fallback_rate
+    try:
+        live_rate = int(cached_live_rate) if cached_live_rate else None
+    except (TypeError, ValueError):
+        live_rate = None
     support = (
         html.escape(payment.support_username)
         if payment and payment.support_username
@@ -681,13 +705,31 @@ async def admin_payment_config(
         if payment and payment.card_holder
         else "ثبت نشده"
     )
+    merchant = (
+        f"{html.escape(payment.zarinpal_merchant_id[:8])}…"
+        f"{html.escape(payment.zarinpal_merchant_id[-4:])}"
+        if payment and payment.zarinpal_merchant_id
+        else "ثبت نشده"
+    )
+    callback_url = (
+        html.escape(payment.zarinpal_callback_url)
+        if payment and payment.zarinpal_callback_url
+        else "ثبت نشده"
+    )
+    zarinpal_enabled = bool(payment and payment.zarinpal_enabled)
+    zarinpal_status = "فعال 🟢" if zarinpal_enabled else "غیرفعال 🔴"
     if callback.message:
         await callback.message.edit_text(
             "تنظیمات پرداخت 💳\n\n"
             f"آیدی پشتیبانی: <b>{support}</b>\n"
             f"شماره کارت: <code>{card}</code>\n"
-            f"نام صاحب کارت: <b>{holder}</b>",
-            reply_markup=payment_config_keyboard(),
+            f"نام صاحب کارت: <b>{holder}</b>\n\n"
+            f"وضعیت زرین‌پال: <b>{zarinpal_status}</b>\n"
+            f"شناسه پذیرنده: <code>{merchant}</code>\n"
+            f"آدرس بازگشت: <code>{callback_url}</code>\n\n"
+            f"نرخ پشتیبان دلار: <b>{format_money(fallback_rate, 'TOMAN')}</b>\n"
+            f"آخرین نرخ زنده: <b>{format_money(live_rate, 'TOMAN') if live_rate else 'هنوز دریافت نشده'}</b>",
+            reply_markup=payment_config_keyboard(zarinpal_enabled),
         )
     await callback.answer()
 
@@ -797,6 +839,193 @@ async def finish_card_edit(
     await message.answer(
         "مشخصات کارت ذخیره شد. ✅", reply_markup=main_menu_keyboard(is_admin=True)
     )
+
+
+@router.callback_query(F.data == "admin:payment:zarinpal:merchant")
+async def begin_zarinpal_merchant_edit(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.set_state(AdminPaymentState.waiting_for_zarinpal_merchant)
+    if callback.message:
+        await callback.message.answer(
+            "شناسه پذیرنده زرین‌پال را ارسال کنید.",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminPaymentState.waiting_for_zarinpal_merchant)
+async def finish_zarinpal_merchant_edit(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    merchant_id = (message.text or "").strip()
+    if (
+        not 10 <= len(merchant_id) <= 100
+        or not merchant_id.isascii()
+        or not merchant_id.replace("-", "").isalnum()
+    ):
+        await message.answer(
+            "شناسه پذیرنده معتبر نیست؛ مقدار پنل زرین‌پال را وارد کنید."
+        )
+        return
+    async with session_factory() as session:
+        payment = await session.get(PaymentConfig, 1)
+        if payment is None:
+            payment = PaymentConfig(id=1)
+            session.add(payment)
+        payment.zarinpal_merchant_id = merchant_id
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        "شناسه پذیرنده زرین‌پال ذخیره شد. ✅",
+        reply_markup=main_menu_keyboard(is_admin=True),
+    )
+
+
+@router.callback_query(F.data == "admin:payment:zarinpal:callback")
+async def begin_zarinpal_callback_edit(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.set_state(AdminPaymentState.waiting_for_zarinpal_callback)
+    if callback.message:
+        await callback.message.answer(
+            "آدرس HTTPS بازگشت زرین‌پال را ارسال کنید.\n"
+            "نمونه: <code>https://example.com/payment/callback</code>",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminPaymentState.waiting_for_zarinpal_callback)
+async def finish_zarinpal_callback_edit(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    callback_url = (message.text or "").strip()
+    if (
+        not callback_url.startswith("https://")
+        or len(callback_url) > 1000
+        or any(char.isspace() for char in callback_url)
+    ):
+        await message.answer("آدرس بازگشت باید یک URL عمومی و معتبر HTTPS باشد.")
+        return
+    async with session_factory() as session:
+        payment = await session.get(PaymentConfig, 1)
+        if payment is None:
+            payment = PaymentConfig(id=1)
+            session.add(payment)
+        payment.zarinpal_callback_url = callback_url
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        "آدرس بازگشت زرین‌پال ذخیره شد. ✅",
+        reply_markup=main_menu_keyboard(is_admin=True),
+    )
+
+
+@router.callback_query(F.data == "admin:payment:zarinpal:toggle")
+async def toggle_zarinpal_gateway(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+    redis: Redis,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    error: str | None = None
+    async with session_factory() as session:
+        payment = await session.get(PaymentConfig, 1)
+        if payment is None:
+            payment = PaymentConfig(id=1)
+            session.add(payment)
+        if not payment.zarinpal_enabled and (
+            not payment.zarinpal_merchant_id or not payment.zarinpal_callback_url
+        ):
+            error = "ابتدا شناسه پذیرنده و آدرس بازگشت زرین‌پال را ثبت کنید."
+        else:
+            payment.zarinpal_enabled = not payment.zarinpal_enabled
+            await session.commit()
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    await admin_payment_config(callback, settings, session_factory, redis)
+
+
+@router.callback_query(F.data == "admin:payment:currency:fallback")
+async def begin_usd_fallback_edit(
+    callback: CallbackQuery,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.set_state(AdminPaymentState.waiting_for_usd_fallback)
+    if callback.message:
+        await callback.message.answer(
+            "نرخ پشتیبان هر دلار را به تومان و فقط به‌صورت عدد ارسال کنید.\n"
+            "این مقدار فقط هنگام قطع منبع زنده استفاده می‌شود.",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminPaymentState.waiting_for_usd_fallback)
+async def finish_usd_fallback_edit(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+    redis: Redis,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    try:
+        rate = _parse_integer(message.text)
+        if not 10_000 <= rate <= 10_000_000:
+            raise ValueError
+    except ValueError:
+        await message.answer("نرخ باید عددی بین ۱۰٬۰۰۰ تا ۱۰٬۰۰۰٬۰۰۰ تومان باشد.")
+        return
+    await redis.set(USD_RATE_FALLBACK_KEY, str(rate))
+    await state.clear()
+    await message.answer(
+        f"نرخ پشتیبان روی <b>{format_money(rate, 'TOMAN')}</b> تنظیم شد. ✅",
+        reply_markup=main_menu_keyboard(is_admin=True),
+    )
+
+
+@router.callback_query(F.data == "admin:payment:currency:refresh")
+async def refresh_live_usd_rate(
+    callback: CallbackQuery,
+    settings: Settings,
+    redis: Redis,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await callback.answer("در حال دریافت نرخ زنده…")
+    await redis.delete(USD_RATE_CACHE_KEY)
+    rate = await fetch_live_usd_rate(redis)
+    if callback.message:
+        await callback.message.answer(
+            f"نرخ فعلی دلار آزاد: <b>{format_money(rate, 'TOMAN')}</b> ✅\n"
+            "این نرخ برای دو ساعت در Redis ذخیره شد."
+        )
 
 
 @router.callback_query(F.data == "admin:receipts")

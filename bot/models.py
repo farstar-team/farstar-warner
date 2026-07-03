@@ -455,6 +455,11 @@ class PaymentConfig(Base):
     support_username: Mapped[str | None] = mapped_column(String(64))
     card_number: Mapped[str | None] = mapped_column(String(32))
     card_holder: Mapped[str | None] = mapped_column(String(100))
+    zarinpal_merchant_id: Mapped[str | None] = mapped_column(String(100))
+    zarinpal_callback_url: Mapped[str | None] = mapped_column(String(1000))
+    zarinpal_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -546,6 +551,7 @@ class PaymentInvoice(Base):
         index=True,
     )
     discount_amount: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    zarinpal_merchant_id: Mapped[str] = mapped_column(String(100), nullable=False)
     zarinpal_authority: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True
     )

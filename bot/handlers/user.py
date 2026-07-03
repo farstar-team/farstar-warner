@@ -152,6 +152,23 @@ def _zarinpal_payment_keyboard(
     )
 
 
+def _active_zarinpal_config(
+    payment: PaymentConfig | None,
+    settings: Settings,
+    provider: ZarinpalProvider,
+) -> tuple[str, str] | None:
+    if payment is not None:
+        merchant_id = (payment.zarinpal_merchant_id or "").strip()
+        callback_url = (payment.zarinpal_callback_url or "").strip()
+        if payment.zarinpal_enabled and merchant_id and callback_url:
+            return merchant_id, callback_url
+        return None
+    callback_url = (settings.zarinpal_callback_url or "").strip()
+    if provider.enabled and callback_url:
+        return provider.merchant_id, callback_url
+    return None
+
+
 class AddPageState(StatesGroup):
     waiting_for_username = State()
     waiting_for_confirmation = State()
@@ -1889,6 +1906,7 @@ async def purchase_plan_details(
     if plan is None or not plan.is_active:
         await callback.answer("این پلن دیگر فعال نیست.", show_alert=True)
         return
+    zarinpal_config = _active_zarinpal_config(payment, settings, zarinpal_provider)
     toman_amount, live_rate = await _amount_in_toman(
         plan.price,
         plan.price_currency,
@@ -1916,7 +1934,7 @@ async def purchase_plan_details(
                 plan.id,
                 payment.support_username if payment else None,
                 bool(payment and payment.card_number),
-                bool(zarinpal_provider.enabled and settings.zarinpal_callback_url),
+                zarinpal_config is not None,
             ),
         )
     await callback.answer()
@@ -2003,6 +2021,7 @@ async def apply_discount_code(
     if not valid or plan is None or discount is None:
         await message.answer("کد تخفیف نامعتبر، منقضی یا قبلاً استفاده‌شده است.")
         return
+    zarinpal_config = _active_zarinpal_config(payment, settings, zarinpal_provider)
     discount_amount = plan.price * discount.percent // 100
     final_amount = max(0, plan.price - discount_amount)
     final_toman, live_rate = await _amount_in_toman(
@@ -2029,7 +2048,7 @@ async def apply_discount_code(
             plan.id,
             payment.support_username if payment else None,
             bool(payment and payment.card_number),
-            bool(zarinpal_provider.enabled and settings.zarinpal_callback_url),
+            zarinpal_config is not None,
         ),
     )
 
@@ -2100,10 +2119,6 @@ async def begin_zarinpal_payment(
     except ValueError:
         await callback.answer("درخواست پرداخت نامعتبر است.", show_alert=True)
         return
-    if not zarinpal_provider.enabled or not settings.zarinpal_callback_url:
-        await callback.answer("درگاه زرین‌پال تنظیم نشده است.", show_alert=True)
-        return
-
     state_data = await state.get_data()
     requested_discount_id = (
         state_data.get("purchase_discount_code_id")
@@ -2113,6 +2128,7 @@ async def begin_zarinpal_payment(
     now = datetime.now(timezone.utc)
     async with session_factory() as session:
         plan = await session.get(SubscriptionPlan, plan_id)
+        payment = await session.get(PaymentConfig, 1)
         discount = (
             await session.get(DiscountCode, requested_discount_id)
             if isinstance(requested_discount_id, int)
@@ -2162,6 +2178,11 @@ async def begin_zarinpal_payment(
     if plan_data is None:
         await callback.answer("این پلن دیگر فعال نیست.", show_alert=True)
         return
+    zarinpal_config = _active_zarinpal_config(payment, settings, zarinpal_provider)
+    if zarinpal_config is None:
+        await callback.answer("درگاه زرین‌پال تنظیم یا فعال نشده است.", show_alert=True)
+        return
+    merchant_id, configured_callback_url = zarinpal_config
 
     discount_amount = plan_data["price"] * plan_data["discount_percent"] // 100
     payable_original = max(0, plan_data["price"] - discount_amount)
@@ -2204,6 +2225,7 @@ async def begin_zarinpal_payment(
                 amount_toman=amount_toman,
                 discount_code_id=plan_data["discount_id"],
                 discount_amount=discount_amount,
+                zarinpal_merchant_id=merchant_id,
                 is_paid=False,
             )
             session.add(invoice)
@@ -2220,13 +2242,14 @@ async def begin_zarinpal_payment(
         payment_url = zarinpal_provider.START_PAY_URL.format(authority=authority)
     else:
         callback_url = _zarinpal_callback_url(
-            settings.zarinpal_callback_url,
+            configured_callback_url,
             invoice_id,
         )
         authority, payment_url = await zarinpal_provider.request_payment(
             amount_toman,
             f"خرید اشتراک {plan_data['name']} - فاکتور {invoice_id}",
             callback_url,
+            merchant_id=merchant_id,
         )
         if authority is None or payment_url is None:
             async with session_factory() as session:
@@ -2298,6 +2321,7 @@ async def verify_zarinpal_payment(
                 "is_paid": invoice.is_paid,
                 "authority": invoice.zarinpal_authority,
                 "amount": invoice.amount_toman,
+                "merchant_id": invoice.zarinpal_merchant_id,
             }
     if invoice_data is None:
         await callback.answer("فاکتور پیدا نشد.", show_alert=True)
@@ -2312,6 +2336,7 @@ async def verify_zarinpal_payment(
     verified, ref_id = await zarinpal_provider.verify_payment(
         invoice_data["amount"],
         invoice_data["authority"],
+        merchant_id=invoice_data["merchant_id"],
     )
     if not verified:
         await callback.answer(

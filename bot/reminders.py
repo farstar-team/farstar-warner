@@ -10,11 +10,18 @@ from sqlalchemy import select
 
 from bot.database import SessionFactory
 from bot.keyboards.inline import expiry_reminder_keyboard
-from bot.models import SubscriptionReminderPreference, User, UserSubscription, UserStatus
+from bot.models import (
+    SubscriptionReminderPreference,
+    User,
+    UserSubscription,
+    UserStatus,
+)
 from bot.time_utils import format_datetime_dual, to_persian_digits
 
 
 logger = logging.getLogger(__name__)
+
+
 async def send_expiry_reminders(bot: Bot, session_factory: SessionFactory) -> None:
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -60,7 +67,9 @@ async def send_expiry_reminders(bot: Bot, session_factory: SessionFactory) -> No
                     reply_markup=expiry_reminder_keyboard(),
                 )
             except TelegramAPIError as exc:
-                logger.warning("Could not send expiry reminder to %s: %s", user.telegram_id, exc)
+                logger.warning(
+                    "Could not send expiry reminder to %s: %s", user.telegram_id, exc
+                )
                 continue
             if preference is None:
                 preference = SubscriptionReminderPreference(user_id=user.telegram_id)

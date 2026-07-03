@@ -96,6 +96,14 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 "price_currency VARCHAR(8) NOT NULL DEFAULT 'TOMAN'",
                 "ALTER TABLE subscription_plans ADD COLUMN IF NOT EXISTS "
                 "price_currency VARCHAR(8) NOT NULL DEFAULT 'TOMAN'",
+                "ALTER TABLE payment_config ADD COLUMN IF NOT EXISTS "
+                "zarinpal_merchant_id VARCHAR(100) NULL",
+                "ALTER TABLE payment_config ADD COLUMN IF NOT EXISTS "
+                "zarinpal_callback_url VARCHAR(1000) NULL",
+                "ALTER TABLE payment_config ADD COLUMN IF NOT EXISTS "
+                "zarinpal_enabled BOOLEAN NOT NULL DEFAULT FALSE",
+                "ALTER TABLE payment_invoices ADD COLUMN IF NOT EXISTS "
+                "zarinpal_merchant_id VARCHAR(100) NULL",
             )
             for statement in migrations:
                 await connection.execute(text(statement))
@@ -269,6 +277,44 @@ async def initialize_database(engine: AsyncEngine) -> None:
                     text(
                         "ALTER TABLE subscription_plans ADD COLUMN price_currency "
                         "VARCHAR(8) NOT NULL DEFAULT 'TOMAN'"
+                    )
+                )
+            payment_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(text("PRAGMA table_info(payment_config)"))
+                ).all()
+            }
+            payment_migrations = {
+                "zarinpal_merchant_id": (
+                    "ALTER TABLE payment_config ADD COLUMN "
+                    "zarinpal_merchant_id VARCHAR(100) NULL"
+                ),
+                "zarinpal_callback_url": (
+                    "ALTER TABLE payment_config ADD COLUMN "
+                    "zarinpal_callback_url VARCHAR(1000) NULL"
+                ),
+                "zarinpal_enabled": (
+                    "ALTER TABLE payment_config ADD COLUMN "
+                    "zarinpal_enabled BOOLEAN NOT NULL DEFAULT 0"
+                ),
+            }
+            for column, statement in payment_migrations.items():
+                if column not in payment_columns:
+                    await connection.execute(text(statement))
+            invoice_columns = {
+                row[1]
+                for row in (
+                    await connection.execute(
+                        text("PRAGMA table_info(payment_invoices)")
+                    )
+                ).all()
+            }
+            if "zarinpal_merchant_id" not in invoice_columns:
+                await connection.execute(
+                    text(
+                        "ALTER TABLE payment_invoices ADD COLUMN "
+                        "zarinpal_merchant_id VARCHAR(100) NULL"
                     )
                 )
 

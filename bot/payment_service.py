@@ -38,6 +38,9 @@ class ZarinpalProvider:
     def enabled(self) -> bool:
         return bool(self.merchant_id)
 
+    def _merchant(self, merchant_id: str | None) -> str:
+        return str(merchant_id or self.merchant_id or "").strip()
+
     async def close(self) -> None:
         if self._owns_client:
             await self._client.aclose()
@@ -47,15 +50,18 @@ class ZarinpalProvider:
         amount_toman: int,
         description: str,
         callback_url: str,
+        *,
+        merchant_id: str | None = None,
     ) -> tuple[str | None, str | None]:
-        if not self.enabled:
+        active_merchant = self._merchant(merchant_id)
+        if not active_merchant:
             return None, "merchant_not_configured"
         if isinstance(amount_toman, bool) or amount_toman <= 0:
             return None, "invalid_amount"
         if not callback_url.startswith(("https://", "http://")):
             return None, "invalid_callback_url"
         payload = {
-            "merchant_id": self.merchant_id,
+            "merchant_id": active_merchant,
             "amount": int(amount_toman),
             "currency": "IRT",
             "description": str(description or "پرداخت فارستار وارنر")[:255],
@@ -82,16 +88,19 @@ class ZarinpalProvider:
         self,
         amount_toman: int,
         authority: str,
+        *,
+        merchant_id: str | None = None,
     ) -> tuple[bool, str | None]:
         normalized_authority = str(authority or "").strip()
-        if not self.enabled:
+        active_merchant = self._merchant(merchant_id)
+        if not active_merchant:
             return False, "merchant_not_configured"
         if isinstance(amount_toman, bool) or amount_toman <= 0:
             return False, "invalid_amount"
         if AUTHORITY_RE.fullmatch(normalized_authority) is None:
             return False, "invalid_authority"
         payload = {
-            "merchant_id": self.merchant_id,
+            "merchant_id": active_merchant,
             "amount": int(amount_toman),
             "authority": normalized_authority,
         }

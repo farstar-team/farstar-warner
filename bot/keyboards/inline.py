@@ -783,7 +783,7 @@ def admin_plans_keyboard(plans: list[SubscriptionPlan]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def payment_config_keyboard() -> InlineKeyboardMarkup:
+def payment_config_keyboard(zarinpal_enabled: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -796,6 +796,40 @@ def payment_config_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="💳 تغییر مشخصات کارت",
                     callback_data="admin:payment:card",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔑 ثبت شناسه پذیرنده زرین‌پال",
+                    callback_data="admin:payment:zarinpal:merchant",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🌐 ثبت آدرس بازگشت زرین‌پال",
+                    callback_data="admin:payment:zarinpal:callback",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=(
+                        "🔴 غیرفعال‌کردن زرین‌پال"
+                        if zarinpal_enabled
+                        else "🟢 فعال‌کردن زرین‌پال"
+                    ),
+                    callback_data="admin:payment:zarinpal:toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💱 تنظیم نرخ پشتیبان دلار",
+                    callback_data="admin:payment:currency:fallback",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 دریافت و آزمایش نرخ زنده",
+                    callback_data="admin:payment:currency:refresh",
                 )
             ],
             [InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")],

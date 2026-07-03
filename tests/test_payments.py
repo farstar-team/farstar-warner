@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import create_engine, inspect
 
 from bot import money
-from bot.models import Base, PaymentInvoice
+from bot.models import Base, PaymentConfig, PaymentInvoice
 from bot.money import convert_usd_to_toman, fetch_live_usd_rate
 from bot.payment_service import ZarinpalProvider
 
@@ -76,14 +76,19 @@ async def test_zarinpal_request_and_verify_use_irt_and_are_idempotent_codes() ->
         )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = ZarinpalProvider("merchant-id", client=client)
+    provider = ZarinpalProvider(None, client=client)
     try:
         authority, payment_url = await provider.request_payment(
             250_000,
             "خرید آزمایشی",
             "https://example.com/payment/callback",
+            merchant_id="panel-merchant-id",
         )
-        verified, ref_id = await provider.verify_payment(250_000, authority or "")
+        verified, ref_id = await provider.verify_payment(
+            250_000,
+            authority or "",
+            merchant_id="panel-merchant-id",
+        )
     finally:
         await client.aclose()
 
@@ -94,6 +99,7 @@ async def test_zarinpal_request_and_verify_use_irt_and_are_idempotent_codes() ->
     assert verified is True
     assert ref_id == "987654"
     assert requests[1]["amount"] == 250_000
+    assert requests[0]["merchant_id"] == "panel-merchant-id"
 
 
 def test_payment_invoice_schema_has_unique_authority_and_paid_flag() -> None:
@@ -111,5 +117,20 @@ def test_payment_invoice_schema_has_unique_authority_and_paid_flag() -> None:
         for column in constraint["column_names"]
     }
 
-    assert {"zarinpal_authority", "is_paid", "amount_toman"} <= columns
+    assert {
+        "zarinpal_authority",
+        "zarinpal_merchant_id",
+        "is_paid",
+        "amount_toman",
+    } <= columns
     assert "zarinpal_authority" in unique_columns
+
+    payment_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns(PaymentConfig.__tablename__)
+    }
+    assert {
+        "zarinpal_merchant_id",
+        "zarinpal_callback_url",
+        "zarinpal_enabled",
+    } <= payment_columns

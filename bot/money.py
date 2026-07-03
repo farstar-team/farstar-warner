@@ -15,6 +15,7 @@ PERSIAN_DIGITS = str.maketrans("0123456789,", "۰۱۲۳۴۵۶۷۸۹٬")
 LOCALIZED_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 SUPPORTED_CURRENCIES = {"TOMAN", "USD"}
 USD_RATE_CACHE_KEY = "farstar:money:usd-toman-rate:v1"
+USD_RATE_FALLBACK_KEY = "farstar:money:usd-toman-fallback:v1"
 USD_RATE_CACHE_TTL_SECONDS = 7200
 TGJU_USD_URL = "https://www.tgju.org/profile/price_dollar_rl"
 TGJU_RATE_RE = re.compile(
@@ -69,7 +70,15 @@ def _parse_tgju_usd_toman(raw_html: str) -> int:
     return toman_rate
 
 
-def _fallback_usd_rate() -> int:
+async def _fallback_usd_rate(redis_client: Redis) -> int:
+    try:
+        configured = await redis_client.get(USD_RATE_FALLBACK_KEY)
+        if configured is not None:
+            rate = int(configured)
+            if 10_000 <= rate <= 10_000_000:
+                return rate
+    except (RedisError, TypeError, ValueError):
+        logger.warning("Could not read the administrator USD fallback rate")
     try:
         return get_settings().usd_toman_fallback_rate
     except Exception:
@@ -123,7 +132,7 @@ async def fetch_live_usd_rate(redis_client: Redis) -> int:
             "Live USD/Toman rate fetch failed; using fallback", exc_info=True
         )
 
-    fallback = _fallback_usd_rate()
+    fallback = await _fallback_usd_rate(redis_client)
     try:
         await redis_client.set(USD_RATE_CACHE_KEY, str(fallback), ex=300)
     except RedisError:

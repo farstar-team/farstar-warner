@@ -22,7 +22,7 @@ from bot.config import Settings, get_settings
 from bot.database import SessionFactory, create_database, initialize_database
 from bot.diagnostics import DiagnosticStore, RedisDiagnosticLogHandler
 from bot.handlers import admin, user
-from bot.models import PlanTier, User, UserStatus
+from bot.models import PaymentConfig, PlanTier, User, UserStatus
 from bot.payment_service import ZarinpalProvider
 from bot.profile_preview import ProfilePreviewService
 from bot.reminders import send_expiry_reminders
@@ -112,6 +112,38 @@ async def ensure_primary_admin(
         await session.commit()
 
 
+async def ensure_payment_config(
+    session_factory: SessionFactory,
+    settings: Settings,
+) -> None:
+    env_merchant = (
+        settings.zarinpal_merchant_id.get_secret_value().strip()
+        if settings.zarinpal_merchant_id
+        else ""
+    )
+    env_callback = (settings.zarinpal_callback_url or "").strip()
+    async with session_factory() as session:
+        payment = await session.get(PaymentConfig, 1)
+        created = payment is None
+        if payment is None:
+            payment = PaymentConfig(id=1)
+            session.add(payment)
+        imported_from_env = False
+        if env_merchant and not payment.zarinpal_merchant_id:
+            payment.zarinpal_merchant_id = env_merchant
+            imported_from_env = True
+        if env_callback and not payment.zarinpal_callback_url:
+            payment.zarinpal_callback_url = env_callback
+            imported_from_env = True
+        if (
+            (created or imported_from_env)
+            and payment.zarinpal_merchant_id
+            and payment.zarinpal_callback_url
+        ):
+            payment.zarinpal_enabled = True
+        await session.commit()
+
+
 async def run() -> None:
     settings = get_settings()
     logging.basicConfig(
@@ -185,6 +217,7 @@ async def run() -> None:
     try:
         await wait_for_dependencies(engine, redis)
         await initialize_database(engine)
+        await ensure_payment_config(session_factory, settings)
         await ensure_primary_admin(session_factory, settings)
         await bot.delete_webhook(drop_pending_updates=False)
         await configure_commands(bot, settings)

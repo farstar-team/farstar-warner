@@ -170,6 +170,22 @@ ensure_instance_defaults() {
     printf 'META_GRAPH_API_VERSION=v21.0\n' \
       | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
   fi
+  if ! "${SUDO[@]}" grep -q '^USD_TOMAN_FALLBACK_RATE=' "${env_file}"; then
+    printf 'USD_TOMAN_FALLBACK_RATE=650000\n' \
+      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
+  fi
+  if ! "${SUDO[@]}" grep -q '^ZARINPAL_MERCHANT_ID=' "${env_file}"; then
+    printf 'ZARINPAL_MERCHANT_ID=\n' \
+      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
+  fi
+  if ! "${SUDO[@]}" grep -q '^ZARINPAL_CALLBACK_URL=' "${env_file}"; then
+    printf 'ZARINPAL_CALLBACK_URL=\n' \
+      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
+  fi
+  if ! "${SUDO[@]}" grep -q '^ZARINPAL_TIMEOUT_SECONDS=' "${env_file}"; then
+    printf 'ZARINPAL_TIMEOUT_SECONDS=15\n' \
+      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
+  fi
   "${SUDO[@]}" chmod 600 "${env_file}"
 }
 
@@ -285,6 +301,10 @@ INSTAGRAM_BASELINE_USERNAMES=farstar_vpn,instagram,nasa
 PROXY_HEALTH_URL=https://www.cloudflare.com/cdn-cgi/trace
 PAGE_CHECK_DELAY_MIN_SECONDS=15
 PAGE_CHECK_DELAY_MAX_SECONDS=45
+USD_TOMAN_FALLBACK_RATE=650000
+ZARINPAL_MERCHANT_ID=
+ZARINPAL_CALLBACK_URL=
+ZARINPAL_TIMEOUT_SECONDS=15
 FREE_TRIAL_DAYS=7
 LOG_LEVEL=INFO
 EOF
@@ -347,14 +367,7 @@ update_application() {
   log "Updating Farstar Warner from ${REPOSITORY_URL}"
   command -v git >/dev/null 2>&1 || fail "git is not installed."
   [[ -d "${APP_DIR}/.git" ]] || fail "${APP_DIR} is not a Git checkout. Clone ${REPOSITORY_URL} to enable updates."
-  # The installer makes the manager executable. Ignore executable-bit-only
-  # differences while continuing to protect real local content changes.
   git -C "${APP_DIR}" config core.fileMode false
-  if [[ -n "$(git -C "${APP_DIR}" status --porcelain --untracked-files=no)" ]]; then
-    git -C "${APP_DIR}" status --short --untracked-files=no >&2
-    fail "The application has local tracked content changes. Commit or stash them before updating."
-  fi
-
   local running_instances=()
   while IFS= read -r env_file; do
     local instance
@@ -364,14 +377,43 @@ update_application() {
     fi
   done < <("${SUDO[@]}" find "${INSTANCE_DIR}" -maxdepth 1 -type f -name '*.env' -print 2>/dev/null | sort)
 
+  for instance in "${running_instances[@]}"; do
+    backup_instance "${instance}"
+  done
+
+  local timestamp source_backup_dir backup_branch dirty_state stash_ref
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  source_backup_dir="/var/backups/farstar-warner/source-${timestamp}"
+  backup_branch="farstar-server-backup-${timestamp}"
+  "${SUDO[@]}" mkdir -p "${source_backup_dir}"
+  git -C "${APP_DIR}" rev-parse HEAD \
+    | "${SUDO[@]}" tee "${source_backup_dir}/previous-head.txt" >/dev/null
+  git -C "${APP_DIR}" status --short \
+    | "${SUDO[@]}" tee "${source_backup_dir}/status.txt" >/dev/null
+  git -C "${APP_DIR}" diff --binary HEAD \
+    | "${SUDO[@]}" tee "${source_backup_dir}/local-changes.patch" >/dev/null
+  git -C "${APP_DIR}" branch "${backup_branch}" HEAD
+  dirty_state="$(git -C "${APP_DIR}" status --porcelain)"
+  stash_ref=""
+  if [[ -n "${dirty_state}" ]]; then
+    git -C "${APP_DIR}" stash push --include-untracked \
+      --message "Farstar automatic backup ${timestamp}" >/dev/null
+    stash_ref="$(git -C "${APP_DIR}" rev-parse refs/stash)"
+    printf '%s\n' "${stash_ref}" \
+      | "${SUDO[@]}" tee "${source_backup_dir}/stash-ref.txt" >/dev/null
+  fi
+  "${SUDO[@]}" chmod -R go-rwx "${source_backup_dir}"
+
   git -C "${APP_DIR}" fetch --prune origin
-  git -C "${APP_DIR}" pull --ff-only origin main
+  git -C "${APP_DIR}" reset --hard origin/main
+  "${SUDO[@]}" install -m 755 "${APP_DIR}/farstar.sh" /usr/local/bin/farstar
   build_image
   for instance in "${running_instances[@]}"; do
     ensure_instance_defaults "${instance}"
-    compose "${instance}" up -d --no-build --force-recreate bot-app
+    compose "${instance}" up -d --no-build --force-recreate
   done
   log "Update completed. Version $(source_version) is active; running bot instances were recreated."
+  log "Pre-update source backup: ${source_backup_dir} (branch ${backup_branch}${stash_ref:+, stash ${stash_ref}})"
 }
 
 remove_instance() {
