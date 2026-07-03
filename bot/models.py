@@ -148,6 +148,15 @@ class TargetPage(Base):
     )
     last_check_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
     last_http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_evidence_source: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    last_evidence_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_deactivation_evidence_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     status_confirmed: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
@@ -278,6 +287,32 @@ class PageSnapshot(Base):
     post_count: Mapped[int | None] = mapped_column(Integer)
     is_private: Mapped[bool | None] = mapped_column(Boolean)
     is_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class InstagramMonitoringAccount(Base):
+    __tablename__ = "instagram_monitoring_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(80), nullable=False)
+    instagram_user_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    access_token_encrypted: Mapped[str] = mapped_column(String(4096), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_health_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

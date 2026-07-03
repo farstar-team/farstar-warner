@@ -91,6 +91,13 @@ PAGE_STATUS_NAMES = {
     PageStatus.DEACTIVATED: "غیرفعال / منتظر فعال‌شدن 🔴",
     None: "در انتظار اولین بررسی ⚪",
 }
+EVIDENCE_SOURCE_NAMES = {
+    "public_web_profile": "اطلاعات عمومی مستقیم",
+    "web_profile_explicit_absence": "پاسخ قطعی نبودن در مسیر مستقیم",
+    "graphql_username_search": "جست‌وجوی مستقل نام کاربری",
+    "graphql_username_search_absence": "نبودن نام در جست‌وجوی مستقل",
+    "meta_business_discovery": "اتصال رسمی متا",
+}
 
 
 class AddPageState(StatesGroup):
@@ -281,9 +288,9 @@ def profile_result_to_embed(
         following_count=result.following_count,
         post_count=result.post_count,
         is_private=result.is_private,
-        is_verified=result.is_verified,
+        is_verified=bool(result.is_verified),
         diagnostic=(
-            "web_profile_api_cache" if result.from_cache else "web_profile_api"
+            f"{result.source}_cache" if result.from_cache else result.source
         ),
     )
 
@@ -898,11 +905,18 @@ async def view_page(
         if page.last_http_status is not None
         else "ثبت نشده"
     )
+    evidence_source = EVIDENCE_SOURCE_NAMES.get(
+        page.last_evidence_source or "",
+        "هنوز شاهد قطعی ثبت نشده",
+    )
     text = (
         f"جزئیات پیج <b>@{html.escape(page.instagram_username)}</b>\n\n"
         f"وضعیت قطعی ذخیره‌شده: <b>{status_text}</b>\n"
         f"نتیجه آخرین تلاش: <b>{latest_outcome}</b>\n"
         f"کد HTTP آخر: <code>{http_status}</code>\n"
+        f"منبع آخرین شاهد: <b>{evidence_source}</b>\n"
+        f"زمان آخرین شاهد: {format_datetime(page.last_evidence_at)}\n"
+        f"آخرین شاهد غیرفعال‌شدن: {format_datetime(page.last_deactivation_evidence_at)}\n"
         f"آخرین تلاش: {format_datetime(page.last_checked_at)}\n"
         f"آخرین پاسخ قطعی: {format_datetime(page.last_successful_check_at)}\n"
         f"آخرین تغییر وضعیت: {format_datetime(page.last_status_changed_at)}\n"
@@ -948,11 +962,20 @@ def _profile_details_caption(details: EmbedProfile) -> str:
         lines.extend(("", f"بیوگرافی:\n{html.escape(biography)}"))
     else:
         lines.extend(("", "بیوگرافی در نمای عمومی اینستاگرام ارائه نشده است."))
-    source_text = (
-        "آخرین پاسخ سالم ذخیره‌شده نمایش داده شد؛ اینستاگرام موقتاً پاسخ زنده نداد."
-        if details.diagnostic == "web_profile_api_cache"
-        else "اطلاعات از Web Profile API اینستاگرام و بدون ورود به حساب دریافت شد."
-    )
+    if (details.diagnostic or "").endswith("_cache"):
+        source_text = (
+            "آخرین پاسخ سالم ذخیره‌شده نمایش داده شد؛ provider زنده موقتاً پاسخ قطعی نداد."
+        )
+    elif details.diagnostic == "meta_business_discovery":
+        source_text = "اطلاعات از Business Discovery رسمی Meta دریافت شد."
+    elif details.diagnostic == "graphql_username_search":
+        source_text = (
+            "فعال‌بودن پیج با جست‌وجوی مستقل و تطابق دقیق نام کاربری تأیید شد."
+        )
+    else:
+        source_text = (
+            "اطلاعات از fallback عمومی Web Profile و بدون ورود به حساب دریافت شد."
+        )
     lines.extend(
         (
             "",

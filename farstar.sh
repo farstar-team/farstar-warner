@@ -154,6 +154,25 @@ random_secret() {
   printf '%s' "${secret}"
 }
 
+fernet_key() {
+  openssl rand -base64 32 | tr -d '\n' | tr '+/' '-_'
+}
+
+ensure_instance_defaults() {
+  local instance="$1"
+  local env_file
+  env_file="$(instance_env "${instance}")"
+  if ! "${SUDO[@]}" grep -q '^CREDENTIAL_ENCRYPTION_KEY=' "${env_file}"; then
+    printf 'CREDENTIAL_ENCRYPTION_KEY=%s\n' "$(fernet_key)" \
+      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
+  fi
+  if ! "${SUDO[@]}" grep -q '^META_GRAPH_API_VERSION=' "${env_file}"; then
+    printf 'META_GRAPH_API_VERSION=v21.0\n' \
+      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
+  fi
+  "${SUDO[@]}" chmod 600 "${env_file}"
+}
+
 build_image() {
   log "Building the latest Farstar Warner image..."
   "${DOCKER[@]}" build --tag farstar-warner:latest "${APP_DIR}"
@@ -252,12 +271,16 @@ REDIS_HOST=redis
 REDIS_PORT=6379
 REDIS_DB=0
 REDIS_PASSWORD=${redis_password}
+CREDENTIAL_ENCRYPTION_KEY=$(fernet_key)
+META_GRAPH_API_VERSION=v21.0
 CHECK_INTERVAL_SECONDS=300
 CHECK_CONCURRENCY=8
 DEACTIVATION_CONFIRMATIONS=2
+DEACTIVATION_CONFIRMATION_DELAY_SECONDS=15
 CHECK_JITTER_MIN_SECONDS=0.5
 CHECK_JITTER_MAX_SECONDS=3.0
 INSTAGRAM_PROXY_URL=socks5://warp_proxy:1080
+INSTAGRAM_SEARCH_DOC_ID=26347858941511777
 PROXY_HEALTH_URL=https://www.cloudflare.com/cdn-cgi/trace
 PAGE_CHECK_DELAY_MIN_SECONDS=15
 PAGE_CHECK_DELAY_MAX_SECONDS=45
@@ -278,6 +301,7 @@ EOF
 start_instance() {
   local instance="$1"
   require_instance "${instance}"
+  ensure_instance_defaults "${instance}"
   if ! "${DOCKER[@]}" image inspect farstar-warner:latest >/dev/null 2>&1; then
     build_image
   fi
@@ -299,6 +323,7 @@ restart_instance() {
 apply_instance() {
   local instance="$1"
   require_instance "${instance}"
+  ensure_instance_defaults "${instance}"
   if ! "${DOCKER[@]}" image inspect farstar-warner:latest >/dev/null 2>&1; then
     build_image
   fi
@@ -342,6 +367,7 @@ update_application() {
   git -C "${APP_DIR}" pull --ff-only origin main
   build_image
   for instance in "${running_instances[@]}"; do
+    ensure_instance_defaults "${instance}"
     compose "${instance}" up -d --no-build --force-recreate bot-app
   done
   log "Update completed. Version $(source_version) is active; running bot instances were recreated."
@@ -415,7 +441,67 @@ edit_instance() {
   fi
 }
 
+doctor_instance() {
+  local instance="$1"
+  require_instance "${instance}"
+  printf '\nInstance: %s\n' "${instance}"
+  compose "${instance}" ps
+  local warp_trace direct_status warp_status search_direct_status search_warp_status
+  warp_trace="$(
+    compose "${instance}" exec -T warp_proxy sh -c \
+      "curl -fsS --max-time 12 --socks5-hostname 127.0.0.1:1080 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|warp)='" \
+      2>/dev/null || true
+  )"
+  direct_status="$(
+    compose "${instance}" exec -T bot-app curl -sS --max-time 15 \
+      -o /dev/null -w '%{http_code}' \
+      -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
+      -H 'X-IG-App-ID: 936619743392459' \
+      'https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram' \
+      2>/dev/null || printf 'network-error'
+  )"
+  warp_status="$(
+    compose "${instance}" exec -T bot-app curl -sS --max-time 15 \
+      --proxy socks5h://warp_proxy:1080 \
+      -o /dev/null -w '%{http_code}' \
+      -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
+      -H 'X-IG-App-ID: 936619743392459' \
+      'https://www.instagram.com/api/v1/users/web_profile_info/?username=instagram' \
+      2>/dev/null || printf 'network-error'
+  )"
+  search_direct_status="$(
+    compose "${instance}" exec -T bot-app curl -sS --max-time 15 \
+      -o /dev/null -w '%{http_code}' \
+      -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
+      -H 'Accept: */*' -H 'Referer: https://www.instagram.com/' \
+      --data-urlencode 'variables={"hasQuery":true,"query":"instagram"}' \
+      --data-urlencode 'doc_id=26347858941511777' \
+      --data-urlencode 'server_timestamps=true' \
+      'https://www.instagram.com/graphql/query' \
+      2>/dev/null || printf 'network-error'
+  )"
+  search_warp_status="$(
+    compose "${instance}" exec -T bot-app curl -sS --max-time 15 \
+      --proxy socks5h://warp_proxy:1080 \
+      -o /dev/null -w '%{http_code}' \
+      -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
+      -H 'Accept: */*' -H 'Referer: https://www.instagram.com/' \
+      --data-urlencode 'variables={"hasQuery":true,"query":"instagram"}' \
+      --data-urlencode 'doc_id=26347858941511777' \
+      --data-urlencode 'server_timestamps=true' \
+      'https://www.instagram.com/graphql/query' \
+      2>/dev/null || printf 'network-error'
+  )"
+  printf 'WARP trace:\n%s\n' "${warp_trace:-unavailable}"
+  printf 'Instagram direct HTTP: %s\n' "${direct_status}"
+  printf 'Instagram WARP HTTP:   %s\n' "${warp_status}"
+  printf 'Username search direct HTTP: %s\n' "${search_direct_status}"
+  printf 'Username search WARP HTTP:   %s\n' "${search_warp_status}"
+  printf 'Interpretation: HTTP 401/403/429 means Instagram rejected the request; it is not proof of a firewall failure.\n'
+}
+
 doctor() {
+  local requested_instance="${1:-}"
   log "System diagnostics"
   printf 'Application directory: %s\n' "${APP_DIR}"
   printf 'Instance directory:    %s\n' "${INSTANCE_DIR}"
@@ -426,6 +512,15 @@ doctor() {
   printf '\nContainer resource snapshot:\n'
   "${DOCKER[@]}" stats --no-stream --format 'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}' \
     | { head -n 1; grep '^farstar-' || true; }
+  if [[ -n "${requested_instance}" ]]; then
+    doctor_instance "${requested_instance}"
+    return
+  fi
+  local env_file instance
+  while IFS= read -r env_file; do
+    instance="$(basename -- "${env_file}" .env)"
+    doctor_instance "${instance}"
+  done < <("${SUDO[@]}" find "${INSTANCE_DIR}" -maxdepth 1 -type f -name '*.env' -print 2>/dev/null | sort)
 }
 
 usage() {
@@ -447,7 +542,7 @@ Commands:
   backup INSTANCE      Create a PostgreSQL backup
   restore INSTANCE     Restore a PostgreSQL SQL backup
   remove INSTANCE      Remove an instance, optionally including its data
-  doctor               Show Docker and resource diagnostics
+  doctor [INSTANCE]    Test containers, WARP, and both Instagram routes
   version              Show source and running bot versions
   help                 Show this help
 EOF
@@ -520,7 +615,7 @@ main() {
     backup) [[ $# -ge 2 ]] || fail "An instance name is required."; backup_instance "$2" ;;
     restore) [[ $# -ge 2 ]] || fail "An instance name is required."; restore_instance "$2" ;;
     remove) [[ $# -ge 2 ]] || fail "An instance name is required."; remove_instance "$2" ;;
-    doctor) doctor ;;
+    doctor) doctor "${2:-}" ;;
     version) show_version ;;
     *) usage; fail "Unknown command: ${command}" ;;
   esac

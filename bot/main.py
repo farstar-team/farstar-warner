@@ -130,9 +130,20 @@ async def run() -> None:
         DiagnosticStore(
             redis,
             redactions=(
-                settings.telegram_bot_token.get_secret_value(),
-                settings.postgres_password.get_secret_value(),
-                settings.redis_password.get_secret_value(),
+                *(
+                    value
+                    for value in (
+                        settings.telegram_bot_token.get_secret_value(),
+                        settings.postgres_password.get_secret_value(),
+                        settings.redis_password.get_secret_value(),
+                        (
+                            settings.credential_encryption_key.get_secret_value()
+                            if settings.credential_encryption_key
+                            else ""
+                        ),
+                    )
+                    if value
+                ),
             ),
         ),
         asyncio.get_running_loop(),

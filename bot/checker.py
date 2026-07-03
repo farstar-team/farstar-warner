@@ -24,10 +24,12 @@ from redis.exceptions import LockError, RedisError
 from sqlalchemy import and_, case, func, select
 
 from bot.config import Settings
+from bot.credential_store import CredentialStore, CredentialStoreError
 from bot.database import SessionFactory
 from bot.diagnostics import DiagnosticStore
 from bot.models import (
     NotificationSettings,
+    InstagramMonitoringAccount,
     PageEvent,
     PageSnapshot,
     PageStatus,
@@ -71,6 +73,8 @@ class CheckOutcome(str, Enum):
 @dataclass(slots=True, frozen=True)
 class ProfileResult:
     outcome: CheckOutcome
+    source: str = "public_web_profile"
+    metadata_complete: bool = False
     canonical_username: str | None = None
     profile_id: str | None = None
     full_name: str | None = None
@@ -80,7 +84,7 @@ class ProfileResult:
     following_count: int | None = None
     post_count: int | None = None
     is_private: bool | None = None
-    is_verified: bool = False
+    is_verified: bool | None = None
     retry_after: int | None = None
     http_status: int | None = None
     from_cache: bool = False
@@ -128,6 +132,8 @@ class InstagramChecker:
     PROFILE_LOCK_PREFIX = "farstar:instagram:profile-lock:"
     FRESH_CACHE_SECONDS = 60
     STALE_CACHE_SECONDS = 86400
+    GRAPH_HEALTH_PREFIX = "farstar:graph-account-health:"
+    GRAPH_HEALTH_SECONDS = 300
 
     def __init__(
         self,
@@ -141,8 +147,10 @@ class InstagramChecker:
         self.redis = redis
         self.settings = settings
         self.diagnostics = DiagnosticStore(redis)
+        self.credentials = CredentialStore(settings)
         self._rate_limited = asyncio.Event()
         self._lock_lost = asyncio.Event()
+        self._official_ready = False
         self._http = httpx.AsyncClient(
             http2=True,
             follow_redirects=False,
@@ -160,6 +168,14 @@ class InstagramChecker:
             headers=INSTAGRAM_BROWSER_HEADERS,
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
+        self._graph_http = httpx.AsyncClient(
+            http2=True,
+            follow_redirects=False,
+            trust_env=False,
+            timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+            headers={"Accept": "application/json"},
+        )
 
     def set_browser_probe(self, probe: object) -> None:
         """Retain startup compatibility; monitoring uses the curl transport only."""
@@ -168,6 +184,7 @@ class InstagramChecker:
     async def close(self) -> None:
         await self._http.aclose()
         await self._direct_http.aclose()
+        await self._graph_http.aclose()
 
     async def fetch_profile(
         self,
@@ -175,6 +192,7 @@ class InstagramChecker:
         *,
         allow_stale: bool = True,
         force_refresh: bool = False,
+        expected_profile_id: str | None = None,
     ) -> ProfileResult:
         normalized_username = username.strip().lower()
         if not force_refresh:
@@ -184,37 +202,13 @@ class InstagramChecker:
             if cached is not None:
                 return replace(cached, from_cache=True)
 
-        cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
-        if cooldown_ttl > 0:
-            if allow_stale:
-                stale = await self._read_cached_profile(
-                    f"{self.PROFILE_STALE_PREFIX}{normalized_username}"
-                )
-                if stale is not None:
-                    return replace(stale, from_cache=True)
-            return ProfileResult(
-                CheckOutcome.RATE_LIMITED,
-                retry_after=cooldown_ttl,
-            )
-
         profile_lock = self.redis.lock(
             f"{self.PROFILE_LOCK_PREFIX}{normalized_username}",
-            timeout=60,
+            timeout=180,
             blocking_timeout=30,
         )
         acquired = await profile_lock.acquire()
         if not acquired:
-            if force_refresh:
-                response = await self._execute_profile_request(normalized_username)
-                result = await self._profile_result_from_response(
-                    response,
-                    normalized_username,
-                )
-                if result.outcome == CheckOutcome.ACTIVE:
-                    await self._cache_profile(result, normalized_username)
-                elif result.outcome == CheckOutcome.DEACTIVATED:
-                    await self._cache_deactivated(result, normalized_username)
-                return result
             return await self._stale_or_unknown(normalized_username, allow_stale)
         try:
             if not force_refresh:
@@ -223,6 +217,30 @@ class InstagramChecker:
                 )
                 if cached is not None:
                     return replace(cached, from_cache=True)
+            official = await self._fetch_profile_official(
+                normalized_username,
+                expected_profile_id=expected_profile_id,
+            )
+            if official is not None:
+                if official.outcome == CheckOutcome.ACTIVE:
+                    await self._cache_profile(official, normalized_username)
+                    return official
+                if official.outcome == CheckOutcome.DEACTIVATED:
+                    await self._cache_deactivated(official, normalized_username)
+                    return official
+
+            cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
+            if cooldown_ttl > 0:
+                if allow_stale:
+                    stale = await self._read_cached_profile(
+                        f"{self.PROFILE_STALE_PREFIX}{normalized_username}"
+                    )
+                    if stale is not None:
+                        return replace(stale, from_cache=True)
+                return ProfileResult(
+                    CheckOutcome.RATE_LIMITED,
+                    retry_after=cooldown_ttl,
+                )
             response = await self._execute_profile_request(normalized_username)
             result = await self._profile_result_from_response(
                 response,
@@ -245,6 +263,317 @@ class InstagramChecker:
         finally:
             with suppress(LockError):
                 await profile_lock.release()
+
+    async def monitoring_accounts(self) -> list[InstagramMonitoringAccount]:
+        async with self.session_factory() as session:
+            return list(
+                await session.scalars(
+                    select(InstagramMonitoringAccount).order_by(
+                        InstagramMonitoringAccount.is_active.desc(),
+                        InstagramMonitoringAccount.id,
+                    )
+                )
+            )
+
+    async def official_provider_preflight(self, *, force: bool = False) -> bool:
+        if not self.credentials.available:
+            self._official_ready = False
+            return False
+        accounts = [account for account in await self.monitoring_accounts() if account.is_active]
+        for account in accounts:
+            try:
+                token = self.credentials.decrypt(account.access_token_encrypted)
+            except CredentialStoreError as exc:
+                await self._set_monitoring_account_health(
+                    account.id,
+                    healthy=False,
+                    error=str(exc),
+                )
+                continue
+            healthy, _, _ = await self.validate_monitoring_account(
+                account.instagram_user_id,
+                token,
+                account_id=account.id,
+                force=force,
+            )
+            if healthy:
+                self._official_ready = True
+                return True
+        self._official_ready = False
+        return False
+
+    async def validate_monitoring_account(
+        self,
+        instagram_user_id: str,
+        access_token: str,
+        *,
+        account_id: int | None = None,
+        force: bool = True,
+    ) -> tuple[bool, str, str | None]:
+        if account_id is not None and not force:
+            cached = await self.redis.get(f"{self.GRAPH_HEALTH_PREFIX}{account_id}")
+            if cached == "healthy":
+                return True, "اتصال رسمی سالم است.", None
+        url = (
+            f"{self.settings.meta_graph_base_url}/"
+            f"{self.settings.meta_graph_api_version}/{quote(instagram_user_id, safe='')}"
+        )
+        started_at = time.perf_counter()
+        try:
+            response = await self._graph_http.get(
+                url,
+                params={"fields": "id,username"},
+                headers={"Authorization": f"Bearer {access_token.strip()}"},
+            )
+        except httpx.HTTPError as exc:
+            message = f"خطای شبکه Graph API: {type(exc).__name__}"
+            if account_id is not None:
+                await self._set_monitoring_account_health(
+                    account_id, healthy=False, error=message
+                )
+            return False, message, None
+
+        payload = self._json_object(response.content)
+        username = self._optional_text(payload.get("username")) if payload else None
+        returned_id = str(payload.get("id") or "") if payload else ""
+        healthy = response.status_code == 200 and returned_id == instagram_user_id
+        error = None if healthy else self._graph_error_text(payload, response.status_code)
+        if account_id is not None:
+            await self._set_monitoring_account_health(
+                account_id,
+                healthy=healthy,
+                error=error,
+            )
+            if healthy:
+                await self.redis.set(
+                    f"{self.GRAPH_HEALTH_PREFIX}{account_id}",
+                    "healthy",
+                    ex=self.GRAPH_HEALTH_SECONDS,
+                )
+            else:
+                await self.redis.delete(f"{self.GRAPH_HEALTH_PREFIX}{account_id}")
+        await self.diagnostics.add(
+            level="INFO" if healthy else "ERROR",
+            event="official_account_health",
+            message=(
+                "اتصال رسمی حساب مانیتورینگ Meta سالم است."
+                if healthy
+                else "اتصال رسمی حساب مانیتورینگ Meta معتبر نیست."
+            ),
+            transport="meta-graph-api",
+            http_status=response.status_code,
+            elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+            response_bytes=len(response.content),
+            detail=(
+                f"account_id={account_id or 0}; ig_user_id={instagram_user_id}; "
+                f"error={error or 'none'}"
+            ),
+        )
+        return healthy, error or "اتصال رسمی سالم است.", username
+
+    async def _fetch_profile_official(
+        self,
+        username: str,
+        *,
+        expected_profile_id: str | None,
+    ) -> ProfileResult | None:
+        if not self.credentials.available:
+            return None
+        accounts = [account for account in await self.monitoring_accounts() if account.is_active]
+        if not accounts:
+            return None
+
+        last_unknown: ProfileResult | None = None
+        for account in accounts:
+            try:
+                token = self.credentials.decrypt(account.access_token_encrypted)
+            except CredentialStoreError as exc:
+                await self._set_monitoring_account_health(
+                    account.id, healthy=False, error=str(exc)
+                )
+                continue
+            healthy, _, _ = await self.validate_monitoring_account(
+                account.instagram_user_id,
+                token,
+                account_id=account.id,
+                force=False,
+            )
+            if not healthy:
+                continue
+
+            url = (
+                f"{self.settings.meta_graph_base_url}/"
+                f"{self.settings.meta_graph_api_version}/"
+                f"{quote(account.instagram_user_id, safe='')}"
+            )
+            fields = (
+                "business_discovery.username("
+                f"{username}"
+                "){id,username,name,biography,followers_count,follows_count,"
+                "media_count,profile_picture_url}"
+            )
+            started_at = time.perf_counter()
+            try:
+                response = await self._graph_http.get(
+                    url,
+                    params={"fields": fields},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                last_unknown = ProfileResult(CheckOutcome.UNKNOWN)
+                await self.diagnostics.add(
+                    level="WARNING",
+                    event="official_profile_network_error",
+                    message="Graph API برای پیج هدف پاسخ شبکه‌ای معتبر نداد.",
+                    username=username,
+                    transport="meta-graph-api",
+                    detail=f"account_id={account.id}; error={type(exc).__name__}",
+                )
+                continue
+
+            payload = self._json_object(response.content)
+            minimal_fields_used = False
+            if response.status_code != 200 and self._graph_error_code(payload) == 100:
+                minimal_fields = (
+                    "business_discovery.username("
+                    f"{username}"
+                    "){id,username,followers_count,media_count}"
+                )
+                try:
+                    minimal_response = await self._graph_http.get(
+                        url,
+                        params={"fields": minimal_fields},
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                except httpx.HTTPError:
+                    minimal_response = None
+                if minimal_response is not None:
+                    response = minimal_response
+                    payload = self._json_object(response.content)
+                    minimal_fields_used = True
+            discovery = payload.get("business_discovery") if payload else None
+            if response.status_code == 200 and isinstance(discovery, dict):
+                result = self._parse_business_discovery(discovery, username)
+                if result is not None:
+                    result = replace(
+                        result,
+                        metadata_complete=not minimal_fields_used,
+                    )
+                    await self.diagnostics.add(
+                        level="INFO",
+                        event="official_profile_succeeded",
+                        message="اطلاعات پیج از Business Discovery رسمی Meta دریافت شد.",
+                        username=username,
+                        transport="meta-graph-api",
+                        http_status=response.status_code,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                        response_bytes=len(response.content),
+                        detail=f"monitoring_account_id={account.id}",
+                    )
+                    return result
+
+            error_text = self._graph_error_text(payload, response.status_code)
+            await self.diagnostics.add(
+                level="WARNING",
+                event="official_profile_unavailable",
+                message=(
+                    "Business Discovery پیج هدف را برنگرداند؛ مسیر عمومی به‌عنوان fallback بررسی می‌شود."
+                ),
+                username=username,
+                transport="meta-graph-api",
+                http_status=response.status_code,
+                elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+                response_bytes=len(response.content),
+                detail=f"monitoring_account_id={account.id}; error={error_text}",
+            )
+            error_code = self._graph_error_code(payload)
+            if expected_profile_id and error_code in {100, 803}:
+                return ProfileResult(
+                    CheckOutcome.DEACTIVATED,
+                    source="meta_business_discovery",
+                    profile_id=expected_profile_id,
+                    http_status=404,
+                )
+            last_unknown = ProfileResult(
+                CheckOutcome.UNKNOWN,
+                http_status=response.status_code,
+            )
+        return last_unknown
+
+    async def _set_monitoring_account_health(
+        self,
+        account_id: int,
+        *,
+        healthy: bool,
+        error: str | None,
+    ) -> None:
+        async with self.session_factory() as session:
+            account = await session.get(InstagramMonitoringAccount, account_id)
+            if account is None:
+                return
+            account.last_health_status = "healthy" if healthy else "failed"
+            account.last_error = self._truncate(error, 500)
+            account.last_checked_at = datetime.now(timezone.utc)
+            await session.commit()
+
+    @classmethod
+    def _parse_business_discovery(
+        cls,
+        data: dict[object, object],
+        requested_username: str,
+    ) -> ProfileResult | None:
+        profile_id = str(data.get("id") or "").strip()
+        canonical_username = str(data.get("username") or requested_username).strip().lower()
+        if not profile_id.isdigit() or not canonical_username:
+            return None
+
+        def count(name: str) -> int | None:
+            value = data.get(name)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+        return ProfileResult(
+            outcome=CheckOutcome.ACTIVE,
+            source="meta_business_discovery",
+            metadata_complete=False,
+            canonical_username=canonical_username,
+            profile_id=profile_id,
+            full_name=cls._optional_text(data.get("name")),
+            biography=cls._optional_text(data.get("biography")),
+            profile_picture_url=cls._optional_text(data.get("profile_picture_url")),
+            follower_count=count("followers_count"),
+            following_count=count("follows_count"),
+            post_count=count("media_count"),
+            is_private=None,
+            is_verified=None,
+            http_status=200,
+        )
+
+    @staticmethod
+    def _json_object(body: bytes) -> dict[str, object] | None:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _graph_error_code(payload: dict[str, object] | None) -> int | None:
+        error = payload.get("error") if payload else None
+        code = error.get("code") if isinstance(error, dict) else None
+        return code if isinstance(code, int) and not isinstance(code, bool) else None
+
+    @classmethod
+    def _graph_error_text(
+        cls,
+        payload: dict[str, object] | None,
+        status_code: int,
+    ) -> str:
+        error = payload.get("error") if payload else None
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = str(error.get("message") or "").strip()
+            return f"HTTP {status_code}; code={code}; {message[:300]}"
+        return f"HTTP {status_code}; پاسخ JSON خطای معتبر نداشت"
 
     async def _profile_result_from_response(
         self,
@@ -272,9 +601,19 @@ class InstagramChecker:
 
         status_code = response.status_code
         if status_code == 404 or self._body_indicates_deactivated(response.body):
-            return ProfileResult(CheckOutcome.DEACTIVATED, http_status=status_code)
+            return ProfileResult(
+                CheckOutcome.DEACTIVATED,
+                source="web_profile_explicit_absence",
+                http_status=status_code,
+            )
+
+        discovery_result = await self._search_profile_via_graphql(username)
+        if discovery_result is not None:
+            return discovery_result
+
         if self._response_is_access_blocked(response):
-            self._rate_limited.set()
+            if not self._official_ready:
+                self._rate_limited.set()
             cooldown = await self._activate_cooldown(None)
             await self._record_final_failure(username, response)
             return ProfileResult(
@@ -292,6 +631,179 @@ class InstagramChecker:
             return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
         await self._record_final_failure(username, response)
         return ProfileResult(CheckOutcome.UNKNOWN, http_status=status_code)
+
+    async def _search_profile_via_graphql(
+        self,
+        username: str,
+    ) -> ProfileResult | None:
+        routes = [True, False] if self.settings.instagram_proxy_url else [False]
+        for use_proxy in routes:
+            response = await self._execute_graphql_search_once(
+                username,
+                use_proxy=use_proxy,
+            )
+            result = self._parse_graphql_search_response(
+                response.body,
+                username,
+                response.status_code,
+            )
+            await self.diagnostics.add(
+                level=(
+                    "INFO"
+                    if result is not None
+                    else "WARNING"
+                ),
+                event="graphql_discovery_attempt",
+                message=(
+                    "جست‌وجوی مستقل نام کاربری نتیجه قطعی داد."
+                    if result is not None
+                    else "جست‌وجوی مستقل نام کاربری پاسخ قطعی نداد."
+                ),
+                username=username,
+                transport=response.transport,
+                http_status=response.status_code,
+                return_code=response.return_code,
+                elapsed_ms=response.elapsed_ms,
+                response_bytes=len(response.body),
+                detail=(
+                    f"outcome={result.outcome.value}; source={result.source}"
+                    if result is not None
+                    else self._response_diagnostic(response)
+                ),
+            )
+            if result is not None:
+                return result
+        return None
+
+    async def _execute_graphql_search_once(
+        self,
+        username: str,
+        *,
+        use_proxy: bool,
+    ) -> CurlResponse:
+        url = f"{self.settings.instagram_base_url}/graphql/query"
+        variables = json.dumps(
+            {"hasQuery": True, "query": username},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        started_at = time.perf_counter()
+        client = self._http if use_proxy else self._direct_http
+        transport = (
+            "graphql-search-http2-proxy"
+            if use_proxy
+            else "graphql-search-http2-direct"
+        )
+        try:
+            response = await client.post(
+                url,
+                data={
+                    "variables": variables,
+                    "doc_id": self.settings.instagram_search_doc_id,
+                    "server_timestamps": "true",
+                },
+                headers={
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.8",
+                    "Referer": "https://www.instagram.com/",
+                },
+            )
+        except httpx.HTTPError as exc:
+            return CurlResponse(
+                None,
+                b"",
+                str(exc),
+                1,
+                transport,
+                int((time.perf_counter() - started_at) * 1000),
+            )
+        if len(response.content) > self.MAX_RESPONSE_BYTES:
+            return CurlResponse(
+                response.status_code,
+                b"",
+                "response exceeded safety limit",
+                63,
+                transport,
+                int((time.perf_counter() - started_at) * 1000),
+            )
+        return CurlResponse(
+            response.status_code,
+            response.content,
+            f"httpx {response.http_version}",
+            0,
+            transport,
+            int((time.perf_counter() - started_at) * 1000),
+        )
+
+    @classmethod
+    def _parse_graphql_search_response(
+        cls,
+        body: bytes,
+        requested_username: str,
+        status_code: int | None,
+    ) -> ProfileResult | None:
+        if status_code != 200:
+            return None
+        payload = cls._json_object(body)
+        if payload is None:
+            return None
+        payload_status = payload.get("status")
+        if payload_status is not None and payload_status != "ok":
+            return None
+        data = payload.get("data") if payload else None
+        search = (
+            data.get("xdt_api__v1__fbsearch__non_profiled_serp")
+            if isinstance(data, dict)
+            else None
+        )
+        users = search.get("users") if isinstance(search, dict) else None
+        if not isinstance(users, list):
+            return None
+
+        normalized = requested_username.strip().lower()
+        for entry in users:
+            if not isinstance(entry, dict):
+                continue
+            user_data = entry.get("user") if isinstance(entry.get("user"), dict) else entry
+            raw_username = user_data.get("username")
+            if not isinstance(raw_username, str) or raw_username.lower() != normalized:
+                continue
+            raw_id = user_data.get("id") or user_data.get("pk")
+            profile_id = str(raw_id or "").strip()
+            if not profile_id.isdigit():
+                return None
+            verified = user_data.get("is_verified")
+            return ProfileResult(
+                outcome=CheckOutcome.ACTIVE,
+                source="graphql_username_search",
+                metadata_complete=False,
+                canonical_username=raw_username.lower(),
+                profile_id=profile_id,
+                full_name=cls._optional_text(user_data.get("full_name")),
+                biography=cls._optional_text(user_data.get("biography")),
+                profile_picture_url=cls._optional_text(
+                    user_data.get("profile_pic_url_hd")
+                    or user_data.get("profile_pic_url")
+                ),
+                follower_count=cls._plain_count(user_data.get("follower_count")),
+                following_count=cls._plain_count(user_data.get("following_count")),
+                post_count=cls._plain_count(user_data.get("media_count")),
+                is_private=(
+                    user_data.get("is_private")
+                    if isinstance(user_data.get("is_private"), bool)
+                    else None
+                ),
+                is_verified=verified if isinstance(verified, bool) else None,
+                http_status=200,
+            )
+
+        return ProfileResult(
+            outcome=CheckOutcome.DEACTIVATED,
+            source="graphql_username_search_absence",
+            metadata_complete=False,
+            canonical_username=normalized,
+            http_status=404,
+        )
 
     async def _cache_profile(
         self,
@@ -401,10 +913,10 @@ class InstagramChecker:
         if self._response_is_access_blocked(direct_response):
             await self.diagnostics.add(
                 level="WARNING",
-                event="instagram_circuit_opening",
+                event="web_profile_routes_blocked",
                 message=(
-                    "هم مسیر WARP و هم مسیر مستقیم با رد دسترسی اینستاگرام "
-                    "مواجه شدند؛ ادامه retry متوقف می‌شود."
+                    "مسیر Web Profile روی WARP و اتصال مستقیم رد شد؛ "
+                    "جست‌وجوی مستقل نام کاربری پیش از مدار محافظ اجرا می‌شود."
                 ),
                 trace_id=trace_id,
                 username=username,
@@ -689,6 +1201,7 @@ class InstagramChecker:
 
         return ProfileResult(
             outcome=CheckOutcome.ACTIVE,
+            metadata_complete=True,
             canonical_username=canonical_username,
             profile_id=profile_id,
             full_name=cls._optional_text(user_data.get("full_name")),
@@ -955,6 +1468,18 @@ class InstagramChecker:
         return False
 
     async def reference_profile_preflight(self) -> bool:
+        if await self.official_provider_preflight(force=False):
+            await self.redis.delete(self.REFERENCE_ALERT_KEY)
+            await self.diagnostics.add(
+                level="INFO",
+                event="reference_profile_succeeded",
+                message=(
+                    "حداقل یک حساب مانیتورینگ رسمی Meta سالم است؛ "
+                    "چرخه پایش با provider رسمی آغاز می‌شود."
+                ),
+                transport="meta-graph-api",
+            )
+            return True
         result = await self.fetch_profile(
             "instagram",
             allow_stale=False,
@@ -971,7 +1496,10 @@ class InstagramChecker:
                 ),
                 username="instagram",
                 http_status=result.http_status,
-                detail=f"profile_id={result.profile_id}; from_cache={result.from_cache}",
+                detail=(
+                    f"profile_id={result.profile_id}; from_cache={result.from_cache}; "
+                    f"source={result.source}"
+                ),
             )
             return True
 
@@ -1056,7 +1584,7 @@ class InstagramChecker:
                                 following_count=result.following_count,
                                 post_count=result.post_count,
                                 is_private=result.is_private,
-                                is_verified=result.is_verified,
+                                is_verified=bool(result.is_verified),
                             ),
                         )
                     except Exception as exc:
@@ -1133,8 +1661,9 @@ class InstagramChecker:
                 await lock.release()
 
     async def run(self) -> None:
+        self._official_ready = await self.official_provider_preflight(force=False)
         cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
-        if cooldown_ttl > 0:
+        if cooldown_ttl > 0 and not self._official_ready:
             await self.diagnostics.add(
                 level="WARNING",
                 event="checker_circuit_open",
@@ -1240,7 +1769,9 @@ class InstagramChecker:
             try:
                 if target_id is None:
                     return
-                if self._rate_limited.is_set() or self._lock_lost.is_set():
+                if (
+                    self._rate_limited.is_set() and not self._official_ready
+                ) or self._lock_lost.is_set():
                     continue
                 await self._check_target(target_id)
             except Exception as exc:
@@ -1254,7 +1785,8 @@ class InstagramChecker:
             finally:
                 queue.task_done()
             if target_id is not None and not (
-                self._rate_limited.is_set() or self._lock_lost.is_set()
+                (self._rate_limited.is_set() and not self._official_ready)
+                or self._lock_lost.is_set()
             ):
                 await asyncio.sleep(
                     random.uniform(
@@ -1353,6 +1885,7 @@ class InstagramChecker:
             username,
             allow_stale=False,
             force_refresh=True,
+            expected_profile_id=snapshot.last_known_id,
         )
         await self.diagnostics.add(
             level=(
@@ -1366,7 +1899,7 @@ class InstagramChecker:
             http_status=result.http_status,
             detail=(
                 f"target_id={target_id}; profile_id={result.profile_id or 'none'}; "
-                f"from_cache={result.from_cache}"
+                f"from_cache={result.from_cache}; source={result.source}"
             ),
         )
         if result.outcome == CheckOutcome.UNKNOWN:
@@ -1386,12 +1919,15 @@ class InstagramChecker:
             and known_status != PageStatus.DEACTIVATED
         ):
             confirmations = 1
+            confirmation_sources = [result.source]
             while confirmations < self.settings.deactivation_confirmations:
-                await asyncio.sleep(random.uniform(2.0, 5.0))
+                delay = self.settings.deactivation_confirmation_delay_seconds
+                await asyncio.sleep(random.uniform(delay * 0.8, delay * 1.2))
                 confirmation = await self.fetch_profile(
                     username,
                     allow_stale=False,
                     force_refresh=True,
+                    expected_profile_id=snapshot.last_known_id,
                 )
                 if confirmation.outcome != CheckOutcome.DEACTIVATED:
                     await self._record_inconclusive_check(
@@ -1415,13 +1951,17 @@ class InstagramChecker:
                     )
                     return confirmation
                 confirmations += 1
+                confirmation_sources.append(confirmation.source)
             await self.diagnostics.add(
                 level="INFO",
                 event="deactivation_confirmed_immediately",
                 message=("غیرفعال‌شدن پیج با چند پاسخ قطعی در همان چرخه تأیید شد."),
                 username=username,
                 http_status=result.http_status,
-                detail=(f"target_id={target_id}; confirmations={confirmations}"),
+                detail=(
+                    f"target_id={target_id}; confirmations={confirmations}; "
+                    f"sources={','.join(confirmation_sources)}"
+                ),
             )
 
         notifications: list[NotificationPayload] = []
@@ -1468,11 +2008,14 @@ class InstagramChecker:
             target.last_successful_check_at = checked_at
             target.last_check_outcome = result.outcome.value
             target.last_http_status = result.http_status
+            target.last_evidence_source = result.source
+            target.last_evidence_at = checked_at
             target.status_confirmed = True
             if new_status == PageStatus.ACTIVE:
                 target.consecutive_active_checks += 1
                 target.consecutive_deactivated_checks = 0
             else:
+                target.last_deactivation_evidence_at = checked_at
                 target.consecutive_deactivated_checks = max(
                     self.settings.deactivation_confirmations,
                     target.consecutive_deactivated_checks + 1,
@@ -1530,7 +2073,10 @@ class InstagramChecker:
                     session.add(snapshot)
                 else:
                     escaped_page = html.escape(target.instagram_username)
-                    if snapshot.is_verified != result.is_verified:
+                    if (
+                        result.is_verified is not None
+                        and snapshot.is_verified != result.is_verified
+                    ):
                         verification_event = (
                             "verification_added"
                             if result.is_verified
@@ -1667,6 +2213,10 @@ class InstagramChecker:
                         )
                     if (
                         snapshot.biography is not None
+                        and (
+                            result.metadata_complete
+                            or result.biography is not None
+                        )
                         and snapshot.biography != result.biography
                     ):
                         session.add(
@@ -1775,13 +2325,20 @@ class InstagramChecker:
                 if picture_key:
                     snapshot.profile_picture_key = picture_key
                     snapshot.profile_picture_url = result.profile_picture_url
-                snapshot.full_name = self._truncate(result.full_name, 255)
-                snapshot.biography = self._truncate(result.biography, 2000)
-                snapshot.follower_count = result.follower_count
-                snapshot.following_count = result.following_count
-                snapshot.post_count = result.post_count
-                snapshot.is_private = result.is_private
-                snapshot.is_verified = result.is_verified
+                if result.metadata_complete or result.full_name is not None:
+                    snapshot.full_name = self._truncate(result.full_name, 255)
+                if result.metadata_complete or result.biography is not None:
+                    snapshot.biography = self._truncate(result.biography, 2000)
+                if result.metadata_complete or result.follower_count is not None:
+                    snapshot.follower_count = result.follower_count
+                if result.metadata_complete or result.following_count is not None:
+                    snapshot.following_count = result.following_count
+                if result.metadata_complete or result.post_count is not None:
+                    snapshot.post_count = result.post_count
+                if result.metadata_complete or result.is_private is not None:
+                    snapshot.is_private = result.is_private
+                if result.is_verified is not None:
+                    snapshot.is_verified = result.is_verified
 
             escaped_current = html.escape(target.instagram_username)
             escaped_previous = html.escape(previous_username)
@@ -1820,7 +2377,10 @@ class InstagramChecker:
                         target_page_id=target.id,
                         user_id=target.user_id,
                         event_type="deactivated",
-                        description="پیج از وضعیت فعال به غیرفعال تغییر کرد.",
+                        description=(
+                            "پیج از وضعیت فعال به غیرفعال تغییر کرد؛ "
+                            f"منبع شاهد: {result.source}."
+                        ),
                     )
                 )
                 if notification_settings.notify_deactivation:
@@ -1913,6 +2473,7 @@ class InstagramChecker:
             http_status=result.http_status,
             detail=(
                 f"target_id={target_id}; owner_id={recipient_id}; "
+                f"source={result.source}; metadata_complete={result.metadata_complete}; "
                 f"admin_categories={','.join(sorted(admin_report_categories)) or 'none'}"
             ),
         )
@@ -2014,6 +2575,16 @@ class InstagramChecker:
         if not isinstance(edge, dict):
             return None
         value = edge.get("count")
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int) and value >= 0:
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+        return None
+
+    @staticmethod
+    def _plain_count(value: object) -> int | None:
         if isinstance(value, bool):
             return None
         if isinstance(value, int) and value >= 0:

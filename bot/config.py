@@ -35,10 +35,17 @@ class Settings(BaseSettings):
     check_interval_seconds: int = Field(default=300, ge=30, le=86400)
     check_concurrency: int = Field(default=8, ge=1, le=50)
     deactivation_confirmations: int = Field(default=2, ge=1, le=5)
+    deactivation_confirmation_delay_seconds: float = Field(
+        default=15.0, ge=3.0, le=120.0
+    )
     check_jitter_min_seconds: float = Field(default=0.5, ge=0, le=30)
     check_jitter_max_seconds: float = Field(default=3.0, ge=0, le=60)
     instagram_base_url: str = "https://www.instagram.com"
     instagram_proxy_url: str | None = None
+    instagram_search_doc_id: str = "26347858941511777"
+    meta_graph_base_url: str = "https://graph.facebook.com"
+    meta_graph_api_version: str = "v21.0"
+    credential_encryption_key: SecretStr | None = None
     instagram_request_timeout_seconds: float = Field(default=20.0, ge=5, le=60)
     proxy_health_url: str = "https://www.cloudflare.com/cdn-cgi/trace"
     page_check_delay_min_seconds: float = Field(default=15.0, ge=1, le=60)
@@ -80,12 +87,39 @@ class Settings(BaseSettings):
             raise ValueError("instagram_proxy_url must use socks5, HTTP, or HTTPS")
         return normalized
 
+    @field_validator("instagram_search_doc_id")
+    @classmethod
+    def validate_instagram_search_doc_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.isdigit() or len(normalized) > 32:
+            raise ValueError("instagram_search_doc_id must be numeric")
+        return normalized
+
     @field_validator("proxy_health_url")
     @classmethod
     def validate_proxy_health_url(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized.startswith("https://"):
             raise ValueError("proxy_health_url must use HTTPS")
+        return normalized
+
+    @field_validator("meta_graph_base_url")
+    @classmethod
+    def normalize_meta_graph_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        if normalized != "https://graph.facebook.com":
+            raise ValueError("meta_graph_base_url must be https://graph.facebook.com")
+        return normalized
+
+    @field_validator("meta_graph_api_version")
+    @classmethod
+    def validate_meta_graph_api_version(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized.startswith("v"):
+            normalized = f"v{normalized}"
+        parts = normalized[1:].split(".")
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            raise ValueError("meta_graph_api_version must look like v21.0")
         return normalized
 
     @field_validator("log_level")

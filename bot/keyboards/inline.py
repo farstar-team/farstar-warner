@@ -6,6 +6,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from bot.money import format_money
 from bot.models import (
     DiscountCode,
+    InstagramMonitoringAccount,
     NotificationSettings,
     RequiredChannel,
     SubscriptionPlan,
@@ -798,8 +799,14 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="◈ افزودن پیج پایش ادمین",
+                    text="◈ افزودن پیج هدف مدیر",
                     callback_data="admin:add_target",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔐 حساب‌های رسمی مانیتورینگ",
+                    callback_data="admin:monitoring_accounts",
                 )
             ],
             [
@@ -878,6 +885,60 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                     text="بررسی فوری همه پیج‌ها 🔄", callback_data="admin:check_now"
                 )
             ],
+        ]
+    )
+
+
+def admin_monitoring_accounts_keyboard(
+    accounts: list[InstagramMonitoringAccount],
+    *,
+    encryption_available: bool,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for account in accounts:
+        status = "✅" if account.is_active else "⏸"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{status} {account.label}",
+                    callback_data=f"admin:monitoring:test:{account.id}",
+                ),
+                InlineKeyboardButton(
+                    text="خاموش/روشن",
+                    callback_data=f"admin:monitoring:toggle:{account.id}",
+                ),
+                InlineKeyboardButton(
+                    text="حذف 🗑",
+                    callback_data=f"admin:monitoring:delete:{account.id}",
+                ),
+            ]
+        )
+    if encryption_available:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="➕ افزودن اتصال رسمی Meta",
+                    callback_data="admin:monitoring:add",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="↩️ پنل مدیریت", callback_data="admin:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_monitoring_delete_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="بله، اتصال حذف شود ✅",
+                    callback_data=f"admin:monitoring:delete_confirm:{account_id}",
+                ),
+                InlineKeyboardButton(
+                    text="انصراف ↩️",
+                    callback_data="admin:monitoring_accounts",
+                ),
+            ]
         ]
     )
 

@@ -115,6 +115,10 @@ valid_env_secret() {
   [[ "$1" =~ ^[A-Za-z0-9._~!@%+=:-]+$ ]]
 }
 
+generate_fernet_key() {
+  openssl rand -base64 32 | tr -d '\n' | tr '+/' '-_'
+}
+
 REUSE_EXISTING=false
 if [[ -f "${ENV_FILE}" || -L "${ENV_FILE}" ]] && "${SUDO[@]}" test -s "${ENV_FILE}"; then
   read -r -p "An existing .env configuration was found. Reuse it? [Y/n]: " reuse_answer
@@ -165,6 +169,7 @@ if [[ "${REUSE_EXISTING}" == "false" ]]; then
   printf '\n'
   REDIS_PASSWORD="${REDIS_PASSWORD:-${DEFAULT_REDIS_PASSWORD}}"
   valid_env_secret "${REDIS_PASSWORD}" || fail "The Redis password contains unsupported characters."
+  CREDENTIAL_ENCRYPTION_KEY="$(generate_fernet_key)"
 
   umask 077
   if [[ -L "${ENV_FILE}" ]]; then
@@ -185,12 +190,16 @@ REDIS_HOST=redis
 REDIS_PORT=6379
 REDIS_DB=0
 REDIS_PASSWORD=${REDIS_PASSWORD}
+CREDENTIAL_ENCRYPTION_KEY=${CREDENTIAL_ENCRYPTION_KEY}
+META_GRAPH_API_VERSION=v21.0
 CHECK_INTERVAL_SECONDS=300
 CHECK_CONCURRENCY=8
 DEACTIVATION_CONFIRMATIONS=2
+DEACTIVATION_CONFIRMATION_DELAY_SECONDS=15
 CHECK_JITTER_MIN_SECONDS=0.5
 CHECK_JITTER_MAX_SECONDS=3.0
 INSTAGRAM_PROXY_URL=socks5://warp_proxy:1080
+INSTAGRAM_SEARCH_DOC_ID=26347858941511777
 PROXY_HEALTH_URL=https://www.cloudflare.com/cdn-cgi/trace
 PAGE_CHECK_DELAY_MIN_SECONDS=15
 PAGE_CHECK_DELAY_MAX_SECONDS=45
@@ -199,6 +208,16 @@ LOG_LEVEL=INFO
 EOF
   chmod 600 "${ENV_FILE}"
 fi
+
+if ! "${SUDO[@]}" grep -q '^CREDENTIAL_ENCRYPTION_KEY=' "${ENV_FILE}"; then
+  printf 'CREDENTIAL_ENCRYPTION_KEY=%s\n' "$(generate_fernet_key)" \
+    | "${SUDO[@]}" tee -a "${ENV_FILE}" >/dev/null
+fi
+if ! "${SUDO[@]}" grep -q '^META_GRAPH_API_VERSION=' "${ENV_FILE}"; then
+  printf 'META_GRAPH_API_VERSION=v21.0\n' \
+    | "${SUDO[@]}" tee -a "${ENV_FILE}" >/dev/null
+fi
+"${SUDO[@]}" chmod 600 "${ENV_FILE}"
 
 log "Installing the Farstar server management command..."
 if [[ -d "${PROJECT_DIR}/.git" ]]; then

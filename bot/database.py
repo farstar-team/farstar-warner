@@ -53,6 +53,12 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
                 "last_http_status INTEGER NULL",
                 "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "last_evidence_source VARCHAR(64) NULL",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "last_evidence_at TIMESTAMPTZ NULL",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "last_deactivation_evidence_at TIMESTAMPTZ NULL",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
                 "status_confirmed BOOLEAN NOT NULL DEFAULT FALSE",
                 "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
                 "consecutive_active_checks INTEGER NOT NULL DEFAULT 0",
@@ -134,6 +140,18 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 ),
                 "last_http_status": (
                     "ALTER TABLE target_pages ADD COLUMN last_http_status INTEGER NULL"
+                ),
+                "last_evidence_source": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "last_evidence_source VARCHAR(64) NULL"
+                ),
+                "last_evidence_at": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "last_evidence_at DATETIME NULL"
+                ),
+                "last_deactivation_evidence_at": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "last_deactivation_evidence_at DATETIME NULL"
                 ),
                 "status_confirmed": (
                     "ALTER TABLE target_pages ADD COLUMN "

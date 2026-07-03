@@ -1,6 +1,6 @@
 # Farstar Warner | فارستار وارنر
 
-ربات تلگرام فارسی برای پایش وضعیت پیج‌های عمومی اینستاگرام، بدون دریافت رمز عبور کاربر یا نیاز به کلید رسمی API اینستاگرام.
+ربات تلگرام فارسی برای پایش وضعیت پیج‌های اینستاگرام با مسیر رسمی Meta برای حساب‌های حرفه‌ای و fallback محدودِ عمومی؛ بدون ذخیره رمز عبور یا session cookie اینستاگرام.
 
 [راهنمای فارسی](#راهنمای-فارسی) · [English guide](#english-guide)
 
@@ -12,14 +12,14 @@
 
 فارستار وارنر یک سامانه ناهمگام برای پایش پیج‌های عمومی اینستاگرام است. کاربران می‌توانند پیج‌های موردنظرشان را به ربات اضافه کنند و برای فعال‌شدن، دی‌اکتیوشدن یا تغییر نام کاربری آن‌ها اعلان بگیرند. تمام پیام‌ها، دکمه‌ها، هشدارها و منوهای ربات به زبان فارسی هستند.
 
-این سامانه فقط اطلاعات عمومی را بررسی می‌کند و هیچ رمز عبور، کوکی حساب شخصی یا دسترسی رسمی اینستاگرام از کاربر دریافت نمی‌کند.
+این سامانه رمز عبور یا کوکی حساب شخصی دریافت نمی‌کند. مدیر می‌تواند یک یا چند Instagram Business/Creator را با IG User ID و Instagram User Access Token رسمی Meta متصل کند؛ توکن‌ها با کلید سرور رمزگذاری می‌شوند و هرگز در پنل یا لاگ نمایش داده نمی‌شوند.
 
 ![نمونه کارت تأیید پیج](docs/profile-preview-example.jpg)
 
 ### امکانات
 
 - رابط کاربری کاملاً فارسی با `aiogram 3`
-- پایش وضعیت با اجرای ناهمگام `curl` و Web Profile API دقیقاً با هدرهای تست‌شده روی سرور
+- موتور اجماع Web Profile، جست‌وجوی مستقل GraphQL و Business Discovery رسمی Meta
 - تشخیص تغییر وضعیت فعال و دی‌اکتیو
 - تنظیم جداگانه اعلان‌ها برای هر پیج
 - نمایش زنده عکس پروفایل، تعداد دنبال‌کننده، پست‌ها و عمومی یا خصوصی‌بودن پیج
@@ -38,7 +38,7 @@
 - کنترل اشتراک از پرونده کاربر: تغییر پلن، افزودن ۳۰/۹۰ روز و پایان اشتراک ویژه
 - ماشین وضعیت قطعی با ثبت آخرین تلاش، آخرین پاسخ معتبر و تأییدهای متوالی
 - شناسایی خودکار مدیر اصلی با پلن ویژه، منوی اختصاصی و اعتبار مدیریتی
-- پنل مدیریت برای افزودن پیج مدیر، مشاهده سلامت اتصال عمومی، آمار، تمدید اشتراک، تغییر فاصله و اجرای بررسی فوری
+- پنل مدیریت برای افزودن پیج هدف مدیر، مدیریت چند حساب رسمی مانیتورینگ، مشاهده سلامت تفکیک‌شده اتصال، آمار، تمدید اشتراک، تغییر فاصله و اجرای بررسی فوری
 - مرکز امنیت هر پیج با ۱۰ ابزار: بررسی فوری، امتیاز هشدار، ممیزی عمومی، اثرانگشت هویت، خط مبنا، تاریخچه رخداد، گزارش حادثه، تست اعلان، سلامت پایش و تصویر شواهد
 - PostgreSQL برای نگهداری کاربران، پیج‌ها و تنظیمات
 - Redis برای وضعیت‌های موقت ربات، قفل توزیع‌شده و کنترل محدودیت درخواست
@@ -63,10 +63,14 @@ flowchart LR
     B --> P[("PostgreSQL")]
     B --> R[("Redis")]
     S["APScheduler"] --> C["InstagramChecker"]
+    C --> M["Meta Graph API / Business Discovery"]
+    C --> G["GraphQL username discovery"]
     C --> W["پراکسی داخلی WARP"]
-    W --> H["HTTPX و curl / Web Profile API"]
+    W --> H["HTTPX و curl / fallback عمومی"]
     B --> X["Chromium اختیاری برای پیش‌نمایش"]
-    H --> I["صفحه عمومی اینستاگرام"]
+    M --> I["حساب حرفه‌ای اینستاگرام"]
+    G --> I
+    H --> I["نمای عمومی اینستاگرام"]
     X --> I
     C --> P
     C --> R
@@ -209,7 +213,7 @@ farstar update
 
 پس از نصب، وارد گفت‌وگوی ربات شوید و دستور `/start` را ارسال کنید.
 
-نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **4.4.0** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
+نسخه فعال در پیام شروع و فرمان `/version` نمایش داده می‌شود. نسخه فعلی **5.0.0** است. پس از اولین اجرای موفق هر نسخه جدید، مدیر اصلی یک اعلان فارسی شامل شماره نسخه و فهرست تغییرات دریافت می‌کند. آخرین نسخه‌ای که اعلان شده در Redis نگهداری می‌شود تا با هر restart پیام تکراری ارسال نشود.
 
 منوی اصلی شامل این گزینه‌هاست:
 
@@ -231,7 +235,7 @@ https://www.instagram.com/instagram/
 
 از دکمه `مرکز امنیت و شواهد پیج` نیز می‌توان ۱۰ ابزار دفاعی و گزارش‌گیری را اجرا کرد. خط مبنای هویت در Redis ذخیره می‌شود و اثر فعلی نام، بیوگرافی، تصویر، نوع پیج و نشان تأیید را با آن مقایسه می‌کند.
 
-هنگام افزودن پیج، ربات ابتدا Web Profile API اینستاگرام را بدون Session یا ورود بررسی می‌کند:
+هنگام افزودن یا بررسی پیج، ربات ابتدا Business Discovery رسمی را با حساب‌های مانیتورینگ سالم امتحان می‌کند. سپس Web Profile عمومی اجرا می‌شود و اگر پاسخ آن 401، ناقص یا نامعتبر باشد، جست‌وجوی مستقل GraphQL نام کاربری پیش از فعال‌شدن مدار محافظ اجرا می‌شود:
 
 - اگر پیج فعال باشد، نام، بیوگرافی، تصویر، دنبال‌کننده، دنبال‌شونده، تعداد پست، نوع پیج و نشان تأیید مستقیماً از JSON استخراج می‌شود. ربات اطلاعات فارسی و کارت تصویری اختصاصی را برای تأیید می‌فرستد؛ شکست ساخت یا ارسال عکس مانع نمایش متن و دکمه تأیید نمی‌شود.
 - اگر پاسخ `404` باشد، گزینه «ثبت به‌عنوان پیج غیرفعال» نمایش داده می‌شود. این پیج با وضعیت غیرفعال ذخیره می‌شود و به‌محض بازگشت پاسخ `200`، اعلان فعال‌شدن ارسال خواهد شد.
@@ -260,6 +264,7 @@ https://www.instagram.com/instagram/
 - مدیریت کاربران همراه جست‌وجوی شناسه، مشاهده اشتراک، خریدها، فیش‌ها، پیج‌ها و مسدودسازی حساب
 - کنترل مستقیم اشتراک هر کاربر، شامل تغییر پلن و روزها، تمدید سریع و بازگرداندن به پلن رایگان
 - مشاهده وضعیت Chromium، endpoint عمومی، cooldown و حالت ورود/عدم ورود
+- افزودن، تست، توقف و حذف چند اتصال رسمی Meta؛ توکن ورودی فوراً از چت حذف و در PostgreSQL رمزگذاری می‌شود
 - مشاهده مرکز لاگ فنی شامل نتیجه هر مسیر HTTPX/HTTP2 و curl، کد HTTP، زمان پاسخ، اندازه پاسخ، علت رد پاسخ و شناسه رهگیری
 - دریافت فایل UTF-8 از ۵۰۰ رخداد اخیر برای گزارش خطا و امکان پاک‌سازی لاگ با تأیید دوباره
 
@@ -280,10 +285,12 @@ https://www.instagram.com/instagram/
 
 ### منطق پایش
 
-پیش از هر چرخه، چکر پیج ثابت `@instagram` را با پاسخ زنده بررسی می‌کند. فقط اگر این پیج مرجع قابل مشاهده باشد وضعیت هدف‌ها تغییر می‌کند؛ بنابراین خرابی مسیر اتصال با دی‌اکتیوشدن پیج اشتباه نمی‌شود. HTTPX/HTTP2 مسیر اصلی است و curl بدون shell، رمز، Session یا grep به‌عنوان fallback اجرا می‌شود. اگر WARP سالم نباشد اما مسیر مستقیم سرور پاسخ معتبر بدهد، پایش از failover مستقیم ادامه پیدا می‌کند:
+پیش از هر چرخه، چکر ابتدا سلامت حساب‌های رسمی Meta را با شناسه خود همان حساب آزمایش می‌کند. اگر دست‌کم یک اتصال رسمی سالم باشد، حساب‌های حرفه‌ای هدف با Business Discovery بررسی می‌شوند. در نبود provider رسمی سالم، پیج ثابت `@instagram` باید از Web Profile یا جست‌وجوی مستقل GraphQL پاسخ معتبر بدهد. جست‌وجو با `doc_id` مورد استفاده نسخه فعال Instaloader و تطابق دقیق username انجام می‌شود؛ پیشنهادهای مشابه به‌عنوان حساب هدف پذیرفته نمی‌شوند:
 
 - انتقال وضعیت از دی‌اکتیو به فعال، اعلان `پیج فعال شد! 🎉` ایجاد می‌کند.
-- انتقال وضعیت از فعال به دی‌اکتیو پس از دو پاسخ قطعی در همان چرخه، اعلان `پیج دی‌اکتیو شد! ⚠️` ایجاد می‌کند و به چرخه بعد موکول نمی‌شود.
+- انتقال وضعیت از فعال به دی‌اکتیو پس از دو شاهد قطعی با فاصله پیش‌فرض حدود ۱۵ ثانیه، اعلان `پیج دی‌اکتیو شد! ⚠️` ایجاد می‌کند.
+- پاسخ JSON سالم جست‌وجو که username دقیق را ندارد، شاهد غیرفعال/تغییرنام است؛ پاسخ 401، login wall، JSON ناقص یا خطای شبکه هرگز شاهد غیرفعال‌شدن نیست.
+- منبع و زمان آخرین شاهد قطعی و آخرین شاهد غیرفعال‌شدن برای هر پیج در دیتابیس ذخیره و در جزئیات پیج نمایش داده می‌شود.
 - هر پیج وضعیت قطعی، نتیجه آخرین تلاش، زمان آخرین پاسخ معتبر، کد HTTP و شمارنده تأیید فعال/غیرفعال مستقل دارد.
 - وضعیت انتخاب‌شده دستی هنگام ثبت، تا زمان اولین پاسخ معتبر با برچسب «در انتظار تأیید قطعی» نمایش داده می‌شود.
 - ورود به جزئیات پیج ابتدا تست مرجع و سپس بررسی همان پیج را اجرا می‌کند و وضعیت نمایش‌داده‌شده را با دیتابیس همگام می‌سازد.
@@ -296,13 +303,24 @@ https://www.instagram.com/instagram/
 - اولین بررسی فقط وضعیت پایه را ثبت می‌کند و اعلان تغییر وضعیت نمی‌فرستد.
 - پاسخ‌های ورود اجباری، چالش امنیتی، خطاهای شبکه و خطاهای موقت به‌عنوان وضعیت نامشخص در نظر گرفته می‌شوند و وضعیت ذخیره‌شده را تغییر نمی‌دهند.
 - هدف‌ها با workerهای هم‌زمان محدودشده توسط `CHECK_CONCURRENCY` پردازش می‌شوند؛ هر worker بین هدف‌های خود فاصله تصادفی دارد تا یک فهرست بزرگ ساعت‌ها در صف نماند.
-- پاسخ `401` همراه `Please wait`، پاسخ `403` و پاسخ `429` رد موقت دسترسی محسوب می‌شوند. پس از یک تلاش WARP و یک تلاش مستقیم، مدار محافظ باز می‌شود و تا ۱۵ دقیقه هیچ retry تکراری ارسال نمی‌شود.
+- پاسخ `401` همراه `Please wait`، پاسخ `403` و پاسخ `429` در Web Profile ابتدا باعث اجرای GraphQL discovery می‌شوند. فقط اگر discovery نیز پاسخ قطعی ندهد، مدار محافظ عمومی تا ۱۵ دقیقه باز می‌شود؛ provider رسمی سالم همچنان ادامه می‌دهد.
 - هر چرخه و همچنین تست مستقل پنج‌دقیقه‌ای، `@instagram`، مسیر اتصال و توانایی ساخت کارت تصویری را بررسی می‌کند؛ خطای تشخیصی برای مدیر و بازیابی سلامت نیز اطلاع‌رسانی می‌شود.
 
 سلامت WARP فقط با Cloudflare Trace و مقدار `warp=on` سنجیده می‌شود و دیگر پاسخ 401 اینستاگرام به‌اشتباه «خرابی WARP» گزارش نمی‌شود. `warp-supervisor.sh` هنگام سه شکست واقعی Trace، همان تونل ثبت‌شده را reconnect می‌کند. برنامه برای دورزدن rate limit، ثبت حساب WARP تازه یا تعویض اجباری IP انجام نمی‌دهد و Docker socket نیز در اختیار ربات قرار نمی‌گیرد.
 
 > [!IMPORTANT]
-> اینستاگرام می‌تواند ساختار صفحات عمومی یا سیاست‌های دسترسی خود را بدون اطلاع قبلی تغییر دهد. پایش بدون API رسمی تضمین دائمی ندارد. فقط پیج‌های عمومی را بررسی کنید و قوانین محل فعالیت و شرایط استفاده سرویس‌ها را رعایت کنید.
+> اینستاگرام می‌تواند ساختار صفحات عمومی یا سیاست‌های دسترسی خود را بدون اطلاع قبلی تغییر دهد. Meta Business Discovery فقط حساب‌های حرفه‌ای Business/Creator را پوشش می‌دهد و حساب شخصی/خصوصی را تضمین نمی‌کند. fallback عمومی نیز تضمین دائمی ندارد.
+
+### اتصال حساب حرفه‌ای مدیر
+
+مطابق مستندات Meta، حساب مانیتورینگ باید Instagram Business یا Creator باشد، به Facebook Page متصل شود و اپ Meta مجوزهای لازم و Instagram User Access Token داشته باشد. سپس:
+
+1. در ربات وارد «پنل مدیریت» و «حساب‌های رسمی مانیتورینگ» شوید.
+2. «افزودن اتصال رسمی Meta» را بزنید.
+3. یک نام داخلی، IG User ID عددی و توکن رسمی را ارسال کنید.
+4. ربات پیش از ذخیره، خود حساب را از Graph API آزمایش می‌کند؛ پیام توکن حذف و مقدار آن با کلید اختصاصی سرور رمزگذاری می‌شود.
+
+رمز عبور، sessionid و کوکی مرورگر در این مسیر پذیرفته یا ذخیره نمی‌شوند. می‌توانید چند حساب رسمی ثبت کنید؛ اتصال خراب کنار گذاشته می‌شود و اتصال سالم بعدی استفاده خواهد شد.
 
 ### متغیرهای محیطی
 
@@ -323,13 +341,17 @@ https://www.instagram.com/instagram/
 | `REDIS_PORT` | خیر | `6379` | پورت Redis |
 | `REDIS_DB` | خیر | `0` | شماره دیتابیس Redis |
 | `REDIS_PASSWORD` | بله | — | رمز Redis |
+| `CREDENTIAL_ENCRYPTION_KEY` | برای اتصال رسمی | ساخته‌شده توسط نصب‌کننده | کلید Fernet برای رمزگذاری توکن‌های Meta؛ پس از ثبت توکن تغییر ندهید |
+| `META_GRAPH_API_VERSION` | خیر | `v21.0` | نسخه Graph API؛ هنگام ارتقای اپ Meta قابل تغییر است |
 | `CHECK_INTERVAL_SECONDS` | خیر | `300` | فاصله اولیه بررسی‌ها؛ حداقل ۳۰ ثانیه |
 | `CHECK_CONCURRENCY` | خیر | `8` | تعداد بررسی هم‌زمان؛ بین ۱ تا ۵۰ |
 | `DEACTIVATION_CONFIRMATIONS` | خیر | `2` | تعداد پاسخ قطعی متوالی پیش از ثبت دی‌اکتیوشدن |
+| `DEACTIVATION_CONFIRMATION_DELAY_SECONDS` | خیر | `15` | فاصله میان شواهد تأیید غیرفعال‌شدن |
 | `CHECK_JITTER_MIN_SECONDS` | خیر | `0.5` | کمترین تأخیر تصادفی |
 | `CHECK_JITTER_MAX_SECONDS` | خیر | `3.0` | بیشترین تأخیر تصادفی |
 | `INSTAGRAM_BASE_URL` | خیر | `https://www.instagram.com` | نشانی پایه صفحات عمومی |
 | `INSTAGRAM_PROXY_URL` | خیر | `socks5://warp_proxy:1080` در Docker | پراکسی داخلی مخصوص درخواست‌های پایش |
+| `INSTAGRAM_SEARCH_DOC_ID` | خیر | `26347858941511777` | شناسه query جست‌وجوی دقیق؛ فقط هنگام تغییر upstream به‌روزرسانی شود |
 | `INSTAGRAM_REQUEST_TIMEOUT_SECONDS` | خیر | `20` | مهلت هر درخواست HTTP |
 | `PROXY_HEALTH_URL` | خیر | `https://www.cloudflare.com/cdn-cgi/trace` | endpoint بررسی عبور ترافیک از WARP |
 | `PAGE_CHECK_DELAY_MIN_SECONDS` | خیر | `15` | کمترین فاصله میان دو بررسی |
@@ -381,7 +403,13 @@ docker compose logs --tail=100 bot-app
 3. خروجی `docker compose logs --tail=100 bot-app` را بررسی کنید.
 4. مطمئن شوید سرور به `api.telegram.org` دسترسی دارد.
 
-اگر بررسی اینستاگرام انجام نمی‌شود، ابتدا وضعیت `warp_proxy` و سپس بخش «وضعیت اتصال اینستاگرام» و «لاگ کامل و عیب‌یابی» پنل مدیر را بررسی کنید. پاسخ `401`، `403` یا `429` وضعیت ذخیره‌شده پیج‌ها را تغییر نمی‌دهد.
+اگر بررسی اینستاگرام انجام نمی‌شود، ابتدا دستور زیر را اجرا کنید. این فرمان `warp=on` و کد HTTP مسیر مستقیم و WARP را جدا نشان می‌دهد:
+
+```bash
+farstar doctor warner
+```
+
+سپس بخش «وضعیت اتصال اینستاگرام»، «حساب‌های رسمی مانیتورینگ» و «لاگ کامل و عیب‌یابی» پنل مدیر را بررسی کنید. پاسخ `401`، `403` یا `429` به معنی ردشدن درخواست توسط اینستاگرام است، نه اثبات خرابی فایروال؛ چنین پاسخی وضعیت ذخیره‌شده پیج‌ها را تغییر نمی‌دهد.
 
 مشاهده علت دقیق سلامت WARP:
 
@@ -433,12 +461,13 @@ farstar-warner/
 
 ## English guide
 
-Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram profiles without collecting Instagram passwords or requiring official Instagram API credentials. The Telegram interface is entirely in Persian; the Ubuntu installer is in English.
+Farstar Warner is an asynchronous Telegram bot with a multi-source evidence engine: official Meta Business Discovery, Web Profile metadata, and exact-match GraphQL username discovery. It never stores Instagram passwords or session cookies. The Telegram interface is entirely in Persian; the Ubuntu installer is in English.
 
 ### Main features
 
 - Asynchronous Telegram UI with aiogram 3
-- Asynchronous curl-based Web Profile API checks using the server-validated headers
+- Multiple encrypted Meta Business/Creator monitoring connections managed by the administrator
+- Official Business Discovery plus exact-match GraphQL discovery before opening the public circuit breaker
 - Activation and confirmed deactivation notifications with image evidence
 - Per-profile hourly or threshold-based follower reports
 - Black-and-gold bilingual live cards and image reports for monitoring events
@@ -457,7 +486,7 @@ Farstar Warner is an asynchronous Telegram bot for monitoring public Instagram p
 - Mandatory membership checks for administrator-configured Telegram channels
 - Support-contact and card-transfer checkout with duplicate-resistant receipts and manual approval
 - Stable profile-picture change detection and richer incident snapshots
-- Restricted administrator panel with admin target onboarding and public-access health diagnostics
+- Restricted administrator panel with admin target onboarding, official-provider health, and separated WARP/direct diagnostics
 - Ten defensive per-profile tools for identity baselines, audit evidence, history, risk scoring, test alerts, health, and incident reports
 - Automatic primary-administrator provisioning with a dedicated menu
 - PostgreSQL persistence and Redis coordination
@@ -498,6 +527,6 @@ Open the bot and send `/start`. The configured administrator can access the rest
 
 ### Operational note
 
-Instagram can change public page behavior or apply temporary access restrictions at any time. Login redirects, challenge pages, network errors, and temporary server failures do not overwrite the last known profile state. A `401` with a wait message, `403`, or `429` opens a Redis-backed circuit breaker so repeated retries cannot amplify a temporary denial. WARP health is measured independently through Cloudflare Trace.
+Instagram can change public behavior or apply temporary restrictions at any time. Login redirects, malformed JSON, challenge pages, and network errors never become deactivation evidence. Web Profile denial triggers independent username discovery first; the public circuit breaker opens only when both sources are inconclusive. WARP health is measured independently through Cloudflare Trace. Business Discovery covers professional Business/Creator targets, not every personal or private account.
 
 Use the software only for public profiles and in accordance with applicable law and platform terms.

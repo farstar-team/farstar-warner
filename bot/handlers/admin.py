@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, Router
@@ -18,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 
 from bot.checker import CheckOutcome, InstagramChecker
 from bot.config import Settings
+from bot.credential_store import CredentialStoreError
 from bot.database import SessionFactory
 from bot.diagnostics import DiagnosticEntry
 from bot.handlers.user import AddPageState
@@ -25,6 +27,8 @@ from bot.keyboards.inline import (
     admin_channels_keyboard,
     admin_discounts_keyboard,
     admin_diagnostics_keyboard,
+    admin_monitoring_accounts_keyboard,
+    admin_monitoring_delete_keyboard,
     admin_panel_keyboard,
     admin_plan_keyboard,
     admin_plans_keyboard,
@@ -41,6 +45,7 @@ from bot.keyboards.inline import (
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import (
     DiscountCode,
+    InstagramMonitoringAccount,
     PageEvent,
     PageStatus,
     PaymentConfig,
@@ -170,6 +175,12 @@ class AdminUserState(StatesGroup):
     waiting_for_user_id = State()
 
 
+class AdminMonitoringAccountState(StatesGroup):
+    waiting_for_label = State()
+    waiting_for_instagram_user_id = State()
+    waiting_for_access_token = State()
+
+
 def _digits(value: object) -> str:
     return str(value).translate(PERSIAN_DIGITS)
 
@@ -220,6 +231,9 @@ async def _reject_callback(callback: CallbackQuery, settings: Settings) -> bool:
         AdminStoreState.waiting_for_url,
         AdminReportCopyState.waiting_for_user_id,
         AdminUserState.waiting_for_user_id,
+        AdminMonitoringAccountState.waiting_for_label,
+        AdminMonitoringAccountState.waiting_for_instagram_user_id,
+        AdminMonitoringAccountState.waiting_for_access_token,
     ),
     F.text == "لغو عملیات ↩️",
 )
@@ -1953,6 +1967,306 @@ async def view_user_payments(
     await callback.answer()
 
 
+async def _show_monitoring_accounts(
+    callback: CallbackQuery,
+    checker: InstagramChecker,
+    *,
+    answer_callback: bool = True,
+) -> None:
+    accounts = await checker.monitoring_accounts()
+    lines = [
+        "<b>حساب‌های رسمی مانیتورینگ 🔐</b>",
+        "",
+        "این بخش فقط اتصال رسمی Instagram Business/Creator از طریق Meta Graph API را نگه می‌دارد. رمز اینستاگرام یا کوکی نشست ذخیره نمی‌شود.",
+        "",
+    ]
+    if not checker.credentials.available:
+        lines.extend(
+            (
+                "رمزگذاری اطلاعات محرمانه روی سرور تنظیم نشده است. ❌",
+                "ابتدا آخرین نسخه نصب‌کننده را اجرا کنید یا مقدار <code>CREDENTIAL_ENCRYPTION_KEY</code> را در فایل محیطی نمونه تنظیم و سرویس را recreate کنید.",
+            )
+        )
+    elif not accounts:
+        lines.append("هنوز هیچ اتصال رسمی ثبت نشده است.")
+    else:
+        status_names = {
+            "healthy": "سالم ✅",
+            "failed": "نامعتبر ❌",
+            None: "آزمایش نشده ⚪",
+        }
+        for account in accounts:
+            lines.extend(
+                (
+                    f"<b>#{_digits(account.id)} — {html.escape(account.label)}</b>",
+                    f"IG User ID: <code>{html.escape(account.instagram_user_id)}</code>",
+                    f"حالت: {'فعال ✅' if account.is_active else 'متوقف ⏸'}",
+                    f"سلامت: {status_names.get(account.last_health_status, 'نامشخص ⚪')}",
+                    (
+                        f"آخرین تست:\n{format_datetime_dual(account.last_checked_at)}"
+                        if account.last_checked_at
+                        else "آخرین تست: انجام نشده"
+                    ),
+                    "",
+                )
+            )
+    lines.extend(
+        (
+            "نکته: Business Discovery فقط متادیتای حساب‌های حرفه‌ای دیگر را برمی‌گرداند؛ حساب شخصی یا بعضی حساب‌های محدود همچنان از مسیر عمومی بررسی می‌شوند.",
+            "برای هر ردیف، لمس نام اتصال همان لحظه سلامت توکن را آزمایش می‌کند.",
+        )
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            "\n".join(lines),
+            reply_markup=admin_monitoring_accounts_keyboard(
+                accounts,
+                encryption_available=checker.credentials.available,
+            ),
+        )
+    if answer_callback:
+        await callback.answer()
+
+
+@router.callback_query(F.data == "admin:monitoring_accounts")
+async def admin_monitoring_accounts(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await _show_monitoring_accounts(callback, checker)
+
+
+@router.callback_query(F.data == "admin:monitoring:add")
+async def begin_monitoring_account_add(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+    state: FSMContext,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    if not checker.credentials.available:
+        await callback.answer("رمزگذاری امن روی سرور تنظیم نشده است.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminMonitoringAccountState.waiting_for_label)
+    if callback.message:
+        await callback.message.answer(
+            "یک نام داخلی برای حساب مانیتورینگ بفرستید؛ نمونه: حساب اصلی امنیت",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminMonitoringAccountState.waiting_for_label, F.text)
+async def monitoring_account_label(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    label = (message.text or "").strip()
+    if not 2 <= len(label) <= 80:
+        await message.answer("نام باید بین ۲ تا ۸۰ نویسه باشد.")
+        return
+    await state.update_data(label=label)
+    await state.set_state(AdminMonitoringAccountState.waiting_for_instagram_user_id)
+    await message.answer(
+        "شناسه عددی Instagram User حساب حرفه‌ای متصل به Meta را بفرستید.\n\nاین مقدار نام کاربری نیست و فقط باید عدد باشد."
+    )
+
+
+@router.message(AdminMonitoringAccountState.waiting_for_instagram_user_id, F.text)
+async def monitoring_account_user_id(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    instagram_user_id = (message.text or "").strip()
+    if not instagram_user_id.isdigit() or len(instagram_user_id) > 64:
+        await message.answer("IG User ID نامعتبر است؛ فقط شناسه عددی را ارسال کنید.")
+        return
+    await state.update_data(instagram_user_id=instagram_user_id)
+    await state.set_state(AdminMonitoringAccountState.waiting_for_access_token)
+    await message.answer(
+        "Instagram User Access Token رسمی را ارسال کنید. پیام توکن بلافاصله حذف و مقدار آن پیش از ذخیره رمزگذاری می‌شود.\n\nاز ارسال رمز عبور یا session cookie خودداری کنید."
+    )
+
+
+@router.message(AdminMonitoringAccountState.waiting_for_access_token, F.text)
+async def monitoring_account_token(
+    message: Message,
+    settings: Settings,
+    state: FSMContext,
+    checker: InstagramChecker,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_message(message, settings):
+        return
+    token = (message.text or "").strip()
+    with suppress(TelegramAPIError):
+        await message.delete()
+    if len(token) < 20 or len(token) > 3000:
+        await message.answer("توکن از نظر طول معتبر نیست؛ دوباره ارسال کنید.")
+        return
+    data = await state.get_data()
+    instagram_user_id = str(data.get("instagram_user_id") or "")
+    healthy, error, graph_username = await checker.validate_monitoring_account(
+        instagram_user_id,
+        token,
+        force=True,
+    )
+    if not healthy:
+        await message.answer(
+            "اتصال رسمی تأیید نشد. ❌\n\n"
+            f"علت: <code>{html.escape(error[:500])}</code>\n\n"
+            "توکن یا IG User ID را اصلاح کنید و توکن را دوباره بفرستید."
+        )
+        return
+    try:
+        encrypted = checker.credentials.encrypt(token)
+    except CredentialStoreError as exc:
+        await state.clear()
+        await message.answer(f"ذخیره امن انجام نشد: <code>{html.escape(str(exc))}</code>")
+        return
+    async with session_factory() as session:
+        account = InstagramMonitoringAccount(
+            label=str(data.get("label") or graph_username or "حساب مانیتورینگ"),
+            instagram_user_id=instagram_user_id,
+            access_token_encrypted=encrypted,
+            is_active=True,
+            last_health_status="healthy",
+            last_error=None,
+            last_checked_at=datetime.now(timezone.utc),
+        )
+        session.add(account)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            await state.clear()
+            await message.answer("این IG User ID قبلاً ثبت شده است.")
+            return
+    await state.clear()
+    await message.answer(
+        "اتصال رسمی Meta با موفقیت آزمایش، رمزگذاری و فعال شد. ✅\n\n"
+        f"حساب متصل: <b>@{html.escape(graph_username or 'نامشخص')}</b>",
+        reply_markup=main_menu_keyboard(is_admin=True),
+    )
+
+
+@router.callback_query(F.data.startswith("admin:monitoring:test:"))
+async def test_monitoring_account(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        account_id = int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("شناسه اتصال نامعتبر است.", show_alert=True)
+        return
+    async with session_factory() as session:
+        account = await session.get(InstagramMonitoringAccount, account_id)
+    if account is None:
+        await callback.answer("اتصال پیدا نشد.", show_alert=True)
+        return
+    try:
+        token = checker.credentials.decrypt(account.access_token_encrypted)
+    except CredentialStoreError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.answer("در حال آزمایش اتصال رسمی…")
+    healthy, error, _ = await checker.validate_monitoring_account(
+        account.instagram_user_id,
+        token,
+        account_id=account.id,
+        force=True,
+    )
+    if callback.message:
+        await callback.message.answer(
+            "اتصال رسمی سالم است. ✅" if healthy else f"اتصال رسمی نامعتبر است. ❌\n<code>{html.escape(error[:500])}</code>"
+        )
+    await _show_monitoring_accounts(callback, checker, answer_callback=False)
+
+
+@router.callback_query(F.data.startswith("admin:monitoring:toggle:"))
+async def toggle_monitoring_account(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        account_id = int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("شناسه اتصال نامعتبر است.", show_alert=True)
+        return
+    async with session_factory() as session:
+        account = await session.get(InstagramMonitoringAccount, account_id)
+        if account is None:
+            await callback.answer("اتصال پیدا نشد.", show_alert=True)
+            return
+        account.is_active = not account.is_active
+        await session.commit()
+    await checker.redis.delete(f"{checker.GRAPH_HEALTH_PREFIX}{account_id}")
+    await _show_monitoring_accounts(callback, checker)
+
+
+@router.callback_query(F.data.startswith("admin:monitoring:delete:"))
+async def confirm_monitoring_account_delete(
+    callback: CallbackQuery,
+    settings: Settings,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        account_id = int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("شناسه اتصال نامعتبر است.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            "با حذف اتصال، توکن رمزگذاری‌شده آن برای همیشه از دیتابیس پاک می‌شود. ادامه می‌دهید؟",
+            reply_markup=admin_monitoring_delete_keyboard(account_id),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:monitoring:delete_confirm:"))
+async def delete_monitoring_account(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        account_id = int((callback.data or "").rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("شناسه اتصال نامعتبر است.", show_alert=True)
+        return
+    async with session_factory() as session:
+        account = await session.get(InstagramMonitoringAccount, account_id)
+        if account is not None:
+            await session.delete(account)
+            await session.commit()
+    await checker.redis.delete(f"{checker.GRAPH_HEALTH_PREFIX}{account_id}")
+    await _show_monitoring_accounts(callback, checker)
+
+
 @router.callback_query(F.data == "admin:add_target")
 async def begin_admin_add_target(
     callback: CallbackQuery,
@@ -1983,6 +2297,8 @@ async def instagram_connection_health(
         return
     await callback.answer("در حال آزمایش مسیر عمومی اینستاگرام…")
     warp_ok = await checker.proxy_preflight()
+    official_ok = await checker.official_provider_preflight(force=True)
+    monitoring_accounts = await checker.monitoring_accounts()
     browser_ok, browser_version = await profile_preview.browser_health()
     cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
     result = await checker.fetch_profile(
@@ -2047,17 +2363,20 @@ async def instagram_connection_health(
     )
     text = (
         "وضعیت اتصال اینستاگرام 🌐\n\n"
-        "حالت دسترسی: <b>نمای عمومی بدون ورود</b>\n"
-        "وضعیت ورود: <b>وارد نشده</b>\n"
-        "ذخیره رمز یا کوکی: <b>غیرفعال</b>\n"
+        "مسیر رسمی Meta: "
+        f"<b>{'سالم و آماده ✅' if official_ok else 'تنظیم نشده یا نامعتبر ⚪'}</b>\n"
+        f"تعداد اتصال‌های رسمی: <b>{_digits(len(monitoring_accounts))}</b>\n"
+        "ذخیره رمز یا کوکی اینستاگرام: <b>غیرفعال ✅</b>\n"
+        "توکن‌های رسمی: <b>رمزگذاری‌شده در دیتابیس</b>\n"
         f"پراکسی WARP: <b>{proxy_text}</b>\n"
         f"سلامت مسیر WARP: <b>{warp_text}</b>\n"
         f"شکست‌های متوالی مسیر: <b>{_digits(proxy_failure_streak)}</b>\n"
         f"Chromium: <b>{browser_text}</b>\n"
         f"نتیجه تست: <b>{outcome_names[result.outcome]}</b>\n"
+        f"منبع نتیجه: <code>{html.escape(result.source)}</code>\n"
         f"کد HTTP: <code>{http_text}</code>\n"
-        f"رندر واقعی: <b>{render_text}</b>\n"
-        f"تشخیص رندر: <b>{render_diagnostic}</b>\n"
+        f"رندر عمومی بدون ورود: <b>{render_text}</b>\n"
+        f"تشخیص رندر عمومی: <b>{render_diagnostic}</b>\n"
         f"توقف موقت چکر: <b>{cooldown_text}</b>\n\n"
         "پاسخ نامشخص هیچ‌گاه وضعیت پیج را به دی‌اکتیو تغییر نمی‌دهد."
     )
