@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -336,3 +337,76 @@ async def test_web_profile_401_uses_discovery_before_circuit_breaker() -> None:
     assert result is evidence
     checker._activate_cooldown.assert_not_awaited()
     checker._record_final_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_worker_queue_completes_without_sentinel_tokens() -> None:
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker._rate_limited = asyncio.Event()
+    checker._lock_lost = asyncio.Event()
+    checker._official_ready = False
+    checker.settings = SimpleNamespace(
+        page_check_delay_min_seconds=0,
+        page_check_delay_max_seconds=0,
+    )
+    checker._check_target = AsyncMock()
+
+    class Diagnostics:
+        async def add(self, **_: object) -> None:
+            return None
+
+    checker.diagnostics = Diagnostics()
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for target_id in (1, 2, 3, 4):
+        queue.put_nowait(target_id)
+    workers = [asyncio.create_task(checker._worker(queue)) for _ in range(2)]
+    await asyncio.wait_for(queue.join(), timeout=1)
+    for worker in workers:
+        worker.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    assert checker._check_target.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_three_profile_baseline_accepts_one_verified_active_result() -> None:
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker._rate_limited = asyncio.Event()
+    checker.fetch_profile = AsyncMock(
+        side_effect=[
+            ProfileResult(
+                CheckOutcome.ACTIVE,
+                source="graphql_username_search",
+                canonical_username="instagram",
+                profile_id="1",
+            ),
+            ProfileResult(CheckOutcome.RATE_LIMITED),
+            ProfileResult(CheckOutcome.UNKNOWN),
+        ]
+    )
+
+    class Redis:
+        async def delete(self, *_: object) -> None:
+            return None
+
+        async def set(self, *_: object, **__: object) -> bool:
+            return True
+
+    class Diagnostics:
+        async def add(self, **_: object) -> None:
+            return None
+
+    checker.redis = Redis()
+    checker.diagnostics = Diagnostics()
+    checker._notify = AsyncMock()
+    checker.settings = SimpleNamespace(admin_telegram_id=999)
+
+    assert await checker.reference_profile_preflight() is True
+    assert checker.fetch_profile.await_count == 3
+    checker._notify.assert_not_awaited()
+
+
+def test_text_delta_normalization_coerces_none_and_empty_string() -> None:
+    assert InstagramChecker._normalize_text(None) == ""
+    assert InstagramChecker._normalize_text("") == ""
+    assert InstagramChecker._normalize_text("  Name  ") == "Name"

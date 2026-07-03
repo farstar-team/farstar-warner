@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
-import re
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from enum import Enum
-from pathlib import Path
 
-import arabic_reshaper
 import httpx
-from bidi.algorithm import get_display
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from playwright.async_api import (
     Browser,
+    BrowserContext,
     Playwright,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
@@ -53,6 +49,7 @@ class EmbedProfile:
 
 class ProfilePreviewService:
     CACHE_PREFIX = "farstar:embed-preview:"
+    MAX_AVATAR_BYTES = 8_000_000
 
     def __init__(self, redis: Redis, settings: Settings) -> None:
         self.redis = redis
@@ -64,15 +61,18 @@ class ProfilePreviewService:
         self._http = httpx.AsyncClient(
             timeout=httpx.Timeout(settings.instagram_request_timeout_seconds),
             follow_redirects=False,
+            trust_env=False,
             limits=httpx.Limits(max_connections=4, max_keepalive_connections=2),
         )
 
     async def close(self) -> None:
         if self._browser is not None:
-            await self._browser.close()
+            with suppress(Exception):
+                await self._browser.close()
             self._browser = None
         if self._playwright is not None:
-            await self._playwright.stop()
+            with suppress(Exception):
+                await self._playwright.stop()
             self._playwright = None
         await self._http.aclose()
 
@@ -85,20 +85,37 @@ class ProfilePreviewService:
             return False, None
 
     async def probe_status(self, username: str) -> ProfileResult:
-        """Resolve an inconclusive HTTP check through the rendered public embed."""
         profile = await self.inspect(username, use_cache=False)
         if profile.outcome == PreviewOutcome.ACTIVE:
             return ProfileResult(
                 CheckOutcome.ACTIVE,
-                canonical_username=profile.username,
+                source="playwright_public_embed",
+                metadata_complete=False,
+                canonical_username=profile.username.lower(),
+                full_name=self._normalize_text(profile.full_name),
+                biography=self._normalize_text(profile.biography),
+                profile_picture_url=profile.profile_picture_url,
+                follower_count=profile.follower_count,
+                following_count=profile.following_count,
+                post_count=profile.post_count,
+                is_private=profile.is_private,
+                is_verified=profile.is_verified,
                 http_status=200,
             )
         if profile.outcome == PreviewOutcome.DEACTIVATED:
-            return ProfileResult(CheckOutcome.DEACTIVATED, http_status=404)
-        return ProfileResult(CheckOutcome.UNKNOWN)
+            return ProfileResult(
+                CheckOutcome.DEACTIVATED,
+                source="playwright_explicit_absence",
+                http_status=404,
+            )
+        return ProfileResult(
+            CheckOutcome.UNKNOWN,
+            source=f"playwright_{profile.diagnostic or 'unknown'}",
+        )
 
     async def inspect(self, username: str, *, use_cache: bool = True) -> EmbedProfile:
-        cache_key = f"{self.CACHE_PREFIX}{username.lower()}"
+        normalized_username = username.strip().lower()
+        cache_key = f"{self.CACHE_PREFIX}{normalized_username}"
         if use_cache:
             cached = await self.redis.get(cache_key)
             if cached:
@@ -110,13 +127,13 @@ class ProfilePreviewService:
                     await self.redis.delete(cache_key)
 
         async with self._semaphore:
-            profile = await self._inspect_with_browser(username)
+            profile = await self._inspect_with_browser(normalized_username)
         if profile.outcome == PreviewOutcome.ACTIVE:
             payload = asdict(profile)
             payload["outcome"] = profile.outcome.value
             await self.redis.set(
                 cache_key,
-                json.dumps(payload, ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
                 ex=self.settings.profile_preview_cache_seconds,
             )
         return profile
@@ -129,14 +146,35 @@ class ProfilePreviewService:
                     profile.profile_picture_url,
                     headers={
                         "User-Agent": USER_AGENTS[0],
-                        "Referer": f"{self.settings.instagram_base_url}/{profile.username}/embed/",
+                        "Referer": (
+                            f"{self.settings.instagram_base_url}/"
+                            f"{profile.username}/embed/"
+                        ),
                     },
                 )
-                if response.status_code == 200 and len(response.content) <= 8_000_000:
+                content_type = response.headers.get("content-type", "").lower()
+                if (
+                    response.status_code == 200
+                    and content_type.startswith("image/")
+                    and len(response.content) <= self.MAX_AVATAR_BYTES
+                ):
                     avatar_bytes = response.content
             except httpx.HTTPError:
                 logger.info("Could not download avatar for %s", profile.username)
-        return await asyncio.to_thread(self._draw_card, profile, avatar_bytes)
+        return await asyncio.to_thread(
+            ReportCardRenderer.render_profile,
+            ProfileCardData(
+                username=profile.username,
+                full_name=profile.full_name,
+                biography=profile.biography,
+                follower_count=profile.follower_count,
+                following_count=profile.following_count,
+                post_count=profile.post_count,
+                is_private=profile.is_private,
+                is_verified=profile.is_verified,
+            ),
+            avatar_bytes,
+        )
 
     async def _ensure_browser(self) -> Browser:
         if self._browser is not None and self._browser.is_connected():
@@ -144,8 +182,13 @@ class ProfilePreviewService:
         async with self._start_lock:
             if self._browser is not None and self._browser.is_connected():
                 return self._browser
+            if self._browser is not None:
+                with suppress(Exception):
+                    await self._browser.close()
+                self._browser = None
             if self._playwright is not None:
-                await self._playwright.stop()
+                with suppress(Exception):
+                    await self._playwright.stop()
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch(
                 headless=True,
@@ -156,35 +199,25 @@ class ProfilePreviewService:
                     "--disable-gpu",
                     "--disable-extensions",
                     "--disable-background-networking",
+                    "--disable-sync",
                 ],
             )
             return self._browser
 
     async def _inspect_with_browser(self, username: str) -> EmbedProfile:
+        context: BrowserContext | None = None
         try:
             browser = await self._ensure_browser()
-        except Exception:
-            logger.exception("Chromium could not be started for profile preview")
-            return EmbedProfile(
-                PreviewOutcome.UNKNOWN,
-                username=username,
-                diagnostic="chromium_start_failed",
+            context = await browser.new_context(
+                viewport={"width": 430, "height": 900},
+                locale="en-US",
+                java_script_enabled=True,
+                user_agent=USER_AGENTS[0],
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
-
-        context = await browser.new_context(
-            viewport={"width": 430, "height": 900},
-            locale="en-US",
-            java_script_enabled=True,
-            user_agent=USER_AGENTS[0],
-            extra_http_headers={
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        page = await context.new_page()
-        url = f"{self.settings.instagram_base_url}/{username}/embed/"
-        try:
+            page = await context.new_page()
             response = await page.goto(
-                url,
+                f"{self.settings.instagram_base_url}/{username}/embed/",
                 wait_until="domcontentloaded",
                 timeout=self.settings.profile_preview_timeout_seconds * 1000,
             )
@@ -206,75 +239,67 @@ class ProfilePreviewService:
                     username=username,
                     diagnostic="login_redirect",
                 )
+
             try:
                 await page.wait_for_function(
                     r"""
-                    requestedUsername => {
+                    requested => {
                       const text = (document.body?.innerText || '').toLowerCase();
-                      const usernameVisible = text.split(/\n+/)
-                        .some(line => line.trim() === requestedUsername.toLowerCase());
-                      const metricsVisible = /\bfollowers\b/.test(text) && /\bposts\b/.test(text);
-                      const profileImage = Array.from(document.images).some(img =>
+                      const exact = text.split(/\n+/)
+                        .some(line => line.trim() === requested.toLowerCase());
+                      const metrics = /\bfollowers\b/.test(text) && /\bposts\b/.test(text);
+                      const image = Array.from(document.images).some(img =>
                         (img.alt || '').toLowerCase().includes('profile picture'));
-                      return usernameVisible && metricsVisible && profileImage;
+                      return exact && metrics && image;
                     }
                     """,
                     arg=username,
                     timeout=self.settings.profile_preview_timeout_seconds * 1000,
                 )
             except PlaywrightTimeoutError:
-                body_text = (await page.locator("body").inner_text()).lower()
-                if "page isn't available" in body_text or "page not found" in body_text:
-                    return EmbedProfile(
-                        PreviewOutcome.DEACTIVATED,
-                        username=username,
-                        diagnostic="not_available_text",
-                    )
+                body_text = (
+                    self._normalize_text(await page.locator("body").inner_text())
+                    or ""
+                ).lower()
                 if "log in" in body_text or "login" in page.url:
                     return EmbedProfile(
                         PreviewOutcome.UNKNOWN,
                         username=username,
                         diagnostic="login_wall",
                     )
+                if any(
+                    marker in body_text
+                    for marker in (
+                        "page isn't available",
+                        "page not found",
+                        "sorry, this page isn't available",
+                    )
+                ):
+                    return EmbedProfile(
+                        PreviewOutcome.DEACTIVATED,
+                        username=username,
+                        diagnostic="not_available_text",
+                    )
                 return EmbedProfile(
                     PreviewOutcome.UNKNOWN,
                     username=username,
                     diagnostic="profile_content_timeout",
                 )
-            try:
-                await page.get_by_text(
-                    "View full profile on Instagram", exact=True
-                ).wait_for(
-                    state="visible",
-                    timeout=self.settings.profile_preview_timeout_seconds * 1000,
-                )
-            except PlaywrightTimeoutError:
-                logger.info("The complete embed was not rendered for %s", username)
 
             data = await page.evaluate(
                 r"""
-                (requestedUsername) => {
+                requested => {
                   const clean = value => (value || '').trim();
                   const lines = (document.body.innerText || '')
                     .split(/\n+/).map(clean).filter(Boolean);
-                  const images = Array.from(document.querySelectorAll('img'));
-                  const profileImage = images.find(img =>
-                    clean(img.alt).toLowerCase().includes('profile picture'));
                   const usernameIndex = lines.findIndex(line =>
-                    line.toLowerCase() === requestedUsername.toLowerCase());
-                  const followersIndex = lines.findIndex(line =>
-                    /\bfollowers$/i.test(line));
-                  const postsIndex = lines.findIndex(line =>
-                    /\bposts$/i.test(line));
-                  const followerMatch = followersIndex >= 0
-                    ? lines[followersIndex].match(/^([\d,.]+\s*[KMB]?)\s+followers$/i)
-                    : null;
-                  const postMatch = postsIndex >= 0
-                    ? lines[postsIndex].match(/^([\d,]+)\s+posts$/i)
-                    : null;
-                  const parseMetric = value => {
-                    if (!value) return null;
-                    const normalized = value.replaceAll(',', '').replaceAll(' ', '').toUpperCase();
+                    line.toLowerCase() === requested.toLowerCase());
+                  const followerLine = lines.find(line => /\bfollowers$/i.test(line));
+                  const postLine = lines.find(line => /\bposts$/i.test(line));
+                  const metric = value => {
+                    const match = clean(value).match(/^([\d,.]+\s*[KMB]?)/i);
+                    if (!match) return null;
+                    const normalized = match[1].replaceAll(',', '').replaceAll(' ', '').toUpperCase();
                     const number = Number.parseFloat(normalized);
                     if (!Number.isFinite(number)) return null;
                     if (normalized.endsWith('B')) return Math.round(number * 1000000000);
@@ -282,30 +307,24 @@ class ProfilePreviewService:
                     if (normalized.endsWith('K')) return Math.round(number * 1000);
                     return Math.round(number);
                   };
-                  const numericLabels = Array.from(document.querySelectorAll('[aria-label]'))
-                    .map(el => clean(el.getAttribute('aria-label')))
-                    .filter(value => /^\d[\d,]*$/.test(value));
-                  const numericValues = numericLabels
-                    .map(value => Number(value.replaceAll(',', '')))
-                    .filter(value => Number.isFinite(value));
-                  const fullName = usernameIndex >= 0 ? lines[usernameIndex + 1] : null;
-                  const biographyLines = usernameIndex >= 0 && followersIndex > usernameIndex
-                    ? lines.slice(usernameIndex + 2, Math.max(usernameIndex + 2, followersIndex - 1))
-                    : [];
-                  const bodyLower = (document.body.innerText || '').toLowerCase();
+                  const images = Array.from(document.images);
+                  const avatar = images.find(img =>
+                    clean(img.alt).toLowerCase().includes('profile picture'));
+                  const followerIndex = lines.findIndex(line => line === followerLine);
+                  const fullName = usernameIndex >= 0 ? clean(lines[usernameIndex + 1]) : '';
+                  const bio = usernameIndex >= 0 && followerIndex > usernameIndex
+                    ? lines.slice(usernameIndex + 2, Math.max(usernameIndex + 2, followerIndex - 1)).join('\n')
+                    : '';
+                  const lower = (document.body.innerText || '').toLowerCase();
                   return {
-                    username: usernameIndex >= 0 ? lines[usernameIndex] : requestedUsername,
+                    username: requested.toLowerCase(),
                     full_name: fullName && !/^\d/.test(fullName) ? fullName : null,
-                    biography: biographyLines.length ? biographyLines.join('\n') : null,
-                    profile_picture_url: profileImage ? profileImage.currentSrc || profileImage.src : null,
-                    follower_count: numericValues.length
-                      ? Math.max(...numericValues)
-                      : parseMetric(followerMatch ? followerMatch[1] : null),
-                    follower_display: followerMatch ? followerMatch[1] : null,
-                    post_count: postMatch
-                      ? Number(postMatch[1].replaceAll(',', '')) || null
-                      : null,
-                    is_private: bodyLower.includes('this account is private'),
+                    biography: bio || null,
+                    profile_picture_url: avatar ? avatar.currentSrc || avatar.src : null,
+                    follower_count: metric(followerLine),
+                    follower_display: followerLine ? followerLine.split(/\s+followers/i)[0] : null,
+                    post_count: metric(postLine),
+                    is_private: lower.includes('this account is private'),
                     is_verified: Boolean(document.querySelector('[aria-label="Verified"]'))
                   };
                 }
@@ -332,326 +351,11 @@ class ProfilePreviewService:
                 diagnostic="browser_exception",
             )
         finally:
-            await context.close()
-
-    @classmethod
-    def _draw_card(cls, profile: EmbedProfile, avatar_bytes: bytes | None) -> bytes:
-        return ReportCardRenderer.render_profile(
-            ProfileCardData(
-                username=profile.username,
-                full_name=profile.full_name,
-                biography=profile.biography,
-                follower_count=profile.follower_count,
-                following_count=profile.following_count,
-                post_count=profile.post_count,
-                is_private=profile.is_private,
-                is_verified=profile.is_verified,
-            ),
-            avatar_bytes,
-        )
-
-        # Legacy renderer retained below for compatibility with older deployments.
-        width, height = 1080, 1350
-        image = Image.new("RGB", (width, height), "#070914")
-        pixels = image.load()
-        for y in range(height):
-            for x in range(width):
-                vertical = y / height
-                diagonal = (x + y) / (width + height)
-                pixels[x, y] = (
-                    int(7 + 13 * vertical + 10 * diagonal),
-                    int(9 + 10 * vertical),
-                    int(20 + 38 * diagonal),
-                )
-
-        glow = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        glow_draw = ImageDraw.Draw(glow)
-        glow_draw.ellipse((-210, -180, 500, 520), fill=(225, 48, 145, 105))
-        glow_draw.ellipse((680, 120, 1330, 770), fill=(92, 71, 255, 105))
-        glow_draw.ellipse((190, 940, 850, 1570), fill=(22, 194, 255, 65))
-        glow = glow.filter(ImageFilter.GaussianBlur(115))
-        image = Image.alpha_composite(image.convert("RGBA"), glow).convert("RGB")
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle(
-            (55, 45, 1025, 1305),
-            radius=55,
-            fill="#111526",
-            outline="#8b72ff",
-            width=3,
-        )
-        draw.rounded_rectangle(
-            (78, 68, 1002, 1282), radius=42, outline="#2a3152", width=2
-        )
-
-        regular = cls._font(42, bold=False)
-        bold = cls._font(55, bold=True)
-        title_font = cls._font(64, bold=True)
-        small = cls._font(34, bold=False)
-        tiny = cls._font(27, bold=False)
-        draw.text((105, 100), "FARSTAR", font=title_font, fill="#ffffff", anchor="la")
-        draw.text(
-            (105, 164),
-            "PROFILE INTELLIGENCE",
-            font=tiny,
-            fill="#aeb5d8",
-            anchor="la",
-        )
-        draw.rounded_rectangle(
-            (755, 104, 950, 164), radius=30, fill="#19283a", outline="#35ddb7", width=2
-        )
-        draw.ellipse((782, 124, 802, 144), fill="#35ddb7")
-        draw.text((820, 134), "LIVE DATA", font=tiny, fill="#dffff7", anchor="lm")
-
-        draw.ellipse((375, 208, 705, 538), fill="#e1306c")
-        draw.ellipse((384, 217, 696, 529), fill="#833ab4")
-        draw.ellipse((394, 227, 686, 519), fill="#fcb045")
-        avatar = cls._avatar(avatar_bytes, profile.username, 280, bold)
-        image.paste(avatar, (400, 233), avatar)
-        draw.text(
-            (540, 545), f"@{profile.username}", font=bold, fill="#ffffff", anchor="ma"
-        )
-        if profile.full_name:
-            full_name = cls._ellipsize_for_width(
-                draw,
-                profile.full_name,
-                regular,
-                830,
-            )
-            draw.text(
-                (540, 615),
-                cls._display(full_name),
-                font=regular,
-                fill="#d8d9e8",
-                anchor="ma",
-            )
-
-        stats = (
-            (
-                cls._number(profile.follower_count, profile.follower_display),
-                "FOLLOWERS",
-            ),
-            (cls._number(profile.post_count), "POSTS"),
-            ("PRIVATE" if profile.is_private else "PUBLIC", "VISIBILITY"),
-        )
-        for index, (value, label) in enumerate(stats):
-            left = 95 + index * 315
-            draw.rounded_rectangle(
-                (left, 700, left + 275, 855),
-                radius=25,
-                fill="#1b2139",
-                outline="#343d64",
-                width=2,
-            )
-            draw.text(
-                (left + 137, 735),
-                cls._display(value),
-                font=bold,
-                fill="#ffffff",
-                anchor="ma",
-            )
-            draw.text(
-                (left + 137, 805),
-                label,
-                font=small,
-                fill="#a9aac3",
-                anchor="ma",
-            )
-
-        draw.rounded_rectangle(
-            (95, 905, 985, 1175),
-            radius=30,
-            fill="#181d32",
-            outline="#343d64",
-            width=2,
-        )
-        draw.text((135, 948), "PUBLIC BIO", font=regular, fill="#b8b9ff", anchor="la")
-        biography = (
-            profile.biography
-            or "Biography is not exposed by the public Instagram surface."
-        )
-        biography_was_truncated = len(biography.strip()) > 260
-        biography = cls._clip_text(biography, 260)
-        wrapped = cls._wrap_for_width(draw, biography, small, 800)
-        if len(wrapped) > 3:
-            wrapped = wrapped[:3]
-            biography_was_truncated = True
-        if wrapped and biography_was_truncated:
-            wrapped[-1] = cls._ellipsize_for_width(
-                draw,
-                f"{wrapped[-1]}...",
-                small,
-                800,
-            )
-        y = 1010
-        for line in wrapped:
-            if re.search(r"[\u0600-\u06ff]", line):
-                draw.text(
-                    (940, y),
-                    cls._display(line),
-                    font=small,
-                    fill="#ffffff",
-                    anchor="ra",
-                )
-            else:
-                draw.text(
-                    (135, y),
-                    line,
-                    font=small,
-                    fill="#ffffff",
-                    anchor="la",
-                )
-            y += 48
-
-        verified = "VERIFIED PROFILE" if profile.is_verified else "NOT VERIFIED"
-        draw.text((105, 1225), verified, font=tiny, fill="#65d6ff", anchor="la")
-        draw.text(
-            (975, 1225),
-            "PUBLIC SURFACE  •  NO LOGIN",
-            font=tiny,
-            fill="#8f96b7",
-            anchor="ra",
-        )
-        output = io.BytesIO()
-        image.save(output, format="JPEG", quality=92, optimize=True)
-        return output.getvalue()
+            if context is not None:
+                with suppress(Exception):
+                    await context.close()
 
     @staticmethod
-    def _font(size: int, *, bold: bool) -> ImageFont.FreeTypeFont:
-        names = (
-            "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf"
-            if bold
-            else "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"
-            if bold
-            else "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"
-            if bold
-            else "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "C:/Windows/Fonts/tahomabd.ttf" if bold else "C:/Windows/Fonts/tahoma.ttf",
-            "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-            if bold
-            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        )
-        for name in names:
-            if Path(name).exists():
-                return ImageFont.truetype(name, size=size)
-        return ImageFont.load_default(size=size)
-
-    @staticmethod
-    def _rtl(value: str) -> str:
-        return get_display(arabic_reshaper.reshape(value), base_dir="R")
-
-    @classmethod
-    def _display(cls, value: str) -> str:
-        if re.search(r"[\u0600-\u06ff]", value):
-            return cls._rtl(value)
-        return value
-
-    @staticmethod
-    def _number(value: int | None, fallback: str | None = None) -> str:
-        if value is not None:
-            if value >= 1_000_000_000:
-                compact = f"{value / 1_000_000_000:.1f}B"
-            elif value >= 1_000_000:
-                compact = f"{value / 1_000_000:.1f}M"
-            elif value >= 10_000:
-                compact = f"{value / 1_000:.1f}K"
-            else:
-                compact = f"{value:,}"
-            return compact.replace(".0", "")
-        if fallback:
-            return fallback
-        return "UNKNOWN"
-
-    @classmethod
-    def _wrap_for_width(
-        cls,
-        draw: ImageDraw.ImageDraw,
-        value: str,
-        font: ImageFont.FreeTypeFont,
-        max_width: int,
-    ) -> list[str]:
-        lines: list[str] = []
-        for paragraph in value.splitlines() or [value]:
-            words = paragraph.split()
-            if not words:
-                lines.append("")
-                continue
-            current = words[0]
-            for word in words[1:]:
-                candidate = f"{current} {word}"
-                rendered = cls._display(candidate)
-                box = draw.textbbox((0, 0), rendered, font=font)
-                if box[2] - box[0] <= max_width:
-                    current = candidate
-                else:
-                    lines.append(current)
-                    current = word
-            lines.append(current)
-        return lines
-
-    @classmethod
-    def _ellipsize_for_width(
-        cls,
-        draw: ImageDraw.ImageDraw,
-        value: str,
-        font: ImageFont.FreeTypeFont,
-        max_width: int,
-    ) -> str:
-        value = value.strip()
-        if not value:
-            return value
-        rendered = cls._display(value)
-        box = draw.textbbox((0, 0), rendered, font=font)
-        if box[2] - box[0] <= max_width:
-            return value
-        suffix = "..."
-        shortened = value
-        while shortened:
-            shortened = shortened[:-1].rstrip()
-            candidate = shortened + suffix
-            rendered = cls._display(candidate)
-            box = draw.textbbox((0, 0), rendered, font=font)
-            if box[2] - box[0] <= max_width:
-                return candidate
-        return suffix
-
-    @staticmethod
-    def _clip_text(value: str, limit: int) -> str:
-        value = value.strip()
-        if len(value) <= limit:
-            return value
-        return value[: max(0, limit - 3)].rstrip() + "..."
-
-    @classmethod
-    def _avatar(
-        cls,
-        avatar_bytes: bytes | None,
-        username: str,
-        size: int,
-        font: ImageFont.FreeTypeFont,
-    ) -> Image.Image:
-        mask = Image.new("L", (size, size), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
-        if avatar_bytes:
-            try:
-                avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGB")
-                avatar = ImageOps.fit(
-                    avatar, (size, size), method=Image.Resampling.LANCZOS
-                )
-                avatar.putalpha(mask)
-                return avatar
-            except (OSError, ValueError):
-                pass
-        avatar = Image.new("RGBA", (size, size), "#7148ff")
-        avatar.putalpha(mask)
-        draw = ImageDraw.Draw(avatar)
-        draw.text(
-            (size // 2, size // 2),
-            username[:1].upper(),
-            font=font,
-            fill="white",
-            anchor="mm",
-        )
-        return avatar
+    def _normalize_text(value: object) -> str | None:
+        normalized = str(value or "").strip()
+        return normalized or None

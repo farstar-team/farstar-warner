@@ -97,6 +97,8 @@ EVIDENCE_SOURCE_NAMES = {
     "graphql_username_search": "جست‌وجوی مستقل نام کاربری",
     "graphql_username_search_absence": "نبودن نام در جست‌وجوی مستقل",
     "meta_business_discovery": "اتصال رسمی متا",
+    "playwright_public_embed": "رندر عمومی مرورگر",
+    "playwright_explicit_absence": "نبودن قطعی در رندر عمومی",
 }
 
 

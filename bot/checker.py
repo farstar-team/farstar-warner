@@ -7,6 +7,7 @@ import logging
 import random
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -115,6 +116,7 @@ class NotificationPayload:
 
 
 class InstagramChecker:
+    BASELINE_USERNAMES = ("instagram", "cristiano", "nasa")
     LOCK_KEY = "farstar:checker:lock"
     STATUS_COOLDOWN_KEY = "farstar:checker:status-cooldown"
     DEACTIVATION_STREAK_PREFIX = "farstar:checker:deactivation-streak:"
@@ -151,6 +153,7 @@ class InstagramChecker:
         self._rate_limited = asyncio.Event()
         self._lock_lost = asyncio.Event()
         self._official_ready = False
+        self._browser_probe: Callable[[str], Awaitable[ProfileResult]] | None = None
         self._http = httpx.AsyncClient(
             http2=True,
             follow_redirects=False,
@@ -177,9 +180,11 @@ class InstagramChecker:
             headers={"Accept": "application/json"},
         )
 
-    def set_browser_probe(self, probe: object) -> None:
-        """Retain startup compatibility; monitoring uses the curl transport only."""
-        del probe
+    def set_browser_probe(
+        self,
+        probe: Callable[[str], Awaitable[ProfileResult]],
+    ) -> None:
+        self._browser_probe = probe
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -193,6 +198,7 @@ class InstagramChecker:
         allow_stale: bool = True,
         force_refresh: bool = False,
         expected_profile_id: str | None = None,
+        bypass_cooldown: bool = False,
     ) -> ProfileResult:
         normalized_username = username.strip().lower()
         if not force_refresh:
@@ -230,7 +236,7 @@ class InstagramChecker:
                     return official
 
             cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
-            if cooldown_ttl > 0:
+            if cooldown_ttl > 0 and not bypass_cooldown:
                 if allow_stale:
                     stale = await self._read_cached_profile(
                         f"{self.PROFILE_STALE_PREFIX}{normalized_username}"
@@ -610,6 +616,47 @@ class InstagramChecker:
         discovery_result = await self._search_profile_via_graphql(username)
         if discovery_result is not None:
             return discovery_result
+
+        if self._browser_probe is not None:
+            try:
+                browser_result = await self._browser_probe(username)
+            except Exception as exc:
+                await self.diagnostics.add(
+                    level="ERROR",
+                    event="browser_fallback_exception",
+                    message="شاهد کمکی مرورگر با خطای داخلی متوقف شد.",
+                    username=username,
+                    transport="playwright-public-embed",
+                    detail=f"{type(exc).__name__}: {exc}",
+                )
+            else:
+                await self.diagnostics.add(
+                    level=(
+                        "INFO"
+                        if browser_result.outcome
+                        in {CheckOutcome.ACTIVE, CheckOutcome.DEACTIVATED}
+                        else "WARNING"
+                    ),
+                    event="browser_fallback_result",
+                    message=(
+                        "مرورگر عمومی شاهد قطعی ارائه کرد."
+                        if browser_result.outcome
+                        in {CheckOutcome.ACTIVE, CheckOutcome.DEACTIVATED}
+                        else "مرورگر عمومی نیز پاسخ قطعی ارائه نکرد."
+                    ),
+                    username=username,
+                    transport="playwright-public-embed",
+                    http_status=browser_result.http_status,
+                    detail=(
+                        f"outcome={browser_result.outcome.value}; "
+                        f"source={browser_result.source}"
+                    ),
+                )
+                if browser_result.outcome in {
+                    CheckOutcome.ACTIVE,
+                    CheckOutcome.DEACTIVATED,
+                }:
+                    return browser_result
 
         if self._response_is_access_blocked(response):
             if not self._official_ready:
@@ -1468,56 +1515,61 @@ class InstagramChecker:
         return False
 
     async def reference_profile_preflight(self) -> bool:
-        if await self.official_provider_preflight(force=False):
-            await self.redis.delete(self.REFERENCE_ALERT_KEY)
-            await self.diagnostics.add(
-                level="INFO",
-                event="reference_profile_succeeded",
-                message=(
-                    "حداقل یک حساب مانیتورینگ رسمی Meta سالم است؛ "
-                    "چرخه پایش با provider رسمی آغاز می‌شود."
-                ),
-                transport="meta-graph-api",
-            )
-            return True
-        result = await self.fetch_profile(
-            "instagram",
-            allow_stale=False,
-            force_refresh=False,
+        results = await asyncio.gather(
+            *(
+                self.fetch_profile(
+                    username,
+                    allow_stale=False,
+                    force_refresh=True,
+                    bypass_cooldown=True,
+                )
+                for username in self.BASELINE_USERNAMES
+            ),
+            return_exceptions=True,
         )
-        if result.outcome == CheckOutcome.ACTIVE and result.profile_id:
-            await self.redis.delete(self.REFERENCE_ALERT_KEY)
+        active_results: list[tuple[str, ProfileResult]] = []
+        baseline_details: list[str] = []
+        for username, result in zip(self.BASELINE_USERNAMES, results, strict=True):
+            if isinstance(result, BaseException):
+                baseline_details.append(
+                    f"@{username}=exception:{type(result).__name__}"
+                )
+                continue
+            baseline_details.append(
+                f"@{username}={result.outcome.value}:{result.source}:"
+                f"http={result.http_status or 0}"
+            )
+            if (
+                result.outcome == CheckOutcome.ACTIVE
+                and (result.canonical_username or "").lower() == username
+            ):
+                active_results.append((username, result))
+
+        if active_results:
+            await self.redis.delete(
+                self.REFERENCE_ALERT_KEY,
+                self.STATUS_COOLDOWN_KEY,
+            )
+            self._rate_limited.clear()
             await self.diagnostics.add(
                 level="INFO",
-                event="reference_profile_succeeded",
+                event="baseline_consensus_succeeded",
                 message=(
-                    "پیج مرجع @instagram با پاسخ زنده و معتبر دیده شد؛ "
-                    "چرخه پایش مجاز به بررسی هدف‌ها است."
+                    f"{len(active_results)} پیج از سه پیج مرجع با شاهد زنده "
+                    "دیده شدند؛ چرخه پایش مجاز است."
                 ),
-                username="instagram",
-                http_status=result.http_status,
-                detail=(
-                    f"profile_id={result.profile_id}; from_cache={result.from_cache}; "
-                    f"source={result.source}"
-                ),
+                detail="; ".join(baseline_details),
             )
             return True
 
-        rate_limited = result.outcome == CheckOutcome.RATE_LIMITED
         await self.diagnostics.add(
-            level="ERROR",
-            event="reference_profile_failed",
+            level="CRITICAL",
+            event="baseline_consensus_failed",
             message=(
-                "مدار محافظ دسترسی اینستاگرام باز است؛ درخواست جدید ارسال نمی‌شود."
-                if rate_limited
-                else "پیج مرجع @instagram پاسخ زنده معتبر نداد؛ برای جلوگیری از هشدار اشتباه وضعیت هیچ پیجی تغییر نمی‌کند."
+                "هیچ‌یک از سه پیج مرجع پاسخ فعال معتبر ندادند؛ شبکه یا مسیر "
+                "دسترسی ناسالم فرض می‌شود و وضعیت کاربران تغییر نمی‌کند."
             ),
-            username="instagram",
-            http_status=result.http_status,
-            detail=(
-                f"outcome={result.outcome.value}; from_cache={result.from_cache}; "
-                f"retry_after={result.retry_after or 0}"
-            ),
+            detail="; ".join(baseline_details),
         )
         should_alert = await self.redis.set(
             self.REFERENCE_ALERT_KEY,
@@ -1528,17 +1580,10 @@ class InstagramChecker:
         if should_alert:
             await self._notify(
                 self.settings.admin_telegram_id,
-                (
-                    "دسترسی اینستاگرام موقتاً درخواست‌ها را رد کرده است. ⚠️\n\n"
-                    f"مدار محافظ برای <b>{result.retry_after or self.settings.rate_limit_cooldown_seconds}</b> "
-                    "ثانیه باز می‌ماند و در این مدت هیچ درخواست تکراری ارسال نمی‌شود. "
-                    "وضعیت پیج‌ها بدون تغییر محفوظ است."
-                    if rate_limited
-                    else "تست مرجع اینستاگرام ناموفق بود. ⚠️\n\n"
-                    "ربات نتوانست پیج ثابت <b>@instagram</b> را با پاسخ زنده ببیند؛ "
-                    "بنابراین این چرخه بدون تغییر وضعیت پیج‌های کاربران متوقف شد. "
-                    "جزئیات در بخش لاگ کامل ثبت شده است."
-                ),
+                "آزمون سه‌گانه اینستاگرام ناموفق بود. ⚠️\n\n"
+                "هیچ‌یک از پیج‌های مرجع <b>@instagram</b>، <b>@cristiano</b> "
+                "و <b>@nasa</b> پاسخ فعال معتبر ندادند. چرخه کاربران متوقف شد "
+                "و هیچ وضعیتی تغییر نکرد. سلامت WARP جداگانه در لاگ ثبت شده است.",
             )
         return False
 
@@ -1666,11 +1711,13 @@ class InstagramChecker:
         if cooldown_ttl > 0 and not self._official_ready:
             await self.diagnostics.add(
                 level="WARNING",
-                event="checker_circuit_open",
-                message=("چرخه پایش برای جلوگیری از تکرار درخواست ردشده اجرا نشد."),
+                event="checker_circuit_probe",
+                message=(
+                    "مدار عمومی باز است؛ فقط آزمون سه‌گانه مرجع برای بررسی "
+                    "بازیابی مسیر اجرا می‌شود."
+                ),
                 detail=f"retry_after_seconds={cooldown_ttl}",
             )
-            return
 
         lock = self.redis.lock(
             self.LOCK_KEY,
@@ -1712,7 +1759,7 @@ class InstagramChecker:
             if not target_ids:
                 return
 
-            queue: asyncio.Queue[int | None] = asyncio.Queue()
+            queue: asyncio.Queue[int] = asyncio.Queue()
             for target_id in target_ids:
                 queue.put_nowait(target_id)
 
@@ -1721,12 +1768,15 @@ class InstagramChecker:
                 3,
                 len(target_ids),
             )
-            for _ in range(worker_count):
-                queue.put_nowait(None)
             workers = [
                 asyncio.create_task(self._worker(queue)) for _ in range(worker_count)
             ]
-            await asyncio.gather(*workers)
+            try:
+                await queue.join()
+            finally:
+                for worker in workers:
+                    worker.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
             await self.diagnostics.add(
                 level="INFO",
                 event="checker_cycle_completed",
@@ -1763,12 +1813,10 @@ class InstagramChecker:
                 logger.exception("Checker could not renew its distributed lock")
                 return
 
-    async def _worker(self, queue: asyncio.Queue[int | None]) -> None:
+    async def _worker(self, queue: asyncio.Queue[int]) -> None:
         while True:
             target_id = await queue.get()
             try:
-                if target_id is None:
-                    return
                 if (
                     self._rate_limited.is_set() and not self._official_ready
                 ) or self._lock_lost.is_set():
@@ -1784,7 +1832,7 @@ class InstagramChecker:
                 )
             finally:
                 queue.task_done()
-            if target_id is not None and not (
+            if not (
                 (self._rate_limited.is_set() and not self._official_ready)
                 or self._lock_lost.is_set()
             ):
@@ -2073,6 +2121,10 @@ class InstagramChecker:
                     session.add(snapshot)
                 else:
                     escaped_page = html.escape(target.instagram_username)
+                    previous_full_name = self._normalize_text(snapshot.full_name)
+                    current_full_name = self._normalize_text(result.full_name)
+                    previous_biography = self._normalize_text(snapshot.biography)
+                    current_biography = self._normalize_text(result.biography)
                     if (
                         result.is_verified is not None
                         and snapshot.is_verified != result.is_verified
@@ -2181,9 +2233,9 @@ class InstagramChecker:
                             )
                         )
                     if (
-                        snapshot.full_name is not None
-                        and result.full_name is not None
-                        and snapshot.full_name != result.full_name
+                        previous_full_name
+                        and (result.metadata_complete or result.full_name is not None)
+                        and previous_full_name != current_full_name
                     ):
                         session.add(
                             PageEvent(
@@ -2198,16 +2250,16 @@ class InstagramChecker:
                                 message=(
                                     "نام اصلی پیج عوض شد 🔄\n\n"
                                     f"پیج: <b>@{escaped_page}</b>\n"
-                                    f"نام قبلی: <b>{html.escape(snapshot.full_name)}</b>\n"
-                                    f"نام جدید: <b>{html.escape(result.full_name)}</b>"
+                                    f"نام قبلی: <b>{html.escape(previous_full_name)}</b>\n"
+                                    f"نام جدید: <b>{html.escape(current_full_name or 'حذف شده')}</b>"
                                 ),
                                 username=target.instagram_username,
                                 title="نام اصلی پیج عوض شد",
                                 category="PROFILE",
                                 primary_label="نام جدید",
-                                primary_value=result.full_name,
+                                primary_value=current_full_name or "حذف شده",
                                 secondary_label="نام قبلی",
-                                secondary_value=snapshot.full_name,
+                                secondary_value=previous_full_name,
                                 accent="blue",
                             )
                         )
@@ -2217,7 +2269,7 @@ class InstagramChecker:
                             result.metadata_complete
                             or result.biography is not None
                         )
-                        and snapshot.biography != result.biography
+                        and previous_biography != current_biography
                     ):
                         session.add(
                             PageEvent(
@@ -2326,9 +2378,15 @@ class InstagramChecker:
                     snapshot.profile_picture_key = picture_key
                     snapshot.profile_picture_url = result.profile_picture_url
                 if result.metadata_complete or result.full_name is not None:
-                    snapshot.full_name = self._truncate(result.full_name, 255)
+                    snapshot.full_name = self._truncate(
+                        self._normalize_text(result.full_name) or None,
+                        255,
+                    )
                 if result.metadata_complete or result.biography is not None:
-                    snapshot.biography = self._truncate(result.biography, 2000)
+                    snapshot.biography = self._truncate(
+                        self._normalize_text(result.biography) or None,
+                        2000,
+                    )
                 if result.metadata_complete or result.follower_count is not None:
                     snapshot.follower_count = result.follower_count
                 if result.metadata_complete or result.following_count is not None:
@@ -2568,6 +2626,10 @@ class InstagramChecker:
             return None
         normalized = value.strip()
         return normalized or None
+
+    @staticmethod
+    def _normalize_text(value: object) -> str:
+        return str(value or "").strip()
 
     @staticmethod
     def _edge_count(user_data: dict[object, object], field: str) -> int | None:

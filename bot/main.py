@@ -223,7 +223,6 @@ async def run() -> None:
         await dispatcher.start_polling(
             bot,
             allowed_updates=dispatcher.resolve_used_update_types(),
-            tasks_concurrency_limit=100,
             session_factory=session_factory,
             settings=settings,
             redis=redis,
