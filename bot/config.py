@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     redis_password: SecretStr
 
     check_interval_seconds: int = Field(default=300, ge=30, le=86400)
-    check_concurrency: int = Field(default=8, ge=1, le=50)
+    check_concurrency: int = Field(default=4, ge=1, le=20)
     deactivation_confirmations: int = Field(default=2, ge=1, le=5)
     deactivation_confirmation_delay_seconds: float = Field(
         default=15.0, ge=3.0, le=120.0
@@ -49,9 +49,16 @@ class Settings(BaseSettings):
     credential_encryption_key: SecretStr | None = None
     instagram_request_timeout_seconds: float = Field(default=20.0, ge=5, le=60)
     proxy_health_url: str = "https://www.cloudflare.com/cdn-cgi/trace"
-    page_check_delay_min_seconds: float = Field(default=15.0, ge=1, le=60)
-    page_check_delay_max_seconds: float = Field(default=45.0, ge=1, le=120)
+    page_check_delay_min_seconds: float = Field(default=0.5, ge=0, le=30)
+    page_check_delay_max_seconds: float = Field(default=2.0, ge=0, le=60)
     rate_limit_cooldown_seconds: int = Field(default=900, ge=60, le=86400)
+    preflight_cache_seconds: int = Field(default=300, ge=60, le=3600)
+    recovery_batch_size: int = Field(default=25, ge=1, le=500)
+    health_failure_alert_threshold: int = Field(default=2, ge=1, le=10)
+    health_alert_reminder_seconds: int = Field(default=21600, ge=900, le=604800)
+    guest_search_audit_seconds: int = Field(default=21600, ge=900, le=604800)
+    outbox_batch_size: int = Field(default=25, ge=1, le=100)
+    outbox_max_attempts: int = Field(default=12, ge=3, le=50)
     chromium_executable: str = "/usr/bin/chromium"
     profile_preview_timeout_seconds: int = Field(default=45, ge=10, le=60)
     profile_preview_cache_seconds: int = Field(default=900, ge=60, le=86400)

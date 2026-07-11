@@ -19,12 +19,12 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import httpx
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup
 from redis.asyncio import Redis
 from redis.asyncio.lock import Lock
 from redis.exceptions import LockError, RedisError
-from sqlalchemy import and_, case, delete, func, select
+from sqlalchemy import and_, case, delete, func, select, update
 
 from bot.config import Settings
 from bot.credential_store import CredentialStore, CredentialStoreError
@@ -33,6 +33,7 @@ from bot.diagnostics import DiagnosticStore
 from bot.models import (
     NotificationSettings,
     InstagramMonitoringAccount,
+    NotificationOutbox,
     PageEvent,
     PageSnapshot,
     PageSnapshotHistory,
@@ -125,6 +126,14 @@ class NotificationPayload:
 
 
 @dataclass(slots=True, frozen=True)
+class DeliveryResult:
+    delivered: bool
+    error: str | None = None
+    retry_after: int | None = None
+    terminal: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class ProfileTimelineEntry:
     observed_at: datetime
     status: PageStatus
@@ -148,6 +157,18 @@ class InstagramChecker:
     HEALTH_STATE_KEY = "farstar:checker:health-state"
     HEALTH_ALERT_KEY = "farstar:checker:health-alert"
     REFERENCE_ALERT_KEY = "farstar:checker:reference-alert"
+    PREFLIGHT_CACHE_KEY = "farstar:checker:preflight-result"
+    PREFLIGHT_LOCK_KEY = "farstar:checker:preflight-lock"
+    HEALTH_INCIDENT_KEY = "farstar:checker:health-incident"
+    HEALTH_FAILURE_STREAK_KEY = "farstar:checker:health-failure-streak"
+    HEALTH_MUTE_KEY = "farstar:checker:health-muted"
+    RECOVERY_LOCK_KEY = "farstar:checker:activation-recovery-lock"
+    RECOVERY_DUE_KEY = "farstar:checker:activation-recovery-due"
+    OUTBOX_LOCK_KEY = "farstar:notification-outbox:lock"
+    MANUAL_CHECK_LOCK_PREFIX = "farstar:checker:manual-lock:"
+    GUEST_AUDIT_PREFIX = "farstar:checker:guest-audit:"
+    GRAPHQL_CIRCUIT_KEY = "farstar:checker:graphql-circuit"
+    CYCLE_METRICS_KEY = "farstar:checker:last-cycle"
     LOCK_TIMEOUT_SECONDS = 120
     MAX_RESPONSE_BYTES = 8_000_000
     CURL_EXECUTABLE = "curl"
@@ -175,6 +196,12 @@ class InstagramChecker:
         self._rate_limited = asyncio.Event()
         self._lock_lost = asyncio.Event()
         self._official_ready = False
+        self._cycle_fetch_tasks: dict[str, asyncio.Task[ProfileResult]] = {}
+        self._cycle_confirmation_tasks: dict[
+            tuple[str, int], asyncio.Task[ProfileResult]
+        ] = {}
+        self._cycle_guest_audit_tasks: dict[str, asyncio.Task[bool | None]] = {}
+        self._cycle_blocked_count = 0
         self._browser_probe: Callable[[str], Awaitable[ProfileResult]] | None = None
         self._http = httpx.AsyncClient(
             http2=True,
@@ -221,6 +248,7 @@ class InstagramChecker:
         force_refresh: bool = False,
         expected_profile_id: str | None = None,
         bypass_cooldown: bool = False,
+        activate_circuit: bool = True,
     ) -> ProfileResult:
         normalized_username = username.strip().lower()
         if not force_refresh:
@@ -261,6 +289,7 @@ class InstagramChecker:
             result = await self._profile_result_from_response(
                 response,
                 normalized_username,
+                activate_circuit=activate_circuit,
             )
             if result.outcome == CheckOutcome.ACTIVE:
                 await self._cache_profile(result, normalized_username)
@@ -592,6 +621,8 @@ class InstagramChecker:
         self,
         response: CurlResponse,
         username: str,
+        *,
+        activate_circuit: bool = True,
     ) -> ProfileResult:
         if response.status_code is None and not response.body:
             logger.warning(
@@ -666,9 +697,16 @@ class InstagramChecker:
                     return browser_result
 
         if self._response_is_access_blocked(response):
-            if not self._official_ready:
-                self._rate_limited.set()
-            cooldown = await self._activate_cooldown(None)
+            cooldown = self.settings.rate_limit_cooldown_seconds
+            if activate_circuit and not self._official_ready:
+                self._cycle_blocked_count += 1
+                threshold = max(
+                    3,
+                    min(int(getattr(self.settings, "check_concurrency", 4)), 5),
+                )
+                if self._cycle_blocked_count >= threshold:
+                    self._rate_limited.set()
+                    cooldown = await self._activate_cooldown(None)
             await self._record_final_failure(username, response)
             return ProfileResult(
                 CheckOutcome.RATE_LIMITED,
@@ -690,6 +728,8 @@ class InstagramChecker:
         self,
         username: str,
     ) -> ProfileResult | None:
+        if await self.redis.ttl(self.GRAPHQL_CIRCUIT_KEY) > 0:
+            return None
         routes = (
             [True, False]
             if getattr(self.settings, "instagram_proxy_url", None)
@@ -727,21 +767,47 @@ class InstagramChecker:
             )
             if result is not None:
                 return result
+            if response.status_code in {401, 403, 429}:
+                await self.redis.set(
+                    self.GRAPHQL_CIRCUIT_KEY,
+                    str(response.status_code),
+                    ex=self.settings.guest_search_audit_seconds,
+                )
+                break
         return None
 
     async def _audit_guest_searchability(self, username: str) -> bool | None:
         """Return only authoritative guest-search visibility; blocks stay unknown."""
         if not hasattr(self, "_direct_http"):
             return None
+        cache_key = f"{self.GUEST_AUDIT_PREFIX}{username.lower()}"
+        cached = await self.redis.get(cache_key)
+        if cached in {"true", "false", "unknown"}:
+            return {"true": True, "false": False, "unknown": None}[cached]
         discovery = await self._search_profile_via_graphql(username)
         if discovery is None:
+            await self.redis.set(
+                cache_key,
+                "unknown",
+                ex=self.settings.guest_search_audit_seconds,
+            )
             return None
         if discovery.outcome == CheckOutcome.ACTIVE:
+            await self.redis.set(
+                cache_key,
+                "true",
+                ex=self.settings.guest_search_audit_seconds,
+            )
             return True
         if (
             discovery.outcome == CheckOutcome.DEACTIVATED
             and discovery.source == "graphql_username_search_absence"
         ):
+            await self.redis.set(
+                cache_key,
+                "false",
+                ex=self.settings.guest_search_audit_seconds,
+            )
             return False
         return None
 
@@ -968,91 +1034,71 @@ class InstagramChecker:
             username=username,
         )
         last_response: CurlResponse | None = None
-        blocked_proxy_response: CurlResponse | None = None
+        blocked_responses: list[CurlResponse] = []
         attempt = 0
 
+        # Curl is deliberately attempted first. The production diagnostics showed
+        # that Instagram sometimes accepts this exact browser-shaped request while
+        # rejecting an otherwise equivalent HTTPX TLS fingerprint with HTTP 401.
+        transports: list[Callable[[], Awaitable[CurlResponse]]] = []
         if self.settings.instagram_proxy_url:
-            attempt += 1
-            proxy_response = await self._execute_http2_once(
+            transports.append(
+                lambda: self._execute_curl_once(
+                    username,
+                    force_http2=False,
+                    use_proxy=True,
+                )
+            )
+        transports.append(
+            lambda: self._execute_curl_once(
                 username,
-                use_proxy=True,
+                force_http2=False,
+                use_proxy=False,
             )
-            await self._record_transport_attempt(
-                trace_id, username, attempt, proxy_response
+        )
+        if self.settings.instagram_proxy_url:
+            transports.append(
+                lambda: self._execute_http2_once(username, use_proxy=True)
             )
-            if self._response_is_authoritative(proxy_response, username):
-                await self._record_authoritative(trace_id, username, proxy_response)
-                return proxy_response
-            if self._response_is_access_blocked(proxy_response):
-                blocked_proxy_response = proxy_response
-            else:
-                last_response = proxy_response
+        transports.append(
+            lambda: self._execute_http2_once(username, use_proxy=False)
+        )
 
-        attempt += 1
-        direct_response = await self._execute_http2_once(
-            username,
-            use_proxy=False,
-        )
-        await self._record_transport_attempt(
-            trace_id, username, attempt, direct_response
-        )
-        if self._response_is_authoritative(direct_response, username):
-            await self._record_authoritative(trace_id, username, direct_response)
-            return direct_response
-        if self._response_is_access_blocked(direct_response):
+        for execute in transports:
+            attempt += 1
+            response = await execute()
+            await self._record_transport_attempt(
+                trace_id,
+                username,
+                attempt,
+                response,
+            )
+            if self._response_is_authoritative(response, username):
+                await self._record_authoritative(trace_id, username, response)
+                return response
+            if self._response_is_access_blocked(response):
+                blocked_responses.append(response)
+            else:
+                last_response = response
+
+        if blocked_responses:
+            last_response = blocked_responses[0]
             await self.diagnostics.add(
                 level="WARNING",
                 event="web_profile_routes_blocked",
                 message=(
-                    "مسیر Web Profile روی WARP و اتصال مستقیم رد شد؛ "
-                    "جست‌وجوی مستقل نام کاربری پیش از مدار محافظ اجرا می‌شود."
+                    "همه مسیرهای Web Profile رد شدند؛ شاهدهای عمومی مستقل "
+                    "پیش از اعلام نتیجه نامشخص بررسی می‌شوند."
                 ),
                 trace_id=trace_id,
                 username=username,
-                transport=direct_response.transport,
-                http_status=direct_response.status_code,
-                detail=self._response_diagnostic(direct_response),
+                transport=last_response.transport,
+                http_status=last_response.status_code,
+                detail=(
+                    f"blocked_routes={len(blocked_responses)}; "
+                    f"{self._response_diagnostic(last_response)}"
+                ),
             )
-            return direct_response
-        last_response = direct_response
-
-        attempt += 1
-        direct_curl_response = await self._execute_curl_once(
-            username,
-            force_http2=False,
-            use_proxy=False,
-        )
-        await self._record_transport_attempt(
-            trace_id, username, attempt, direct_curl_response
-        )
-        if self._response_is_authoritative(direct_curl_response, username):
-            await self._record_authoritative(trace_id, username, direct_curl_response)
-            return direct_curl_response
-        if self._response_is_access_blocked(direct_curl_response):
-            return direct_curl_response
-        last_response = direct_curl_response
-
-        if self.settings.instagram_proxy_url and blocked_proxy_response is None:
-            attempt += 1
-            proxy_curl_response = await self._execute_curl_once(
-                username,
-                force_http2=False,
-                use_proxy=True,
-            )
-            await self._record_transport_attempt(
-                trace_id, username, attempt, proxy_curl_response
-            )
-            if self._response_is_authoritative(proxy_curl_response, username):
-                await self._record_authoritative(
-                    trace_id, username, proxy_curl_response
-                )
-                return proxy_curl_response
-            if self._response_is_access_blocked(proxy_curl_response):
-                return proxy_curl_response
-            last_response = proxy_curl_response
-
-        if blocked_proxy_response is not None:
-            last_response = blocked_proxy_response
 
         final_response = last_response or CurlResponse(
             None,
@@ -1627,81 +1673,206 @@ class InstagramChecker:
                 )
         return False
 
-    async def reference_profile_preflight(self) -> bool:
-        baseline_usernames = self.settings.baseline_usernames
-        results = await asyncio.gather(
-            *(
-                self.fetch_profile(
-                    username,
-                    allow_stale=False,
-                    force_refresh=True,
-                    bypass_cooldown=True,
-                )
-                for username in baseline_usernames
-            ),
-            return_exceptions=True,
+    async def reference_profile_preflight(self, *, force: bool = False) -> bool:
+        """Run one shared, cached baseline probe instead of a three-way storm."""
+        if not force:
+            cached = await self.redis.get(self.PREFLIGHT_CACHE_KEY)
+            if cached:
+                try:
+                    payload = json.loads(cached)
+                except (TypeError, json.JSONDecodeError):
+                    await self.redis.delete(self.PREFLIGHT_CACHE_KEY)
+                else:
+                    if isinstance(payload, dict) and isinstance(payload.get("ok"), bool):
+                        return bool(payload["ok"])
+
+        lock = self.redis.lock(
+            self.PREFLIGHT_LOCK_KEY,
+            timeout=max(60, int(self.settings.instagram_request_timeout_seconds * 8)),
+            blocking_timeout=5,
         )
-        active_results: list[tuple[str, ProfileResult]] = []
-        baseline_details: list[str] = []
-        for username, result in zip(baseline_usernames, results, strict=True):
-            if isinstance(result, BaseException):
+        if not await lock.acquire():
+            cached = await self.redis.get(self.PREFLIGHT_CACHE_KEY)
+            if cached:
+                with suppress(TypeError, json.JSONDecodeError):
+                    return bool(json.loads(cached).get("ok"))
+            return False
+
+        try:
+            if not force:
+                cached = await self.redis.get(self.PREFLIGHT_CACHE_KEY)
+                if cached:
+                    with suppress(TypeError, json.JSONDecodeError):
+                        return bool(json.loads(cached).get("ok"))
+
+            baseline_details: list[str] = []
+            healthy = False
+            for username in self.settings.baseline_usernames:
+                try:
+                    result = await self.fetch_profile(
+                        username,
+                        allow_stale=False,
+                        force_refresh=True,
+                        bypass_cooldown=True,
+                        activate_circuit=False,
+                    )
+                except Exception as exc:
+                    baseline_details.append(
+                        f"@{username}=exception:{type(exc).__name__}"
+                    )
+                    continue
                 baseline_details.append(
-                    f"@{username}=exception:{type(result).__name__}"
+                    f"@{username}={result.outcome.value}:{result.source}:"
+                    f"http={result.http_status or 0}"
                 )
-                continue
-            baseline_details.append(
-                f"@{username}={result.outcome.value}:{result.source}:"
-                f"http={result.http_status or 0}"
-            )
-            if (
-                result.outcome == CheckOutcome.ACTIVE
-                and (result.canonical_username or "").lower() == username
-            ):
-                active_results.append((username, result))
+                if (
+                    result.outcome == CheckOutcome.ACTIVE
+                    and (result.canonical_username or "").lower() == username
+                ):
+                    healthy = True
+                    break
+                # An explicit access rejection is route-wide evidence. Trying two
+                # more profiles immediately only amplifies the same block.
+                if result.outcome == CheckOutcome.RATE_LIMITED or (
+                    result.http_status in {401, 403, 429}
+                ):
+                    break
 
-        if active_results:
-            await self.redis.delete(
-                self.REFERENCE_ALERT_KEY,
-                self.STATUS_COOLDOWN_KEY,
+            detail = "; ".join(baseline_details) or "no_baseline_result"
+            encoded = json.dumps(
+                {
+                    "ok": healthy,
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "detail": detail,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
             )
-            self._rate_limited.clear()
+            await self.redis.set(
+                self.PREFLIGHT_CACHE_KEY,
+                encoded,
+                ex=self.settings.preflight_cache_seconds,
+            )
+
+            if healthy:
+                await self.redis.delete(self.STATUS_COOLDOWN_KEY)
+                self._rate_limited.clear()
+                await self.diagnostics.add(
+                    level="INFO",
+                    event="baseline_consensus_succeeded",
+                    message="شاهد مرجع زنده دریافت شد؛ چرخه کامل پایش مجاز است.",
+                    detail=detail,
+                )
+                await self._update_health_incident(healthy=True, detail=detail)
+                return True
+
+            await self._activate_cooldown(None)
             await self.diagnostics.add(
-                level="INFO",
-                event="baseline_consensus_succeeded",
+                level="ERROR",
+                event="baseline_consensus_failed",
                 message=(
-                    f"{len(active_results)} پیج از baselineهای مرجع با شاهد زنده "
-                    "دیده شدند؛ چرخه پایش مجاز است."
+                    "شاهد مرجع معتبر دریافت نشد؛ تغییر منفی وضعیت کاربران "
+                    "متوقف و فقط مسیر بازیابی فعال‌شدن اجرا می‌شود."
                 ),
-                detail="; ".join(baseline_details),
+                detail=detail,
             )
-            return True
+            await self._update_health_incident(healthy=False, detail=detail)
+            return False
+        finally:
+            with suppress(LockError, RedisError):
+                await lock.release()
 
-        await self.diagnostics.add(
-            level="CRITICAL",
-            event="baseline_consensus_failed",
-            message=(
-                "هیچ‌یک از سه پیج مرجع پاسخ فعال معتبر ندادند؛ شبکه یا مسیر "
-                "دسترسی ناسالم فرض می‌شود و وضعیت کاربران تغییر نمی‌کند."
-            ),
-            detail="; ".join(baseline_details),
-        )
-        should_alert = await self.redis.set(
-            self.REFERENCE_ALERT_KEY,
-            "1",
-            ex=900,
-            nx=True,
-        )
-        if should_alert:
-            await self._notify(
-                self.settings.admin_telegram_id,
-                "آزمون baseline اینستاگرام ناموفق بود. ⚠️\n\n"
-                "هیچ‌یک از پیج‌های مرجع تنظیم‌شده پاسخ فعال معتبر ندادند. "
-                "چرخه کاربران متوقف شد "
-                "و هیچ وضعیتی تغییر نکرد. سلامت WARP جداگانه در لاگ ثبت شده است.",
+    async def _update_health_incident(self, *, healthy: bool, detail: str) -> None:
+        """Send one alert per incident, one recovery, and sparse reminders."""
+        now = datetime.now(timezone.utc)
+        raw_state = await self.redis.get(self.HEALTH_INCIDENT_KEY)
+        state: dict[str, object] = {}
+        if raw_state:
+            with suppress(TypeError, json.JSONDecodeError):
+                parsed = json.loads(raw_state)
+                if isinstance(parsed, dict):
+                    state = parsed
+
+        previous_status = str(state.get("status") or "unknown")
+        if healthy:
+            await self.redis.delete(self.HEALTH_FAILURE_STREAK_KEY)
+            recovered = previous_status == "failed"
+            state = {
+                "status": "healthy",
+                "updated_at": now.isoformat(),
+                "detail": detail[:700],
+                "last_alert_at": state.get("last_alert_at"),
+            }
+            await self.redis.set(
+                self.HEALTH_INCIDENT_KEY,
+                json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                ex=604800,
             )
-        return False
+            if recovered:
+                await self._notify(
+                    self.settings.admin_telegram_id,
+                    "دسترسی پایش اینستاگرام دوباره پایدار شد. ✅\n\n"
+                    "صف بررسی کاربران از همین چرخه ادامه پیدا می‌کند و اعلان‌های "
+                    "معوق نیز دوباره ارسال می‌شوند.",
+                )
+            return
+
+        failure_streak = await self.redis.incr(self.HEALTH_FAILURE_STREAK_KEY)
+        if failure_streak == 1:
+            await self.redis.expire(self.HEALTH_FAILURE_STREAK_KEY, 86400)
+        threshold = self.settings.health_failure_alert_threshold
+        status = "failed" if failure_streak >= threshold else "degraded"
+        should_alert = False
+        last_alert_raw = state.get("last_alert_at")
+        last_alert_at: datetime | None = None
+        if isinstance(last_alert_raw, str):
+            with suppress(ValueError):
+                last_alert_at = datetime.fromisoformat(last_alert_raw)
+        if status == "failed":
+            should_alert = previous_status != "failed" or last_alert_at is None
+            if (
+                not should_alert
+                and last_alert_at is not None
+                and (now - last_alert_at).total_seconds()
+                >= self.settings.health_alert_reminder_seconds
+            ):
+                should_alert = True
+        muted = await self.redis.ttl(self.HEALTH_MUTE_KEY) > 0
+        if should_alert and not muted:
+            state["last_alert_at"] = now.isoformat()
+        state.update(
+            {
+                "status": status,
+                "updated_at": now.isoformat(),
+                "failure_streak": failure_streak,
+                "detail": detail[:700],
+            }
+        )
+        await self.redis.set(
+            self.HEALTH_INCIDENT_KEY,
+            json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+            ex=604800,
+        )
+        if should_alert and not muted:
+            delivered = await self._notify(
+                self.settings.admin_telegram_id,
+                "دسترسی عمومی اینستاگرام دچار اختلال پایدار شده است. ⚠️\n\n"
+                f"تعداد شکست متوالی: <code>{failure_streak}</code>\n"
+                f"خلاصه فنی: <code>{html.escape(detail[:600])}</code>\n\n"
+                "برای جلوگیری از گزارش اشتباه، تغییرهای منفی متوقف شده‌اند؛ "
+                "اما بازیابی پیج‌های غیرفعال و صف اعلان ادامه دارد. تا زمان "
+                "تغییر وضعیت، پیام تکراری ارسال نمی‌شود.",
+            )
+            if not delivered:
+                state.pop("last_alert_at", None)
+                await self.redis.set(
+                    self.HEALTH_INCIDENT_KEY,
+                    json.dumps(state, ensure_ascii=False, separators=(",", ":")),
+                    ex=604800,
+                )
 
     async def health_monitor(self) -> None:
+        """Observe shared health state; never launch a competing probe storm."""
         lock = self.redis.lock(
             self.HEALTH_LOCK_KEY,
             timeout=240,
@@ -1710,89 +1881,42 @@ class InstagramChecker:
         if not await lock.acquire(blocking=False):
             return
         try:
-            failure_reason: str | None = None
             proxy_ok = await self.proxy_preflight()
-            reference_ok = await self.reference_profile_preflight()
-            if not reference_ok:
-                latest = await self.diagnostics.latest(1)
-                failure_reason = (
-                    latest[0].detail
-                    if latest and latest[0].detail
-                    else "پیج مرجع @instagram پاسخ زنده معتبر نداد."
-                )
-            else:
-                result = await self.fetch_profile(
-                    "instagram",
-                    allow_stale=False,
-                    force_refresh=False,
-                )
-                if result.outcome != CheckOutcome.ACTIVE:
-                    failure_reason = (
-                        "Web Profile API برای پیج آزمایشی پاسخ معتبر نداد؛ "
-                        f"outcome={result.outcome.value}; http={result.http_status}"
-                    )
-                else:
-                    try:
-                        await asyncio.to_thread(
-                            ReportCardRenderer.render_profile,
-                            ProfileCardData(
-                                username=result.canonical_username or "instagram",
-                                full_name=result.full_name,
-                                biography=result.biography,
-                                follower_count=result.follower_count,
-                                following_count=result.following_count,
-                                post_count=result.post_count,
-                                is_private=result.is_private,
-                                is_verified=bool(result.is_verified),
-                            ),
-                        )
-                    except Exception as exc:
-                        failure_reason = (
-                            "موتور گزارش تصویری نتوانست کارت آزمایشی بسازد؛ "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-
-            previous_state = await self.redis.get(self.HEALTH_STATE_KEY)
-            if failure_reason is None:
-                await self.redis.set(self.HEALTH_STATE_KEY, "healthy", ex=86400)
-                await self.redis.delete(self.HEALTH_ALERT_KEY)
-                await self.diagnostics.add(
-                    level="INFO",
-                    event="health_monitor_succeeded",
-                    message=(
-                        "تست پنج‌دقیقه‌ای API مرجع و موتور گزارش تصویری موفق بود؛ "
-                        f"وضعیت WARP={'سالم' if proxy_ok else 'در حالت failover مستقیم'}."
+            reference_ok = await self.reference_profile_preflight(force=False)
+            renderer_ok = True
+            renderer_error: str | None = None
+            try:
+                await asyncio.to_thread(
+                    ReportCardRenderer.render_profile,
+                    ProfileCardData(
+                        username="farstar_health",
+                        full_name="Farstar Warner",
+                        biography="Local renderer self-test",
+                        follower_count=1,
+                        following_count=1,
+                        post_count=1,
+                        is_private=False,
+                        is_verified=False,
                     ),
                 )
-                if previous_state == "failed":
-                    await self._notify(
-                        self.settings.admin_telegram_id,
-                        "سیستم پایش دوباره سالم شد. ✅\n\n"
-                        "پیج مرجع اینستاگرام و تولید گزارش تصویری با موفقیت "
-                        "آزمایش شدند؛ مسیر اتصال نیز آماده پایش است.",
-                    )
-                return
-
-            await self.redis.set(self.HEALTH_STATE_KEY, "failed", ex=86400)
+            except Exception as exc:
+                renderer_ok = False
+                renderer_error = f"{type(exc).__name__}: {exc}"
+            state = "healthy" if reference_ok and renderer_ok else "degraded"
+            await self.redis.set(self.HEALTH_STATE_KEY, state, ex=86400)
             await self.diagnostics.add(
-                level="ERROR",
-                event="health_monitor_failed",
-                message="تست پنج‌دقیقه‌ای سلامت سامانه ناموفق بود.",
-                detail=failure_reason,
+                level="INFO" if state == "healthy" else "WARNING",
+                event="health_monitor_snapshot",
+                message=(
+                    "نمونه سلامت اشتراکی سامانه ثبت شد؛ این job درخواست "
+                    "اینستاگرام تکراری ایجاد نکرد."
+                ),
+                detail=(
+                    f"reference_ok={reference_ok}; warp_ok={proxy_ok}; "
+                    f"renderer_ok={renderer_ok}; renderer_error="
+                    f"{renderer_error or 'none'}"
+                ),
             )
-            should_alert = await self.redis.set(
-                self.HEALTH_ALERT_KEY,
-                "1",
-                ex=900,
-                nx=True,
-            )
-            if should_alert:
-                await self._notify(
-                    self.settings.admin_telegram_id,
-                    "ربات در تهیه گزارش آزمایشی با مشکل روبه‌رو شد. ⚠️\n\n"
-                    f"علت تشخیصی: <code>{html.escape(failure_reason[:700])}</code>\n\n"
-                    "جزئیات بیشتر در بخش «لاگ کامل و عیب‌یابی» ثبت شده است.",
-                )
         except Exception as exc:
             logger.exception("Health monitor failed unexpectedly")
             await self.diagnostics.add(
@@ -1801,38 +1925,12 @@ class InstagramChecker:
                 message="اجرای مانیتور سلامت با خطای داخلی متوقف شد.",
                 detail=f"{type(exc).__name__}: {exc}",
             )
-            with suppress(Exception):
-                should_alert = await self.redis.set(
-                    self.HEALTH_ALERT_KEY,
-                    "1",
-                    ex=900,
-                    nx=True,
-                )
-                if should_alert:
-                    await self._notify(
-                        self.settings.admin_telegram_id,
-                        "مانیتور سلامت ربات با خطای داخلی متوقف شد. ⚠️\n\n"
-                        f"نوع خطا: <code>{html.escape(type(exc).__name__)}</code>\n"
-                        "جزئیات کامل در لاگ عیب‌یابی ثبت شده است.",
-                    )
         finally:
             with suppress(LockError, RedisError):
                 await lock.release()
 
     async def run(self) -> None:
         self._official_ready = await self.official_provider_preflight(force=False)
-        cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
-        if cooldown_ttl > 0 and not self._official_ready:
-            await self.diagnostics.add(
-                level="WARNING",
-                event="checker_circuit_probe",
-                message=(
-                    "مدار عمومی باز است؛ فقط آزمون سه‌گانه مرجع برای بررسی "
-                    "بازیابی مسیر اجرا می‌شود."
-                ),
-                detail=f"retry_after_seconds={cooldown_ttl}",
-            )
-
         lock = self.redis.lock(
             self.LOCK_KEY,
             timeout=self.LOCK_TIMEOUT_SECONDS,
@@ -1852,50 +1950,15 @@ class InstagramChecker:
         renewal_task = asyncio.create_task(self._renew_lock(lock))
         try:
             self._rate_limited.clear()
-            proxy_ok = await self.proxy_preflight()
-            if not await self.reference_profile_preflight():
-                return
-            if not proxy_ok:
-                await self.diagnostics.add(
-                    level="WARNING",
-                    event="checker_direct_fallback_enabled",
-                    message=(
-                        "WARP سالم نبود اما پیج مرجع از مسیر جایگزین دیده شد؛ "
-                        "چرخه با failover مستقیم ادامه می‌یابد."
-                    ),
+            self._cycle_blocked_count = 0
+            if not await self.reference_profile_preflight(force=False):
+                await self.run_activation_recovery(
+                    force=False,
+                    checker_lock_held=True,
                 )
-            target_ids = await self._eligible_target_ids()
-            await self.diagnostics.add(
-                level="INFO",
-                event="checker_cycle_started",
-                message=f"چرخه پایش برای {len(target_ids)} پیج آغاز شد.",
-            )
-            if not target_ids:
                 return
-
-            queue: asyncio.Queue[int] = asyncio.Queue()
-            for target_id in target_ids:
-                queue.put_nowait(target_id)
-
-            worker_count = min(
-                self.settings.check_concurrency,
-                3,
-                len(target_ids),
-            )
-            workers = [
-                asyncio.create_task(self._worker(queue)) for _ in range(worker_count)
-            ]
-            try:
-                await queue.join()
-            finally:
-                for worker in workers:
-                    worker.cancel()
-                await asyncio.gather(*workers, return_exceptions=True)
-            await self.diagnostics.add(
-                level="INFO",
-                event="checker_cycle_completed",
-                message=f"چرخه پایش {len(target_ids)} پیج پایان یافت.",
-            )
+            target_ids = await self._eligible_target_ids()
+            await self._process_target_queue(target_ids, mode="full")
         except Exception as exc:
             logger.exception("Unexpected checker cycle failure")
             await self.diagnostics.add(
@@ -1913,6 +1976,95 @@ class InstagramChecker:
             except LockError:
                 logger.warning("Checker lock expired before it could be released")
 
+    async def _process_target_queue(
+        self,
+        target_ids: list[int],
+        *,
+        mode: str,
+        positive_only: bool = False,
+        bypass_cooldown: bool = False,
+    ) -> dict[str, int | float | str]:
+        started_at = time.perf_counter()
+        counters: dict[str, int] = {
+            "planned": len(target_ids),
+            "processed": 0,
+            "active": 0,
+            "deactivated": 0,
+            "unknown": 0,
+            "rate_limited": 0,
+            "deferred": 0,
+            "failed": 0,
+        }
+        deferred_targets: dict[int, str] = {}
+        self._cycle_fetch_tasks = {}
+        self._cycle_confirmation_tasks = {}
+        self._cycle_guest_audit_tasks = {}
+        await self.diagnostics.add(
+            level="INFO",
+            event="checker_cycle_started",
+            message=f"چرخه {mode} برای {len(target_ids)} هدف آغاز شد.",
+        )
+        if target_ids:
+            queue: asyncio.Queue[int] = asyncio.Queue()
+            for target_id in target_ids:
+                queue.put_nowait(target_id)
+            worker_count = min(self.settings.check_concurrency, len(target_ids))
+            workers = [
+                asyncio.create_task(
+                    self._worker(
+                        queue,
+                        positive_only=positive_only,
+                        bypass_cooldown=bypass_cooldown,
+                        counters=counters,
+                        deferred_targets=deferred_targets,
+                    )
+                )
+                for _ in range(worker_count)
+            ]
+            try:
+                await queue.join()
+            finally:
+                for worker in workers:
+                    worker.cancel()
+                await asyncio.gather(*workers, return_exceptions=True)
+                for task in self._cycle_fetch_tasks.values():
+                    if not task.done():
+                        task.cancel()
+                for task in self._cycle_confirmation_tasks.values():
+                    if not task.done():
+                        task.cancel()
+                for task in self._cycle_guest_audit_tasks.values():
+                    if not task.done():
+                        task.cancel()
+                self._cycle_fetch_tasks = {}
+                self._cycle_confirmation_tasks = {}
+                self._cycle_guest_audit_tasks = {}
+            if deferred_targets:
+                await self._record_deferred_checks(deferred_targets)
+
+        duration = round(time.perf_counter() - started_at, 3)
+        metrics: dict[str, int | float | str] = {
+            **counters,
+            "mode": mode,
+            "duration_seconds": duration,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await self.redis.set(
+            self.CYCLE_METRICS_KEY,
+            json.dumps(metrics, ensure_ascii=False, separators=(",", ":")),
+            ex=86400,
+        )
+        await self.diagnostics.add(
+            level="INFO" if counters["failed"] == 0 else "WARNING",
+            event="checker_cycle_completed",
+            message=(
+                f"چرخه {mode} پایان یافت: {counters['processed']} بررسی واقعی، "
+                f"{counters['deferred']} تعویق و {counters['failed']} خطا."
+            ),
+            detail=json.dumps(metrics, ensure_ascii=False, separators=(",", ":")),
+        )
+        return metrics
+
     async def _renew_lock(self, lock: Lock) -> None:
         while True:
             await asyncio.sleep(self.LOCK_TIMEOUT_SECONDS / 3)
@@ -1927,16 +2079,58 @@ class InstagramChecker:
                 logger.exception("Checker could not renew its distributed lock")
                 return
 
-    async def _worker(self, queue: asyncio.Queue[int]) -> None:
+    async def _worker(
+        self,
+        queue: asyncio.Queue[int],
+        *,
+        positive_only: bool = False,
+        bypass_cooldown: bool = False,
+        counters: dict[str, int] | None = None,
+        deferred_targets: dict[int, str] | None = None,
+    ) -> None:
         while True:
             target_id = await queue.get()
+            made_request = False
             try:
-                if (
-                    self._rate_limited.is_set() and not self._official_ready
-                ) or self._lock_lost.is_set():
+                if self._lock_lost.is_set():
+                    if deferred_targets is None:
+                        await self._record_deferred_check(target_id, "LockLost")
+                    else:
+                        deferred_targets[target_id] = "LockLost"
+                    if counters is not None:
+                        counters["deferred"] += 1
                     continue
-                await self._check_target(target_id)
+                if (
+                    self._rate_limited.is_set()
+                    and not self._official_ready
+                    and not bypass_cooldown
+                ):
+                    if deferred_targets is None:
+                        await self._record_deferred_check(
+                            target_id,
+                            "CircuitDeferred",
+                        )
+                    else:
+                        deferred_targets[target_id] = "CircuitDeferred"
+                    if counters is not None:
+                        counters["deferred"] += 1
+                    continue
+                made_request = True
+                result = await self._check_target(
+                    target_id,
+                    positive_only=positive_only,
+                    bypass_cooldown=bypass_cooldown,
+                    share_cycle=True,
+                )
+                if counters is not None:
+                    counters["processed"] += 1
+                    if result is None:
+                        counters["unknown"] += 1
+                    else:
+                        counters[result.outcome.value] += 1
             except Exception as exc:
+                if counters is not None:
+                    counters["failed"] += 1
                 logger.exception("Failed to process target %s", target_id)
                 await self.diagnostics.add(
                     level="ERROR",
@@ -1946,10 +2140,7 @@ class InstagramChecker:
                 )
             finally:
                 queue.task_done()
-            if not (
-                (self._rate_limited.is_set() and not self._official_ready)
-                or self._lock_lost.is_set()
-            ):
+            if made_request and not self._lock_lost.is_set():
                 await asyncio.sleep(
                     random.uniform(
                         self.settings.page_check_delay_min_seconds,
@@ -1957,7 +2148,12 @@ class InstagramChecker:
                     )
                 )
 
-    async def _eligible_target_ids(self) -> list[int]:
+    async def _eligible_target_ids(
+        self,
+        *,
+        only_deactivated: bool = False,
+        limit: int | None = None,
+    ) -> list[int]:
         now = datetime.now(timezone.utc)
         effective_limit = case(
             (
@@ -1986,10 +2182,20 @@ class InstagramChecker:
         ranked_targets = (
             select(
                 TargetPage.id.label("target_id"),
+                TargetPage.last_known_status.label("target_status"),
+                TargetPage.last_checked_at.label("last_checked_at"),
                 func.row_number()
                 .over(
                     partition_by=TargetPage.user_id,
-                    order_by=TargetPage.id,
+                    order_by=(
+                        case(
+                            (TargetPage.last_known_status == PageStatus.DEACTIVATED, 0),
+                            (TargetPage.last_known_status.is_(None), 1),
+                            else_=2,
+                        ),
+                        TargetPage.last_checked_at.asc().nulls_first(),
+                        TargetPage.id,
+                    ),
                 )
                 .label("target_rank"),
                 effective_limit.label("target_limit"),
@@ -2003,17 +2209,101 @@ class InstagramChecker:
             .subquery()
         )
         async with self.session_factory() as session:
+            statement = select(ranked_targets.c.target_id).where(
+                ranked_targets.c.target_rank <= ranked_targets.c.target_limit
+            )
+            if only_deactivated:
+                statement = statement.where(
+                    ranked_targets.c.target_status == PageStatus.DEACTIVATED
+                )
+            statement = statement.order_by(
+                case(
+                    (ranked_targets.c.target_status == PageStatus.DEACTIVATED, 0),
+                    (ranked_targets.c.target_status.is_(None), 1),
+                    else_=2,
+                ),
+                ranked_targets.c.last_checked_at.asc().nulls_first(),
+                ranked_targets.c.target_id,
+            )
+            if limit is not None:
+                statement = statement.limit(max(1, limit))
             result = await session.scalars(
-                select(ranked_targets.c.target_id)
-                .where(ranked_targets.c.target_rank <= ranked_targets.c.target_limit)
-                .order_by(ranked_targets.c.target_id)
+                statement
             )
             return list(result)
 
+    async def run_activation_recovery(
+        self,
+        *,
+        force: bool = False,
+        checker_lock_held: bool = False,
+    ) -> dict[str, object]:
+        """Check inactive targets for positive evidence even during an outage."""
+        if not force:
+            due = await self.redis.set(
+                self.RECOVERY_DUE_KEY,
+                "1",
+                ex=self.settings.preflight_cache_seconds,
+                nx=True,
+            )
+            if not due:
+                return {"mode": "activation-recovery", "skipped": "not_due"}
+        checker_lock: Lock | None = None
+        if not checker_lock_held:
+            checker_lock = self.redis.lock(
+                self.LOCK_KEY,
+                timeout=600,
+                blocking_timeout=0,
+            )
+            if not await checker_lock.acquire(blocking=False):
+                return {"mode": "activation-recovery", "skipped": "checker_busy"}
+        lock = self.redis.lock(
+            self.RECOVERY_LOCK_KEY,
+            timeout=600,
+            blocking_timeout=0,
+        )
+        if not await lock.acquire(blocking=False):
+            if checker_lock is not None:
+                with suppress(LockError, RedisError):
+                    await checker_lock.release()
+            return {"mode": "activation-recovery", "skipped": "locked"}
+        try:
+            target_ids = await self._eligible_target_ids(
+                only_deactivated=True,
+                limit=self.settings.recovery_batch_size,
+            )
+            return await self._process_target_queue(
+                target_ids,
+                mode="activation-recovery",
+                positive_only=True,
+                bypass_cooldown=True,
+            )
+        finally:
+            with suppress(LockError, RedisError):
+                await lock.release()
+            if checker_lock is not None:
+                with suppress(LockError, RedisError):
+                    await checker_lock.release()
+
     async def check_target_now(self, target_id: int) -> ProfileResult | None:
-        if not await self.reference_profile_preflight():
+        lock = self.redis.lock(
+            f"{self.MANUAL_CHECK_LOCK_PREFIX}{target_id}",
+            timeout=120,
+            blocking_timeout=0,
+        )
+        if not await lock.acquire(blocking=False):
             return None
-        return await self._check_target(target_id)
+        try:
+            healthy = await self.reference_profile_preflight(force=False)
+            return await self._check_target(
+                target_id,
+                positive_only=not healthy,
+                bypass_cooldown=not healthy,
+                share_cycle=False,
+            )
+        finally:
+            with suppress(LockError, RedisError):
+                await lock.release()
 
     async def get_profile_timeline(
         self,
@@ -2071,9 +2361,154 @@ class InstagramChecker:
             target.last_checked_at = datetime.now(timezone.utc)
             target.last_check_outcome = outcome or result.outcome.value
             target.last_http_status = result.http_status
+            target.consecutive_inconclusive_checks += 1
             await session.commit()
 
-    async def _check_target(self, target_id: int) -> ProfileResult | None:
+    async def _record_deferred_check(self, target_id: int, outcome: str) -> None:
+        async with self.session_factory() as session:
+            target = await session.get(TargetPage, target_id)
+            if target is None:
+                return
+            target.last_check_outcome = outcome
+            target.consecutive_inconclusive_checks += 1
+            await session.commit()
+
+    async def _record_deferred_checks(self, targets: dict[int, str]) -> None:
+        grouped: dict[str, list[int]] = {}
+        for target_id, outcome in targets.items():
+            grouped.setdefault(outcome, []).append(target_id)
+        async with self.session_factory() as session:
+            for outcome, target_ids in grouped.items():
+                await session.execute(
+                    update(TargetPage)
+                    .where(TargetPage.id.in_(target_ids))
+                    .values(
+                        last_check_outcome=outcome,
+                        consecutive_inconclusive_checks=(
+                            TargetPage.consecutive_inconclusive_checks + 1
+                        ),
+                    )
+                )
+            await session.commit()
+
+    async def _fetch_cycle_profile(
+        self,
+        username: str,
+        *,
+        bypass_cooldown: bool,
+        activate_circuit: bool,
+        positive_only: bool,
+    ) -> ProfileResult:
+        task = self._cycle_fetch_tasks.get(username)
+        if task is None:
+            if positive_only:
+                task = asyncio.create_task(
+                    self._fetch_positive_recovery_profile(username)
+                )
+            else:
+                task = asyncio.create_task(
+                    self.fetch_profile(
+                        username,
+                        allow_stale=False,
+                        force_refresh=True,
+                        bypass_cooldown=bypass_cooldown,
+                        activate_circuit=activate_circuit,
+                    )
+                )
+            self._cycle_fetch_tasks[username] = task
+        return await asyncio.shield(task)
+
+    async def _fetch_positive_recovery_profile(self, username: str) -> ProfileResult:
+        """Use at most two exact Curl probes and accept positive evidence only."""
+        responses: list[CurlResponse] = []
+        if self.settings.instagram_proxy_url:
+            responses.append(
+                await self._execute_curl_once(
+                    username,
+                    force_http2=False,
+                    use_proxy=True,
+                )
+            )
+        responses.append(
+            await self._execute_curl_once(
+                username,
+                force_http2=False,
+                use_proxy=False,
+            )
+        )
+        for response in responses:
+            parsed = self._parse_profile_response(
+                response.body,
+                username,
+                response.status_code or 0,
+            )
+            if parsed is not None:
+                await self._cache_profile(parsed, username)
+                return parsed
+        statuses = {response.status_code for response in responses}
+        if statuses and statuses <= {404}:
+            return ProfileResult(
+                CheckOutcome.DEACTIVATED,
+                source="recovery_probe_absence_untrusted",
+                http_status=404,
+            )
+        blocked_status = next(
+            (status for status in statuses if status in {401, 403, 429}),
+            None,
+        )
+        if blocked_status is not None:
+            return ProfileResult(
+                CheckOutcome.RATE_LIMITED,
+                source="recovery_probe_blocked",
+                http_status=blocked_status,
+                retry_after=self.settings.preflight_cache_seconds,
+            )
+        return ProfileResult(
+            CheckOutcome.UNKNOWN,
+            source="recovery_probe_unknown",
+            http_status=next((status for status in statuses if status), None),
+        )
+
+    async def _fetch_cycle_confirmation(
+        self,
+        username: str,
+        confirmation_number: int,
+        *,
+        bypass_cooldown: bool,
+    ) -> ProfileResult:
+        key = (username, confirmation_number)
+        task = self._cycle_confirmation_tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(
+                self.fetch_profile(
+                    username,
+                    allow_stale=False,
+                    force_refresh=True,
+                    bypass_cooldown=bypass_cooldown,
+                    activate_circuit=False,
+                )
+            )
+            self._cycle_confirmation_tasks[key] = task
+        return await asyncio.shield(task)
+
+    async def _audit_cycle_guest_searchability(
+        self,
+        username: str,
+    ) -> bool | None:
+        task = self._cycle_guest_audit_tasks.get(username)
+        if task is None:
+            task = asyncio.create_task(self._audit_guest_searchability(username))
+            self._cycle_guest_audit_tasks[username] = task
+        return await asyncio.shield(task)
+
+    async def _check_target(
+        self,
+        target_id: int,
+        *,
+        positive_only: bool = False,
+        bypass_cooldown: bool = False,
+        share_cycle: bool = False,
+    ) -> ProfileResult | None:
         async with self.session_factory() as session:
             snapshot = await session.get(TargetPage, target_id)
             if snapshot is None:
@@ -2083,18 +2518,32 @@ class InstagramChecker:
 
         # Background state transitions must only use a live Instagram response.
         # Stale metadata is reserved for user-facing profile previews.
-        result = await self.fetch_profile(
-            username,
-            allow_stale=False,
-            force_refresh=True,
-            expected_profile_id=snapshot.last_known_id,
-        )
-        if result.outcome == CheckOutcome.ACTIVE:
-            searchable = (
-                True
-                if result.source == "graphql_username_search"
-                else await self._audit_guest_searchability(username)
+        observation_started_at = datetime.now(timezone.utc)
+        if share_cycle:
+            result = await self._fetch_cycle_profile(
+                username,
+                bypass_cooldown=bypass_cooldown,
+                activate_circuit=not positive_only,
+                positive_only=positive_only,
             )
+        else:
+            result = await self.fetch_profile(
+                username,
+                allow_stale=False,
+                force_refresh=True,
+                expected_profile_id=snapshot.last_known_id,
+                bypass_cooldown=bypass_cooldown,
+                activate_circuit=not positive_only,
+            )
+        if result.outcome == CheckOutcome.ACTIVE:
+            if result.source == "graphql_username_search":
+                searchable = True
+            elif positive_only:
+                searchable = None
+            elif share_cycle:
+                searchable = await self._audit_cycle_guest_searchability(username)
+            else:
+                searchable = await self._audit_guest_searchability(username)
             result = replace(result, guest_searchable=searchable)
         await self.diagnostics.add(
             level=(
@@ -2120,6 +2569,13 @@ class InstagramChecker:
             )
             await self._record_inconclusive_check(target_id, result)
             return result
+        if positive_only and result.outcome != CheckOutcome.ACTIVE:
+            await self._record_inconclusive_check(
+                target_id,
+                result,
+                outcome=f"RecoveryProbe:{result.outcome.value}",
+            )
+            return result
 
         streak_key = f"{self.DEACTIVATION_STREAK_PREFIX}{target_id}"
         await self.redis.delete(streak_key)
@@ -2132,12 +2588,21 @@ class InstagramChecker:
             while confirmations < self.settings.deactivation_confirmations:
                 delay = self.settings.deactivation_confirmation_delay_seconds
                 await asyncio.sleep(random.uniform(delay * 0.8, delay * 1.2))
-                confirmation = await self.fetch_profile(
-                    username,
-                    allow_stale=False,
-                    force_refresh=True,
-                    expected_profile_id=snapshot.last_known_id,
-                )
+                if share_cycle:
+                    confirmation = await self._fetch_cycle_confirmation(
+                        username,
+                        confirmations,
+                        bypass_cooldown=bypass_cooldown,
+                    )
+                else:
+                    confirmation = await self.fetch_profile(
+                        username,
+                        allow_stale=False,
+                        force_refresh=True,
+                        expected_profile_id=snapshot.last_known_id,
+                        bypass_cooldown=bypass_cooldown,
+                        activate_circuit=False,
+                    )
                 if confirmation.outcome != CheckOutcome.DEACTIVATED:
                     await self._record_inconclusive_check(
                         target_id,
@@ -2183,6 +2648,14 @@ class InstagramChecker:
             )
             if target is None:
                 return None
+            previous_evidence_at = target.last_evidence_at
+            if previous_evidence_at is not None:
+                if previous_evidence_at.tzinfo is None:
+                    previous_evidence_at = previous_evidence_at.replace(
+                        tzinfo=timezone.utc
+                    )
+                if previous_evidence_at > observation_started_at:
+                    return result
             owner = await session.get(User, target.user_id)
             if owner is not None:
                 admin_report_categories = parse_admin_report_categories(
@@ -2219,8 +2692,9 @@ class InstagramChecker:
             target.last_check_outcome = result.outcome.value
             target.last_http_status = result.http_status
             target.last_evidence_source = result.source
-            target.last_evidence_at = checked_at
+            target.last_evidence_at = observation_started_at
             target.status_confirmed = True
+            target.consecutive_inconclusive_checks = 0
             if new_status == PageStatus.ACTIVE:
                 target.consecutive_active_checks += 1
                 target.consecutive_deactivated_checks = 0
@@ -2994,6 +3468,45 @@ class InstagramChecker:
                         )
                     )
             recipient_id = target.user_id
+            deliveries: list[tuple[int, NotificationPayload, str]] = []
+            for index, notification in enumerate(notifications):
+                deliveries.append((recipient_id, notification, f"owner:{index}"))
+                if (
+                    admin_report_categories
+                    and recipient_id != self.settings.admin_telegram_id
+                    and notification.category in admin_report_categories
+                ):
+                    deliveries.append(
+                        (
+                            self.settings.admin_telegram_id,
+                            replace(
+                                notification,
+                                message=(
+                                    "رونوشت گزارش کاربر "
+                                    f"<code>{recipient_id}</code> 📨\n\n"
+                                    f"{notification.message}"
+                                ),
+                                reply_markup=None,
+                            ),
+                            f"admin-copy:{index}",
+                        )
+                    )
+            event_stamp = checked_at.isoformat(timespec="microseconds")
+            for delivery_recipient, delivery_payload, delivery_suffix in deliveries:
+                session.add(
+                    NotificationOutbox(
+                        event_key=(
+                            f"target:{target.id}:{event_stamp}:"
+                            f"{delivery_payload.category}:{delivery_suffix}"
+                        ),
+                        recipient_id=delivery_recipient,
+                        target_page_id=target.id,
+                        category=delivery_payload.category,
+                        payload_json=self._notification_payload_json(delivery_payload),
+                        status="Pending",
+                        next_attempt_at=checked_at,
+                    )
+                )
             await session.commit()
 
         if searchability_issue:
@@ -3022,35 +3535,184 @@ class InstagramChecker:
             ),
         )
 
-        if recipient_id is not None:
-            for notification in notifications:
-                await self._notify(recipient_id, notification)
-            if (
-                admin_report_categories
-                and recipient_id != self.settings.admin_telegram_id
-            ):
-                for notification in notifications:
-                    if notification.category not in admin_report_categories:
+        return result
+
+    @staticmethod
+    def _notification_payload_json(payload: NotificationPayload) -> str:
+        data = {
+            "message": payload.message,
+            "username": payload.username,
+            "title": payload.title,
+            "category": payload.category,
+            "primary_label": payload.primary_label,
+            "primary_value": payload.primary_value,
+            "secondary_label": payload.secondary_label,
+            "secondary_value": payload.secondary_value,
+            "accent": payload.accent,
+        }
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _notification_payload_from_json(raw: str) -> NotificationPayload:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("notification payload is not an object")
+        return NotificationPayload(**payload)
+
+    async def dispatch_notification_outbox(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> int:
+        """Deliver due notifications outside database transactions with retry."""
+        lock = self.redis.lock(
+            self.OUTBOX_LOCK_KEY,
+            timeout=300,
+            blocking_timeout=0,
+        )
+        if not await lock.acquire(blocking=False):
+            return 0
+        delivered_count = 0
+        try:
+            now = datetime.now(timezone.utc)
+            batch_size = limit or self.settings.outbox_batch_size
+            async with self.session_factory() as session:
+                rows = list(
+                    await session.scalars(
+                        select(NotificationOutbox)
+                        .where(
+                            NotificationOutbox.status.in_(("Pending", "Retry")),
+                            NotificationOutbox.next_attempt_at <= now,
+                        )
+                        .order_by(
+                            NotificationOutbox.next_attempt_at,
+                            NotificationOutbox.id,
+                        )
+                        .limit(max(1, min(batch_size, 100)))
+                    )
+                )
+
+            for row in rows:
+                try:
+                    payload = self._notification_payload_from_json(row.payload_json)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    result = DeliveryResult(
+                        False,
+                        error=f"invalid payload: {type(exc).__name__}: {exc}",
+                        terminal=True,
+                    )
+                else:
+                    result = await self._deliver_notification(
+                        row.recipient_id,
+                        payload,
+                    )
+
+                async with self.session_factory() as session:
+                    stored = await session.scalar(
+                        select(NotificationOutbox)
+                        .where(NotificationOutbox.id == row.id)
+                        .with_for_update()
+                    )
+                    if stored is None or stored.status == "Sent":
                         continue
-                    await self._notify(
-                        self.settings.admin_telegram_id,
-                        replace(
-                            notification,
-                            message=(
-                                "رونوشت گزارش کاربر "
-                                f"<code>{recipient_id}</code> 📨\n\n"
-                                f"{notification.message}"
-                            ),
-                            reply_markup=None,
+                    stored.attempt_count += 1
+                    if result.delivered:
+                        stored.status = "Sent"
+                        stored.sent_at = datetime.now(timezone.utc)
+                        stored.last_error = None
+                        delivered_count += 1
+                    else:
+                        stored.last_error = self._truncate(result.error, 2000)
+                        exhausted = (
+                            stored.attempt_count >= self.settings.outbox_max_attempts
+                        )
+                        if result.terminal or exhausted:
+                            stored.status = "Dead"
+                        else:
+                            stored.status = "Retry"
+                            delay = result.retry_after or min(
+                                21600,
+                                30 * (2 ** min(stored.attempt_count - 1, 10)),
+                            )
+                            stored.next_attempt_at = datetime.now(
+                                timezone.utc
+                            ) + timedelta(seconds=max(1, delay))
+                    await session.commit()
+
+                if not result.delivered:
+                    await self.diagnostics.add(
+                        level="ERROR" if result.terminal else "WARNING",
+                        event=(
+                            "notification_delivery_dead"
+                            if result.terminal
+                            else "notification_delivery_retry"
+                        ),
+                        message=(
+                            "ارسال اعلان برای همیشه متوقف شد."
+                            if result.terminal
+                            else "ارسال اعلان ناموفق بود و دوباره تلاش می‌شود."
+                        ),
+                        detail=(
+                            f"outbox_id={row.id}; recipient={row.recipient_id}; "
+                            f"error={result.error or 'unknown'}"
                         ),
                     )
-        return result
+                await asyncio.sleep(0.05)
+            return delivered_count
+        finally:
+            with suppress(LockError, RedisError):
+                await lock.release()
+
+    async def retry_failed_notifications(self) -> int:
+        now = datetime.now(timezone.utc)
+        async with self.session_factory() as session:
+            rows = list(
+                await session.scalars(
+                    select(NotificationOutbox).where(
+                        NotificationOutbox.status.in_(("Retry", "Dead"))
+                    )
+                )
+            )
+            for row in rows:
+                row.status = "Retry"
+                row.attempt_count = 0
+                row.next_attempt_at = now
+                row.last_error = None
+            await session.commit()
+            return len(rows)
+
+    async def outbox_status_counts(self) -> dict[str, int]:
+        async with self.session_factory() as session:
+            rows = (
+                await session.execute(
+                    select(NotificationOutbox.status, func.count(NotificationOutbox.id))
+                    .group_by(NotificationOutbox.status)
+                )
+            ).all()
+        return {str(status): int(count) for status, count in rows}
+
+    async def cleanup_notification_outbox(self) -> None:
+        now = datetime.now(timezone.utc)
+        async with self.session_factory() as session:
+            await session.execute(
+                delete(NotificationOutbox).where(
+                    NotificationOutbox.status == "Sent",
+                    NotificationOutbox.sent_at < now - timedelta(days=30),
+                )
+            )
+            await session.execute(
+                delete(NotificationOutbox).where(
+                    NotificationOutbox.status == "Dead",
+                    NotificationOutbox.created_at < now - timedelta(days=90),
+                )
+            )
+            await session.commit()
 
     async def _notify(
         self,
         telegram_id: int,
         notification: str | NotificationPayload,
-    ) -> None:
+    ) -> bool:
         if isinstance(notification, str):
             payload = NotificationPayload(
                 message=notification,
@@ -3063,6 +3725,21 @@ class InstagramChecker:
             )
         else:
             payload = notification
+        result = await self._deliver_notification(telegram_id, payload)
+        if not result.delivered:
+            logger.warning(
+                "Telegram notification failed for user %s: %s",
+                telegram_id,
+                result.error or "unknown error",
+            )
+        return result.delivered
+
+    async def _deliver_notification(
+        self,
+        telegram_id: int,
+        payload: NotificationPayload,
+    ) -> DeliveryResult:
+        card: bytes | None = None
         try:
             card = await asyncio.to_thread(
                 ReportCardRenderer.render_alert,
@@ -3078,33 +3755,58 @@ class InstagramChecker:
                     occurred_at=datetime.now().astimezone(),
                 ),
             )
-            await self.bot.send_photo(
-                telegram_id,
-                BufferedInputFile(card, filename="farstar-security-report.jpg"),
-                caption=payload.message,
-                reply_markup=payload.reply_markup,
-            )
-            return
-        except TelegramAPIError as exc:
-            logger.warning(
-                "Telegram photo notification failed for user %s: %s",
-                telegram_id,
-                exc,
-            )
         except Exception as exc:
             logger.warning("Could not render notification card: %s", exc)
+
+        if card is not None:
+            try:
+                await self.bot.send_photo(
+                    telegram_id,
+                    BufferedInputFile(card, filename="farstar-security-report.jpg"),
+                    caption=payload.message,
+                    reply_markup=payload.reply_markup,
+                )
+                return DeliveryResult(True)
+            except TelegramRetryAfter as exc:
+                return DeliveryResult(
+                    False,
+                    error=f"TelegramRetryAfter: {exc}",
+                    retry_after=max(1, int(exc.retry_after)),
+                )
+            except TelegramForbiddenError as exc:
+                return DeliveryResult(
+                    False,
+                    error=f"TelegramForbiddenError: {exc}",
+                    terminal=True,
+                )
+            except TelegramAPIError as exc:
+                logger.warning(
+                    "Telegram photo notification failed for user %s: %s",
+                    telegram_id,
+                    exc,
+                )
+
         try:
             await self.bot.send_message(
                 telegram_id,
                 payload.message,
                 reply_markup=payload.reply_markup,
             )
-        except TelegramAPIError as exc:
-            logger.warning(
-                "Telegram notification failed for user %s: %s",
-                telegram_id,
-                exc,
+            return DeliveryResult(True)
+        except TelegramRetryAfter as exc:
+            return DeliveryResult(
+                False,
+                error=f"TelegramRetryAfter: {exc}",
+                retry_after=max(1, int(exc.retry_after)),
             )
+        except TelegramForbiddenError as exc:
+            return DeliveryResult(
+                False,
+                error=f"TelegramForbiddenError: {exc}",
+                terminal=True,
+            )
+        except TelegramAPIError as exc:
+            return DeliveryResult(False, error=f"TelegramAPIError: {exc}")
 
     @staticmethod
     def _optional_text(value: object) -> str | None:
@@ -3239,7 +3941,34 @@ class InstagramChecker:
     async def _activate_cooldown(self, requested_seconds: int | None) -> int:
         cooldown = requested_seconds or self.settings.rate_limit_cooldown_seconds
         cooldown = max(60, min(cooldown, 86400))
-        await self.redis.set(self.STATUS_COOLDOWN_KEY, str(cooldown), ex=cooldown)
+        existing_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
+        if existing_ttl > 0:
+            return existing_ttl
+        if existing_ttl == -1:
+            await self.redis.delete(self.STATUS_COOLDOWN_KEY)
+        created = await self.redis.set(
+            self.STATUS_COOLDOWN_KEY,
+            str(cooldown),
+            ex=cooldown,
+            nx=True,
+        )
+        if not created:
+            current_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
+            return current_ttl if current_ttl > 0 else cooldown
+        preflight_ttl = int(getattr(self.settings, "preflight_cache_seconds", 300))
+        await self.redis.delete(self.RECOVERY_DUE_KEY)
+        await self.redis.set(
+            self.PREFLIGHT_CACHE_KEY,
+            json.dumps(
+                {
+                    "ok": False,
+                    "checked_at": datetime.now(timezone.utc).isoformat(),
+                    "detail": "target_rate_limit_circuit_open",
+                },
+                separators=(",", ":"),
+            ),
+            ex=max(60, preflight_ttl),
+        )
         logger.warning(
             "Instagram rate limit detected; pausing checks for %s seconds",
             cooldown,

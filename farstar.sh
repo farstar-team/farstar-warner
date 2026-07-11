@@ -154,22 +154,10 @@ random_secret() {
   printf '%s' "${secret}"
 }
 
-fernet_key() {
-  openssl rand -base64 32 | tr -d '\n' | tr '+/' '-_'
-}
-
 ensure_instance_defaults() {
   local instance="$1"
   local env_file
   env_file="$(instance_env "${instance}")"
-  if ! "${SUDO[@]}" grep -q '^CREDENTIAL_ENCRYPTION_KEY=' "${env_file}"; then
-    printf 'CREDENTIAL_ENCRYPTION_KEY=%s\n' "$(fernet_key)" \
-      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
-  fi
-  if ! "${SUDO[@]}" grep -q '^META_GRAPH_API_VERSION=' "${env_file}"; then
-    printf 'META_GRAPH_API_VERSION=v21.0\n' \
-      | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
-  fi
   if ! "${SUDO[@]}" grep -q '^USD_TOMAN_FALLBACK_RATE=' "${env_file}"; then
     printf 'USD_TOMAN_FALLBACK_RATE=650000\n' \
       | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
@@ -186,6 +174,29 @@ ensure_instance_defaults() {
     printf 'ZARINPAL_TIMEOUT_SECONDS=15\n' \
       | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
   fi
+  if "${SUDO[@]}" grep -q '^CHECK_CONCURRENCY=8$' "${env_file}"; then
+    "${SUDO[@]}" sed -i 's/^CHECK_CONCURRENCY=8$/CHECK_CONCURRENCY=4/' "${env_file}"
+  fi
+  if "${SUDO[@]}" grep -q '^PAGE_CHECK_DELAY_MIN_SECONDS=15\(\.0\)\?$' "${env_file}"; then
+    "${SUDO[@]}" sed -i 's/^PAGE_CHECK_DELAY_MIN_SECONDS=.*/PAGE_CHECK_DELAY_MIN_SECONDS=0.5/' "${env_file}"
+  fi
+  if "${SUDO[@]}" grep -q '^PAGE_CHECK_DELAY_MAX_SECONDS=45\(\.0\)\?$' "${env_file}"; then
+    "${SUDO[@]}" sed -i 's/^PAGE_CHECK_DELAY_MAX_SECONDS=.*/PAGE_CHECK_DELAY_MAX_SECONDS=2/' "${env_file}"
+  fi
+  local key_value
+  for key_value in \
+    'RATE_LIMIT_COOLDOWN_SECONDS=900' \
+    'PREFLIGHT_CACHE_SECONDS=300' \
+    'RECOVERY_BATCH_SIZE=25' \
+    'HEALTH_FAILURE_ALERT_THRESHOLD=2' \
+    'HEALTH_ALERT_REMINDER_SECONDS=21600' \
+    'GUEST_SEARCH_AUDIT_SECONDS=21600' \
+    'OUTBOX_BATCH_SIZE=25' \
+    'OUTBOX_MAX_ATTEMPTS=12'; do
+    if ! "${SUDO[@]}" grep -q "^${key_value%%=*}=" "${env_file}"; then
+      printf '%s\n' "${key_value}" | "${SUDO[@]}" tee -a "${env_file}" >/dev/null
+    fi
+  done
   "${SUDO[@]}" chmod 600 "${env_file}"
 }
 
@@ -287,10 +298,8 @@ REDIS_HOST=redis
 REDIS_PORT=6379
 REDIS_DB=0
 REDIS_PASSWORD=${redis_password}
-CREDENTIAL_ENCRYPTION_KEY=$(fernet_key)
-META_GRAPH_API_VERSION=v21.0
 CHECK_INTERVAL_SECONDS=300
-CHECK_CONCURRENCY=8
+CHECK_CONCURRENCY=4
 DEACTIVATION_CONFIRMATIONS=2
 DEACTIVATION_CONFIRMATION_DELAY_SECONDS=15
 CHECK_JITTER_MIN_SECONDS=0.5
@@ -299,8 +308,16 @@ INSTAGRAM_PROXY_URL=socks5://warp_proxy:1080
 INSTAGRAM_SEARCH_DOC_ID=26347858941511777
 INSTAGRAM_BASELINE_USERNAMES=farstar_vpn,instagram,nasa
 PROXY_HEALTH_URL=https://www.cloudflare.com/cdn-cgi/trace
-PAGE_CHECK_DELAY_MIN_SECONDS=15
-PAGE_CHECK_DELAY_MAX_SECONDS=45
+PAGE_CHECK_DELAY_MIN_SECONDS=0.5
+PAGE_CHECK_DELAY_MAX_SECONDS=2
+RATE_LIMIT_COOLDOWN_SECONDS=900
+PREFLIGHT_CACHE_SECONDS=300
+RECOVERY_BATCH_SIZE=25
+HEALTH_FAILURE_ALERT_THRESHOLD=2
+HEALTH_ALERT_REMINDER_SECONDS=21600
+GUEST_SEARCH_AUDIT_SECONDS=21600
+OUTBOX_BATCH_SIZE=25
+OUTBOX_MAX_ATTEMPTS=12
 USD_TOMAN_FALLBACK_RATE=650000
 ZARINPAL_MERCHANT_ID=
 ZARINPAL_CALLBACK_URL=
@@ -338,7 +355,11 @@ stop_instance() {
 restart_instance() {
   local instance="$1"
   require_instance "${instance}"
-  compose "${instance}" restart
+  ensure_instance_defaults "${instance}"
+  if ! "${DOCKER[@]}" image inspect farstar-warner:latest >/dev/null 2>&1; then
+    build_image
+  fi
+  compose "${instance}" up -d --no-build --force-recreate
 }
 
 apply_instance() {

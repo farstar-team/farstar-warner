@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import html
+import json
 import logging
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from redis.asyncio import Redis
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from bot.checker import CheckOutcome, InstagramChecker
@@ -29,6 +31,7 @@ from bot.keyboards.inline import (
     admin_diagnostics_keyboard,
     admin_monitoring_accounts_keyboard,
     admin_monitoring_delete_keyboard,
+    admin_operations_keyboard,
     admin_panel_keyboard,
     admin_plan_keyboard,
     admin_plans_keyboard,
@@ -93,6 +96,15 @@ DIAGNOSTIC_LEVELS = {
     "ERROR": "خطا",
     "CRITICAL": "بحرانی",
 }
+
+
+def _background_task_done(task: asyncio.Task[object]) -> None:
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except Exception:
+        logger.exception("Admin background operation failed")
 
 
 def _diagnostic_time(value: str) -> str:
@@ -2494,6 +2506,190 @@ async def begin_admin_add_target(
     await callback.answer()
 
 
+async def _show_operations_center(
+    callback: CallbackQuery,
+    checker: InstagramChecker,
+    session_factory: SessionFactory,
+    redis: Redis,
+) -> None:
+    now = datetime.now(timezone.utc)
+    stored_interval = await redis.get("farstar:checker:interval")
+    try:
+        interval = max(30, int(stored_interval or 300))
+    except (TypeError, ValueError):
+        interval = 300
+    stale_cutoff = now - timedelta(seconds=max(interval * 3, 900))
+    async with session_factory() as session:
+        total_targets = await session.scalar(
+            select(func.count()).select_from(TargetPage)
+        )
+        unique_targets = await session.scalar(
+            select(func.count(func.distinct(TargetPage.instagram_username)))
+        )
+        inactive_targets = await session.scalar(
+            select(func.count())
+            .select_from(TargetPage)
+            .where(TargetPage.last_known_status == PageStatus.DEACTIVATED)
+        )
+        overdue_targets = await session.scalar(
+            select(func.count())
+            .select_from(TargetPage)
+            .where(
+                or_(
+                    TargetPage.last_successful_check_at.is_(None),
+                    TargetPage.last_successful_check_at < stale_cutoff,
+                )
+            )
+        )
+        inconclusive_targets = await session.scalar(
+            select(func.count())
+            .select_from(TargetPage)
+            .where(TargetPage.consecutive_inconclusive_checks > 0)
+        )
+
+    outbox = await checker.outbox_status_counts()
+    raw_metrics = await redis.get(checker.CYCLE_METRICS_KEY)
+    metrics: dict[str, object] = {}
+    if raw_metrics:
+        with suppress(TypeError, json.JSONDecodeError):
+            parsed = json.loads(raw_metrics)
+            if isinstance(parsed, dict):
+                metrics = parsed
+    raw_incident = await redis.get(checker.HEALTH_INCIDENT_KEY)
+    incident: dict[str, object] = {}
+    if raw_incident:
+        with suppress(TypeError, json.JSONDecodeError):
+            parsed = json.loads(raw_incident)
+            if isinstance(parsed, dict):
+                incident = parsed
+    incident_names = {
+        "healthy": "سالم ✅",
+        "degraded": "در حال بررسی 🟡",
+        "failed": "اختلال پایدار 🔴",
+        "unknown": "هنوز ثبت نشده ⚪",
+    }
+    mode_names = {
+        "full": "پایش کامل",
+        "activation-recovery": "بازیابی فعال‌شدن",
+    }
+    muted_ttl = await redis.ttl(checker.HEALTH_MUTE_KEY)
+    cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
+    text = (
+        "مرکز عملیات پایش 📡\n\n"
+        f"وضعیت سرویس: <b>{incident_names.get(str(incident.get('status') or 'unknown'), 'نامشخص')}</b>\n"
+        f"مدار محافظ: <b>{'فعال' if cooldown_ttl > 0 else 'بسته و آماده'}</b>"
+        + (
+            f" — {_digits(cooldown_ttl)} ثانیه"
+            if cooldown_ttl > 0
+            else ""
+        )
+        + "\n"
+        f"سکوت هشدار مدیر: <b>{'فعال' if muted_ttl > 0 else 'غیرفعال'}</b>\n\n"
+        f"کل هدف‌ها: <b>{_digits(total_targets or 0)}</b>\n"
+        f"نام‌های کاربری یکتا: <b>{_digits(unique_targets or 0)}</b>\n"
+        f"منتظر فعال‌شدن: <b>{_digits(inactive_targets or 0)}</b>\n"
+        f"عقب‌افتاده از SLA: <b>{_digits(overdue_targets or 0)}</b>\n"
+        f"دارای پاسخ نامشخص: <b>{_digits(inconclusive_targets or 0)}</b>\n\n"
+        f"چرخه آخر: <b>{mode_names.get(str(metrics.get('mode') or ''), 'ثبت نشده')}</b>\n"
+        f"برنامه‌ریزی‌شده: {_digits(metrics.get('planned') or 0)} | "
+        f"واقعاً بررسی‌شده: {_digits(metrics.get('processed') or 0)}\n"
+        f"تعویق: {_digits(metrics.get('deferred') or 0)} | "
+        f"خطا: {_digits(metrics.get('failed') or 0)}\n"
+        f"زمان چرخه: <code>{_digits(metrics.get('duration_seconds') or 0)}</code> ثانیه\n\n"
+        "صندوق اعلان پایدار:\n"
+        f"در انتظار: <b>{_digits(outbox.get('Pending', 0))}</b> | "
+        f"تلاش دوباره: <b>{_digits(outbox.get('Retry', 0))}</b> | "
+        f"ناموفق نهایی: <b>{_digits(outbox.get('Dead', 0))}</b> | "
+        f"ارسال‌شده: <b>{_digits(outbox.get('Sent', 0))}</b>\n\n"
+        f"زمان گزارش:\n{format_datetime_dual(now)}"
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            text,
+            reply_markup=admin_operations_keyboard(muted=muted_ttl > 0),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin:operations")
+async def operations_center(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+    session_factory: SessionFactory,
+    redis: Redis,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await _show_operations_center(callback, checker, session_factory, redis)
+
+
+@router.callback_query(F.data == "admin:operations:recovery")
+async def force_activation_recovery(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    task = asyncio.create_task(checker.run_activation_recovery(force=True))
+    task.add_done_callback(_background_task_done)
+    await callback.answer(
+        "بازیابی پیج‌های غیرفعال در پس‌زمینه آغاز شد. نتیجه در مرکز عملیات ثبت می‌شود.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data == "admin:operations:outbox")
+async def retry_notification_outbox(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    count = await checker.retry_failed_notifications()
+    task = asyncio.create_task(checker.dispatch_notification_outbox())
+    task.add_done_callback(_background_task_done)
+    await callback.answer(
+        f"{_digits(count)} اعلان برای تلاش دوباره آماده شد.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data == "admin:operations:probe")
+async def force_reference_probe(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    task = asyncio.create_task(checker.reference_profile_preflight(force=True))
+    task.add_done_callback(_background_task_done)
+    await callback.answer(
+        "آزمون شاهد مرجع در پس‌زمینه آغاز شد؛ کمی بعد مرکز عملیات را تازه کنید.",
+        show_alert=True,
+    )
+
+
+@router.callback_query(F.data == "admin:operations:mute")
+async def toggle_health_alert_mute(
+    callback: CallbackQuery,
+    settings: Settings,
+    checker: InstagramChecker,
+    session_factory: SessionFactory,
+    redis: Redis,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    if await redis.ttl(checker.HEALTH_MUTE_KEY) > 0:
+        await redis.delete(checker.HEALTH_MUTE_KEY)
+    else:
+        await redis.set(checker.HEALTH_MUTE_KEY, "1", ex=21600)
+    await _show_operations_center(callback, checker, session_factory, redis)
+
+
 @router.callback_query(F.data == "admin:instagram_health")
 async def instagram_connection_health(
     callback: CallbackQuery,
@@ -2506,14 +2702,14 @@ async def instagram_connection_health(
         return
     await callback.answer("در حال آزمایش مسیر عمومی اینستاگرام…")
     warp_ok = await checker.proxy_preflight()
-    official_ok = await checker.official_provider_preflight(force=True)
-    monitoring_accounts = await checker.monitoring_accounts()
     browser_ok, browser_version = await profile_preview.browser_health()
     cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
     result = await checker.fetch_profile(
         "instagram",
         allow_stale=False,
         force_refresh=True,
+        bypass_cooldown=True,
+        activate_circuit=False,
     )
     rendered = (
         None
@@ -2572,11 +2768,9 @@ async def instagram_connection_health(
     )
     text = (
         "وضعیت اتصال اینستاگرام 🌐\n\n"
-        "مسیر رسمی Meta: "
-        f"<b>{'سالم و آماده ✅' if official_ok else 'تنظیم نشده یا نامعتبر ⚪'}</b>\n"
-        f"تعداد اتصال‌های رسمی: <b>{_digits(len(monitoring_accounts))}</b>\n"
+        "مسیر رسمی Meta: <b>غیرفعال؛ حالت OSINT بدون ورود ✅</b>\n"
         "ذخیره رمز یا کوکی اینستاگرام: <b>غیرفعال ✅</b>\n"
-        "توکن‌های رسمی: <b>رمزگذاری‌شده در دیتابیس</b>\n"
+        "توکن یا session اینستاگرام: <b>استفاده نمی‌شود ✅</b>\n"
         f"پراکسی WARP: <b>{proxy_text}</b>\n"
         f"سلامت مسیر WARP: <b>{warp_text}</b>\n"
         f"شکست‌های متوالی مسیر: <b>{_digits(proxy_failure_streak)}</b>\n"
@@ -2597,14 +2791,15 @@ async def _show_diagnostics(
     callback: CallbackQuery,
     checker: InstagramChecker,
 ) -> None:
-    entries = await checker.diagnostics.latest(500)
+    entries = await checker.diagnostics.latest(checker.diagnostics.MAX_ENTRIES)
     error_count = sum(entry.level in {"ERROR", "CRITICAL"} for entry in entries)
     warning_count = sum(entry.level == "WARNING" for entry in entries)
     lines = [
         "لاگ کامل و عیب‌یابی 🧰",
         "",
         f"نسخه ربات: <code>{APP_VERSION}</code>",
-        f"تعداد رکوردهای ذخیره‌شده: {_digits(len(entries))} از ۵۰۰",
+        "تعداد رکوردهای ذخیره‌شده: "
+        f"{_digits(len(entries))} از {_digits(checker.diagnostics.MAX_ENTRIES)}",
         f"خطاها: {_digits(error_count)} | هشدارها: {_digits(warning_count)}",
         "",
         "آخرین رخدادها:",
@@ -2654,7 +2849,7 @@ async def download_diagnostics(
 ) -> None:
     if await _reject_callback(callback, settings):
         return
-    entries = await checker.diagnostics.latest(500)
+    entries = await checker.diagnostics.latest(checker.diagnostics.MAX_ENTRIES)
     if not entries:
         await callback.answer("هنوز لاگی برای دریافت وجود ندارد.", show_alert=True)
         return
@@ -2692,7 +2887,7 @@ async def confirm_clear_diagnostics(
         return
     if callback.message:
         await callback.message.edit_text(
-            "همه ۵۰۰ رکورد اخیر عیب‌یابی پاک شوند؟\n\nاین عملیات قابل بازگشت نیست.",
+            "همه رکوردهای اخیر عیب‌یابی پاک شوند؟\n\nاین عملیات قابل بازگشت نیست.",
             reply_markup=admin_diagnostics_keyboard(confirm_clear=True),
         )
     await callback.answer()

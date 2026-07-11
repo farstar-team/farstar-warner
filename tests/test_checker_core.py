@@ -10,11 +10,19 @@ import pytest
 from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, inspect
 
-from bot.checker import CheckOutcome, CurlResponse, InstagramChecker, ProfileResult
+from bot.checker import (
+    CheckOutcome,
+    CurlResponse,
+    DeliveryResult,
+    InstagramChecker,
+    NotificationPayload,
+    ProfileResult,
+)
 from bot.config import Settings
 from bot.credential_store import CredentialStore
 from bot.models import (
     Base,
+    NotificationOutbox,
     NotificationSettings,
     PageSnapshot,
     PageSnapshotHistory,
@@ -33,6 +41,255 @@ def _settings(key: str) -> Settings:
         redis_password="redis-secret",
         credential_encryption_key=key,
     )
+
+
+@pytest.mark.asyncio
+async def test_deactivated_to_active_without_profile_id_queues_one_alert() -> None:
+    added: list[object] = []
+    target = TargetPage(
+        id=12,
+        instagram_username="reactivated.user",
+        user_id=321,
+        last_known_status=PageStatus.DEACTIVATED,
+        last_known_id=None,
+        status_confirmed=True,
+        consecutive_active_checks=0,
+        consecutive_deactivated_checks=4,
+    )
+    owner = User(telegram_id=321)
+    owner.admin_report_copy = False
+    owner.admin_report_categories = ""
+    notification = NotificationSettings(user_id=321, target_page_id=12)
+    notification.notify_activation = True
+
+    class Session:
+        async def __aenter__(self) -> "Session":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def get(self, model: object, _: object) -> object | None:
+            return {
+                TargetPage: target,
+                User: owner,
+                NotificationSettings: notification,
+            }.get(model)
+
+        async def scalar(self, _: object) -> TargetPage:
+            return target
+
+        def add(self, value: object) -> None:
+            added.append(value)
+
+        async def flush(self) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    class Redis:
+        async def delete(self, *_: object) -> None:
+            return None
+
+    class Diagnostics:
+        async def add(self, **_: object) -> None:
+            return None
+
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.session_factory = Session
+    checker.redis = Redis()
+    checker.diagnostics = Diagnostics()
+    checker.settings = SimpleNamespace(
+        deactivation_confirmations=2,
+        deactivation_confirmation_delay_seconds=0,
+        admin_telegram_id=999,
+    )
+    evidence = ProfileResult(
+        CheckOutcome.ACTIVE,
+        source="http_public_embed",
+        metadata_complete=False,
+        canonical_username="reactivated.user",
+        profile_id=None,
+        is_private=True,
+        http_status=200,
+    )
+    checker.fetch_profile = AsyncMock(return_value=evidence)
+    checker._notify = AsyncMock()
+
+    result = await checker._check_target(target.id, positive_only=True)
+
+    assert result == evidence
+    assert target.last_known_status is PageStatus.ACTIVE
+    assert target.consecutive_active_checks == 1
+    assert target.consecutive_deactivated_checks == 0
+    outbox = [value for value in added if isinstance(value, NotificationOutbox)]
+    assert len(outbox) == 1
+    assert outbox[0].recipient_id == 321
+    assert outbox[0].category == "ACTIVATED"
+    checker._notify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_worker_defers_every_target_with_truthful_counters() -> None:
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker._rate_limited = asyncio.Event()
+    checker._rate_limited.set()
+    checker._lock_lost = asyncio.Event()
+    checker._official_ready = False
+    checker.settings = SimpleNamespace(
+        page_check_delay_min_seconds=0,
+        page_check_delay_max_seconds=0,
+    )
+    checker._check_target = AsyncMock()
+    checker._record_deferred_check = AsyncMock()
+
+    class Diagnostics:
+        async def add(self, **_: object) -> None:
+            return None
+
+    checker.diagnostics = Diagnostics()
+    target_ids = (21, 22, 23, 24, 25)
+    counters = {
+        "planned": len(target_ids),
+        "processed": 0,
+        "active": 0,
+        "deactivated": 0,
+        "unknown": 0,
+        "rate_limited": 0,
+        "deferred": 0,
+        "failed": 0,
+    }
+    queue: asyncio.Queue[int] = asyncio.Queue()
+    for target_id in target_ids:
+        queue.put_nowait(target_id)
+
+    workers = [
+        asyncio.create_task(checker._worker(queue, counters=counters))
+        for _ in range(3)
+    ]
+    await asyncio.wait_for(queue.join(), timeout=1)
+    for worker in workers:
+        worker.cancel()
+    await asyncio.gather(*workers, return_exceptions=True)
+
+    assert checker._record_deferred_check.await_count == len(target_ids)
+    deferred_ids = {
+        call.args[0] for call in checker._record_deferred_check.await_args_list
+    }
+    assert deferred_ids == set(target_ids)
+    assert all(
+        call.args[1] == "CircuitDeferred"
+        for call in checker._record_deferred_check.await_args_list
+    )
+    checker._check_target.assert_not_awaited()
+    assert counters["planned"] == len(target_ids)
+    assert counters["deferred"] == len(target_ids)
+    assert counters["processed"] == 0
+    assert counters["failed"] == 0
+    assert counters["planned"] == counters["processed"] + counters["deferred"]
+
+
+@pytest.mark.asyncio
+async def test_notification_outbox_retries_then_marks_successful_delivery_sent() -> None:
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    payload = NotificationPayload(
+        message="profile activated",
+        username="reactivated.user",
+        title="activation",
+        category="ACTIVATED",
+        primary_label="status",
+        primary_value="active",
+    )
+    row = NotificationOutbox(
+        id=91,
+        event_key="target:12:event:ACTIVATED:owner:0",
+        recipient_id=321,
+        target_page_id=12,
+        category="ACTIVATED",
+        payload_json=InstagramChecker._notification_payload_json(payload),
+        status="Pending",
+        attempt_count=0,
+        next_attempt_at=now,
+    )
+
+    class Session:
+        async def __aenter__(self) -> "Session":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def scalars(self, _: object) -> list[NotificationOutbox]:
+            return [row]
+
+        async def scalar(self, _: object) -> NotificationOutbox:
+            return row
+
+        async def commit(self) -> None:
+            return None
+
+    class Lock:
+        async def acquire(self, *_: object, **__: object) -> bool:
+            return True
+
+        async def release(self) -> None:
+            return None
+
+    class Redis:
+        def lock(self, *_: object, **__: object) -> Lock:
+            return Lock()
+
+    class Diagnostics:
+        async def add(self, **_: object) -> None:
+            return None
+
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.session_factory = Session
+    checker.redis = Redis()
+    checker.diagnostics = Diagnostics()
+    checker.settings = SimpleNamespace(
+        outbox_batch_size=10,
+        outbox_max_attempts=5,
+    )
+    checker._deliver_notification = AsyncMock(
+        side_effect=[
+            DeliveryResult(False, error="temporary Telegram failure", retry_after=1),
+            DeliveryResult(True),
+        ]
+    )
+
+    assert await checker.dispatch_notification_outbox() == 0
+    assert row.status == "Retry"
+    assert row.attempt_count == 1
+    assert row.last_error == "temporary Telegram failure"
+
+    row.next_attempt_at = now
+    assert await checker.dispatch_notification_outbox() == 1
+    assert row.status == "Sent"
+    assert row.attempt_count == 2
+    assert row.sent_at is not None
+    assert row.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_existing_cooldown_ttl_is_not_extended() -> None:
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.settings = SimpleNamespace(rate_limit_cooldown_seconds=900)
+    checker.redis = SimpleNamespace(
+        ttl=AsyncMock(return_value=347),
+        delete=AsyncMock(),
+        set=AsyncMock(),
+    )
+
+    remaining = await checker._activate_cooldown(1800)
+
+    assert remaining == 347
+    checker.redis.ttl.assert_awaited_once_with(checker.STATUS_COOLDOWN_KEY)
+    checker.redis.delete.assert_not_awaited()
+    checker.redis.set.assert_not_awaited()
 
 
 def test_public_parser_reads_only_root_user_node() -> None:
@@ -135,6 +392,19 @@ def test_forensic_history_schema_contains_required_fields() -> None:
         "post_count",
         "external_link",
     } <= columns
+    outbox_columns = {
+        column["name"]
+        for column in inspect(engine).get_columns(NotificationOutbox.__tablename__)
+    }
+    assert {
+        "event_key",
+        "recipient_id",
+        "payload_json",
+        "status",
+        "attempt_count",
+        "next_attempt_at",
+        "sent_at",
+    } <= outbox_columns
 
 
 def test_graphql_search_exact_match_is_active() -> None:
@@ -302,6 +572,7 @@ async def test_official_health_is_disabled_in_osint_only_mode() -> None:
 
 @pytest.mark.asyncio
 async def test_confirmed_active_to_deactivated_transition_notifies_owner() -> None:
+    added: list[object] = []
     target = TargetPage(
         id=7,
         instagram_username="missing_account",
@@ -337,8 +608,8 @@ async def test_confirmed_active_to_deactivated_transition_notifies_owner() -> No
         async def scalar(self, _: object) -> TargetPage:
             return target
 
-        def add(self, _: object) -> None:
-            return None
+        def add(self, value: object) -> None:
+            added.append(value)
 
         async def flush(self) -> None:
             return None
@@ -378,7 +649,10 @@ async def test_confirmed_active_to_deactivated_transition_notifies_owner() -> No
     assert target.consecutive_deactivated_checks == 2
     assert target.last_evidence_source == "graphql_username_search_absence"
     assert target.last_deactivation_evidence_at is not None
-    checker._notify.assert_awaited_once()
+    outbox = [value for value in added if isinstance(value, NotificationOutbox)]
+    assert len(outbox) == 1
+    assert outbox[0].category == "DEACTIVATED"
+    checker._notify.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -438,7 +712,7 @@ async def test_worker_queue_completes_without_sentinel_tokens() -> None:
 
 
 @pytest.mark.asyncio
-async def test_three_profile_baseline_accepts_one_verified_active_result() -> None:
+async def test_preflight_stops_after_first_verified_active_result() -> None:
     checker = InstagramChecker.__new__(InstagramChecker)
     checker._rate_limited = asyncio.Event()
     checker.fetch_profile = AsyncMock(
@@ -455,11 +729,30 @@ async def test_three_profile_baseline_accepts_one_verified_active_result() -> No
     )
 
     class Redis:
+        async def get(self, *_: object) -> None:
+            return None
+
         async def delete(self, *_: object) -> None:
             return None
 
         async def set(self, *_: object, **__: object) -> bool:
             return True
+
+        async def incr(self, *_: object) -> int:
+            return 1
+
+        async def expire(self, *_: object) -> None:
+            return None
+
+        def lock(self, *_: object, **__: object) -> object:
+            class Lock:
+                async def acquire(self, *_: object, **__: object) -> bool:
+                    return True
+
+                async def release(self) -> None:
+                    return None
+
+            return Lock()
 
     class Diagnostics:
         async def add(self, **_: object) -> None:
@@ -471,10 +764,15 @@ async def test_three_profile_baseline_accepts_one_verified_active_result() -> No
     checker.settings = SimpleNamespace(
         admin_telegram_id=999,
         baseline_usernames=("instagram", "cristiano", "nasa"),
+        instagram_request_timeout_seconds=1,
+        preflight_cache_seconds=300,
+        health_failure_alert_threshold=2,
+        health_alert_reminder_seconds=21600,
+        rate_limit_cooldown_seconds=900,
     )
 
     assert await checker.reference_profile_preflight() is True
-    assert checker.fetch_profile.await_count == 3
+    assert checker.fetch_profile.await_count == 1
     checker._notify.assert_not_awaited()
 
 
@@ -506,6 +804,7 @@ def test_embed_html_parser_extracts_private_profile_metrics() -> None:
 
 @pytest.mark.asyncio
 async def test_private_profile_skips_bio_name_picture_and_badge_deltas() -> None:
+    added: list[object] = []
     target = TargetPage(
         id=11,
         instagram_username="private.user",
@@ -555,8 +854,8 @@ async def test_private_profile_skips_bio_name_picture_and_badge_deltas() -> None
         async def scalar(self, _: object) -> TargetPage:
             return target
 
-        def add(self, _: object) -> None:
-            return None
+        def add(self, value: object) -> None:
+            added.append(value)
 
         async def flush(self) -> None:
             return None
@@ -605,7 +904,8 @@ async def test_private_profile_skips_bio_name_picture_and_badge_deltas() -> None
 
     assert snapshot.biography == "Old private biography"
     assert snapshot.full_name == "New Name"
-    checker._notify.assert_awaited_once()
-    notification_payload = checker._notify.await_args.args[1]
-    assert notification_payload.category == "CONTENT"
-    assert "دنبال‌شونده" in notification_payload.message
+    outbox = [value for value in added if isinstance(value, NotificationOutbox)]
+    assert len(outbox) == 1
+    assert outbox[0].category == "CONTENT"
+    assert "دنبال‌شونده" in outbox[0].payload_json
+    checker._notify.assert_not_awaited()

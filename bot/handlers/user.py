@@ -51,6 +51,7 @@ from bot.keyboards.inline import (
 from bot.keyboards.reply import cancel_keyboard, main_menu_keyboard
 from bot.models import (
     DiscountCode,
+    NotificationOutbox,
     NotificationSettings,
     PaymentConfig,
     PaymentInvoice,
@@ -107,6 +108,9 @@ EVIDENCE_SOURCE_NAMES = {
     "meta_business_discovery": "اتصال رسمی متا",
     "playwright_public_embed": "رندر عمومی مرورگر",
     "playwright_explicit_absence": "نبودن قطعی در رندر عمومی",
+    "recovery_probe_absence_untrusted": "شاهد بازیابی بدون تغییر منفی",
+    "recovery_probe_blocked": "مسیر سبک بازیابی با محدودیت روبه‌رو شد",
+    "recovery_probe_unknown": "مسیر سبک بازیابی پاسخ قطعی نداد",
 }
 
 
@@ -922,7 +926,6 @@ async def view_page(
     callback: CallbackQuery,
     db_user: User,
     session_factory: SessionFactory,
-    checker: InstagramChecker,
 ) -> None:
     page_id = int((callback.data or "").rsplit(":", 1)[1])
     async with session_factory() as session:
@@ -935,11 +938,6 @@ async def view_page(
     if owned is None:
         await callback.answer("این پیج پیدا نشد.", show_alert=True)
         return
-    await callback.answer("در حال بررسی وضعیت قطعی پیج…")
-    try:
-        await checker.check_target_now(page_id)
-    except Exception:
-        logger.exception("Could not synchronize target %s before details", page_id)
     async with session_factory() as session:
         page = await session.scalar(
             select(TargetPage).where(
@@ -962,6 +960,11 @@ async def view_page(
         CheckOutcome.RATE_LIMITED.value: "محدودیت موقت؛ وضعیت قطعی تغییر نکرد",
         "UnconfirmedDeactivation": "نشانه غیرفعال‌شدن تأیید دوم را نگرفت",
         "UserSelected": "وضعیت اولیه توسط کاربر انتخاب شده است",
+        "CircuitDeferred": "به‌علت مدار محافظ به چرخه بعد منتقل شد",
+        "LockLost": "به‌علت پایان قفل اجرا به چرخه بعد منتقل شد",
+        "RecoveryProbe:rate_limited": "مسیر بازیابی محدود شد؛ وضعیت تغییر نکرد",
+        "RecoveryProbe:unknown": "مسیر بازیابی پاسخ قطعی نداد",
+        "RecoveryProbe:deactivated": "شاهد مثبت دریافت نشد؛ وضعیت قبلی حفظ شد",
     }
     latest_outcome = outcome_names.get(
         page.last_check_outcome or "",
@@ -989,12 +992,14 @@ async def view_page(
         f"آخرین تغییر وضعیت: {format_datetime(page.last_status_changed_at)}\n"
         f"تأییدهای متوالی فعال: <code>{to_persian_digits(page.consecutive_active_checks)}</code>\n"
         f"تأییدهای متوالی غیرفعال: <code>{to_persian_digits(page.consecutive_deactivated_checks)}</code>\n"
+        f"پاسخ‌های نامشخص متوالی: <code>{to_persian_digits(page.consecutive_inconclusive_checks)}</code>\n"
         f"شناسه اینستاگرام: <code>{html.escape(page.last_known_id or 'ثبت نشده')}</code>"
     )
     if callback.message:
         await callback.message.edit_text(
             text, reply_markup=page_details_keyboard(page.id)
         )
+    await callback.answer()
 
 
 def _profile_details_caption(details: EmbedProfile) -> str:
@@ -1198,11 +1203,16 @@ async def run_security_tool(
     keyboard = security_tools_keyboard(page.id)
 
     if action == "check":
-        result = await checker.fetch_profile(
-            page.instagram_username,
-            allow_stale=False,
-            force_refresh=True,
+        result = await checker.check_target_now(page.id)
+        if result is None:
+            result = ProfileResult(CheckOutcome.UNKNOWN, source="manual_check_busy")
+        synchronized_page = await _owned_page(
+            session_factory,
+            db_user.telegram_id,
+            page.id,
         )
+        if synchronized_page is not None:
+            page = synchronized_page
         current_names = {
             CheckOutcome.ACTIVE: "فعال و قابل مشاهده ✅",
             CheckOutcome.DEACTIVATED: "غیرفعال یا نام کاربری تغییر کرده ⚠️",
@@ -1213,7 +1223,9 @@ async def run_security_tool(
             f"بررسی فوری <b>@{username}</b>\n\n"
             f"نتیجه زنده: <b>{current_names[result.outcome]}</b>\n"
             f"کد HTTP: <code>{to_persian_digits(result.http_status) if result.http_status else 'ثبت نشد'}</code>\n"
-            f"وضعیت ذخیره‌شده: {PAGE_STATUS_NAMES[page.last_known_status]}"
+            f"وضعیت ذخیره‌شده: {PAGE_STATUS_NAMES[page.last_known_status]}\n"
+            "اگر تغییری قطعی شده باشد، هم‌زمان در دیتابیس ثبت و اعلان آن "
+            "وارد صف ارسال پایدار شده است."
         )
         await answer_alert_report(
             callback.message,
@@ -1266,6 +1278,66 @@ async def run_security_tool(
         await callback.message.answer("\n".join(lines), reply_markup=keyboard)
         return
 
+    if action == "timeline":
+        timeline = await checker.get_profile_timeline(
+            page.id,
+            user_id=db_user.telegram_id,
+            limit=30,
+        )
+        lines = [f"خط زمانی و آپ‌تایم <b>@{username}</b> 🕒", ""]
+        if not timeline:
+            lines.append("هنوز شاهد قطعی برای ساخت خط زمانی ثبت نشده است.")
+        else:
+            active_count = sum(
+                item.status == PageStatus.ACTIVE for item in timeline
+            )
+            uptime = round((active_count / len(timeline)) * 100, 1)
+            chronological = list(reversed(timeline))
+            follower_points = [
+                item.follower_count
+                for item in chronological
+                if item.follower_count is not None
+            ]
+            growth = (
+                follower_points[-1] - follower_points[0]
+                if len(follower_points) >= 2
+                else None
+            )
+            lines.extend(
+                (
+                    f"شواهد نگهداری‌شده: <b>{to_persian_digits(len(timeline))}</b> از ۳۰",
+                    f"دسترس‌پذیری در شواهد قطعی: <b>{to_persian_digits(uptime)}٪</b>",
+                    (
+                        "رشد دنبال‌کننده در این بازه: "
+                        f"<b>{'+' if growth is not None and growth > 0 else ''}"
+                        f"{to_persian_digits(growth) if growth is not None else 'داده کافی نیست'}</b>"
+                    ),
+                    "",
+                    "۱۰ شاهد اخیر:",
+                )
+            )
+            for item in timeline[:10]:
+                status_icon = "🟢" if item.status == PageStatus.ACTIVE else "🔴"
+                source_name = EVIDENCE_SOURCE_NAMES.get(
+                    item.evidence_source or "",
+                    "شاهد عمومی",
+                )
+                lines.append(
+                    f"• {status_icon} {format_datetime_dual(item.observed_at)}\n"
+                    f"  فالوور: {format_count(item.follower_count)} | "
+                    f"پست: {format_count(item.post_count)} | "
+                    f"منبع: <b>{html.escape(source_name)}</b>"
+                )
+            lines.extend(
+                (
+                    "",
+                    "این درصد فقط از پاسخ‌های قطعی محاسبه می‌شود؛ پاسخ نامشخص "
+                    "به‌عنوان غیرفعال محاسبه نمی‌شود.",
+                )
+            )
+        await callback.message.answer("\n".join(lines), reply_markup=keyboard)
+        return
+
     if action == "testalert":
         async with session_factory() as session:
             session.add(
@@ -1303,9 +1375,44 @@ async def run_security_tool(
             f"{profile_preview.CACHE_PREFIX}{page.instagram_username.lower()}"
         )
         cooldown_ttl = await redis.ttl(checker.STATUS_COOLDOWN_KEY)
+        async with session_factory() as session:
+            pending_deliveries = await session.scalar(
+                select(func.count())
+                .select_from(NotificationOutbox)
+                .where(
+                    NotificationOutbox.recipient_id == db_user.telegram_id,
+                    NotificationOutbox.target_page_id == page.id,
+                    NotificationOutbox.status.in_(("Pending", "Retry")),
+                )
+            )
+            failed_deliveries = await session.scalar(
+                select(func.count())
+                .select_from(NotificationOutbox)
+                .where(
+                    NotificationOutbox.recipient_id == db_user.telegram_id,
+                    NotificationOutbox.target_page_id == page.id,
+                    NotificationOutbox.status == "Dead",
+                )
+            )
+        last_success = page.last_successful_check_at
+        if last_success is None:
+            sla_text = "هنوز شاهد قطعی ثبت نشده ⚪"
+        else:
+            if last_success.tzinfo is None:
+                last_success = last_success.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - last_success).total_seconds()
+            sla_text = (
+                "سالم و به‌روز ✅"
+                if age_seconds <= max(interval * 3, 900)
+                else "بررسی قطعی عقب افتاده ⚠️"
+            )
         caption = (
             f"سلامت پایش <b>@{username}</b> 💠\n\n"
-            f"آخرین بررسی قطعی: {format_datetime(page.last_checked_at)}\n"
+            f"وضعیت پوشش: <b>{sla_text}</b>\n"
+            f"آخرین تلاش: {format_datetime(page.last_checked_at)}\n"
+            f"آخرین پاسخ قطعی: {format_datetime(page.last_successful_check_at)}\n"
+            "پاسخ‌های نامشخص متوالی: "
+            f"<code>{to_persian_digits(page.consecutive_inconclusive_checks)}</code>\n"
             f"فاصله زمان‌بندی: {to_persian_digits(interval)} ثانیه\n"
             f"کش اطلاعات زنده: {'فعال' if preview_ttl > 0 else 'غیرفعال'}"
             + (f" — {to_persian_digits(preview_ttl)} ثانیه" if preview_ttl > 0 else "")
@@ -1316,7 +1423,10 @@ async def run_security_tool(
                 if cooldown_ttl > 0
                 else ""
             )
-            + "\nحالت دسترسی: نمای عمومی بدون ورود"
+            + "\n"
+            f"اعلان در انتظار ارسال: <b>{to_persian_digits(pending_deliveries or 0)}</b>\n"
+            f"اعلان ناموفق نهایی: <b>{to_persian_digits(failed_deliveries or 0)}</b>\n"
+            "حالت دسترسی: نمای عمومی بدون ورود"
         )
         await answer_alert_report(
             callback.message,
@@ -1326,7 +1436,9 @@ async def run_security_tool(
                 category="HEALTH",
                 primary_label="آخرین بررسی قطعی",
                 primary_value=(
-                    "ثبت شده" if page.last_checked_at is not None else "ثبت نشده"
+                    "ثبت شده"
+                    if page.last_successful_check_at is not None
+                    else "ثبت نشده"
                 ),
                 secondary_label="فاصله بررسی",
                 secondary_value=f"{to_persian_digits(interval)} ثانیه",

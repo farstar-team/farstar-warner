@@ -12,6 +12,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -164,6 +165,9 @@ class TargetPage(Base):
     consecutive_deactivated_checks: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0
     )
+    consecutive_inconclusive_checks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -265,6 +269,54 @@ class PageEvent(Base):
     )
 
     target_page: Mapped[TargetPage] = relationship(back_populates="events")
+
+
+class NotificationOutbox(Base):
+    """Durable, at-least-once delivery queue for Telegram notifications."""
+
+    __tablename__ = "notification_outbox"
+    __table_args__ = (
+        Index(
+            "ix_notification_outbox_status_due",
+            "status",
+            "next_attempt_at",
+        ),
+        Index("ix_notification_outbox_recipient", "recipient_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_key: Mapped[str] = mapped_column(
+        String(180), nullable=False, unique=True, index=True
+    )
+    recipient_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    target_page_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("target_pages.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    category: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="Pending", index=True
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, index=True
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
 
 class PageSnapshot(Base):

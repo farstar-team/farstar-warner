@@ -108,6 +108,12 @@ def security_tools_keyboard(page_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="◈ خط زمانی و آپ‌تایم",
+                    callback_data=f"sec:timeline:{page_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="◈ گزارش حادثه", callback_data=f"sec:report:{page_id}"
                 ),
                 InlineKeyboardButton(
@@ -854,6 +860,12 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="📡 مرکز عملیات پایش",
+                    callback_data="admin:operations",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="🧰 لاگ کامل و عیب‌یابی",
                     callback_data="admin:diagnostics",
                 )
@@ -921,6 +933,45 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="بررسی فوری همه پیج‌ها 🔄", callback_data="admin:check_now"
                 )
+            ],
+        ]
+    )
+
+
+def admin_operations_keyboard(*, muted: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⚡ بازیابی فوری پیج‌های غیرفعال",
+                    callback_data="admin:operations:recovery",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📨 تلاش دوباره اعلان‌های معوق",
+                    callback_data="admin:operations:outbox",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧪 اجرای شاهد مرجع",
+                    callback_data="admin:operations:probe",
+                ),
+                InlineKeyboardButton(
+                    text=("🔔 رفع سکوت" if muted else "🔕 سکوت ۶ ساعته"),
+                    callback_data="admin:operations:mute",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔄 تازه‌سازی",
+                    callback_data="admin:operations",
+                ),
+                InlineKeyboardButton(
+                    text="↩️ پنل مدیریت",
+                    callback_data="admin:home",
+                ),
             ],
         ]
     )

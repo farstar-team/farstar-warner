@@ -185,6 +185,7 @@ class ProfilePreviewService:
             else (("direct", self._embed_direct_http),)
         )
         diagnostics: list[str] = []
+        absence_routes = 0
         url = f"{self.settings.instagram_base_url}/{username}/embed/"
         for route, client in clients:
             try:
@@ -202,11 +203,8 @@ class ProfilePreviewService:
                 continue
             diagnostics.append(f"{route}:http_{response.status_code}")
             if response.status_code == 404:
-                return EmbedProfile(
-                    PreviewOutcome.DEACTIVATED,
-                    username=username,
-                    diagnostic="http_embed_404",
-                )
+                absence_routes += 1
+                continue
             if response.status_code != 200:
                 continue
             if len(response.content) > self.MAX_AVATAR_BYTES:
@@ -214,7 +212,16 @@ class ProfilePreviewService:
                 continue
             profile = self._parse_embed_html(response.text, username)
             if profile is not None:
+                if profile.outcome == PreviewOutcome.DEACTIVATED:
+                    absence_routes += 1
+                    continue
                 return profile
+        if absence_routes == len(clients):
+            return EmbedProfile(
+                PreviewOutcome.DEACTIVATED,
+                username=username,
+                diagnostic="http_embed_404_consensus",
+            )
         return EmbedProfile(
             PreviewOutcome.UNKNOWN,
             username=username,
@@ -528,9 +535,15 @@ class ProfilePreviewService:
                 with suppress(Exception):
                     await self._playwright.stop()
             self._playwright = await async_playwright().start()
+            proxy = (
+                {"server": self.settings.instagram_proxy_url}
+                if self.settings.instagram_proxy_url
+                else None
+            )
             self._browser = await self._playwright.chromium.launch(
                 headless=True,
                 executable_path=self.settings.chromium_executable,
+                proxy=proxy,
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
@@ -583,8 +596,11 @@ class ProfilePreviewService:
                     r"""
                     requested => {
                       const text = (document.body?.innerText || '').toLowerCase();
-                      const exact = text.split(/\n+/)
-                        .some(line => line.trim() === requested.toLowerCase());
+                      const wanted = requested.toLowerCase();
+                      const exact = text.split(/\n+/).some(line => {
+                        const value = line.trim();
+                        return value === wanted || value === `@${wanted}`;
+                      });
                       const metrics = /\bfollowers\b/.test(text) && /\bposts\b/.test(text);
                       const image = Array.from(document.images).some(img =>
                         (img.alt || '').toLowerCase().includes('profile picture'));

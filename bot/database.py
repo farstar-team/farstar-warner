@@ -66,6 +66,8 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 "consecutive_active_checks INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
                 "consecutive_deactivated_checks INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE target_pages ADD COLUMN IF NOT EXISTS "
+                "consecutive_inconclusive_checks INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
                 "notify_follower_change BOOLEAN NOT NULL DEFAULT TRUE",
                 "ALTER TABLE notification_settings ADD COLUMN IF NOT EXISTS "
@@ -189,6 +191,10 @@ async def initialize_database(engine: AsyncEngine) -> None:
                 "consecutive_deactivated_checks": (
                     "ALTER TABLE target_pages ADD COLUMN "
                     "consecutive_deactivated_checks INTEGER NOT NULL DEFAULT 0"
+                ),
+                "consecutive_inconclusive_checks": (
+                    "ALTER TABLE target_pages ADD COLUMN "
+                    "consecutive_inconclusive_checks INTEGER NOT NULL DEFAULT 0"
                 ),
             }
             for column, statement in target_migrations.items():

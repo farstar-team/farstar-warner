@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import traceback
 from asyncio import AbstractEventLoop, CancelledError, Task
 from contextlib import suppress
@@ -30,7 +31,21 @@ class DiagnosticEntry:
 
 class DiagnosticStore:
     KEY = "farstar:diagnostics:entries:v1"
-    MAX_ENTRIES = 500
+    MAX_ENTRIES = 2000
+    DEDUP_PREFIX = "farstar:diagnostics:dedup:"
+    DEDUP_SECONDS = 60
+    NOISY_EVENTS = {
+        "browser_fallback_result",
+        "graphql_discovery_attempt",
+        "instagram_access_denied",
+        "profile_request_started",
+        "profile_request_succeeded",
+        "python_log",
+        "target_result",
+        "target_state_synchronized",
+        "transport_attempt",
+        "web_profile_routes_blocked",
+    }
 
     def __init__(self, redis: Redis, redactions: tuple[str, ...] = ()) -> None:
         self.redis = redis
@@ -65,6 +80,33 @@ class DiagnosticStore:
             response_bytes=response_bytes,
             detail=self._clean(detail, 700),
         )
+        if entry.event in self.NOISY_EVENTS:
+            routine_info = entry.level == "INFO" and entry.event in {
+                "profile_request_started",
+                "profile_request_succeeded",
+                "target_result",
+                "target_state_synchronized",
+                "transport_attempt",
+            }
+            fingerprint = "|".join(
+                (
+                    entry.event,
+                    "routine-sample" if routine_info else entry.username or "",
+                    entry.transport or "",
+                    str(entry.http_status or 0),
+                    entry.message,
+                    entry.detail or "",
+                )
+            )
+            digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:24]
+            first = await self.redis.set(
+                f"{self.DEDUP_PREFIX}{digest}",
+                "1",
+                ex=(self.DEDUP_SECONDS if routine_info else 900),
+                nx=True,
+            )
+            if not first:
+                return
         encoded = json.dumps(asdict(entry), ensure_ascii=False, separators=(",", ":"))
         pipeline = self.redis.pipeline(transaction=True)
         pipeline.lpush(self.KEY, encoded)

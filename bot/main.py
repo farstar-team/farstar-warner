@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -146,6 +148,9 @@ async def ensure_payment_config(
 
 async def run() -> None:
     settings = get_settings()
+    readiness_file = Path("/tmp/farstar-ready")
+    with suppress(OSError):
+        readiness_file.unlink(missing_ok=True)
     logging.basicConfig(
         level=getattr(logging, settings.log_level),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -249,12 +254,27 @@ async def run() -> None:
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
         )
         scheduler.add_job(
+            checker.dispatch_notification_outbox,
+            trigger=IntervalTrigger(seconds=5, timezone=timezone.utc),
+            id="telegram-notification-outbox",
+            name="Durable Telegram notification delivery",
+            replace_existing=True,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=3),
+        )
+        scheduler.add_job(
             send_expiry_reminders,
             trigger=CronTrigger(hour=6, minute=0, timezone=timezone.utc),
             id="subscription-expiry-reminders",
             name="Daily subscription expiry reminders",
             replace_existing=True,
             kwargs={"bot": bot, "session_factory": session_factory},
+        )
+        scheduler.add_job(
+            checker.cleanup_notification_outbox,
+            trigger=CronTrigger(hour=3, minute=15, timezone=timezone.utc),
+            id="notification-outbox-cleanup",
+            name="Notification outbox retention cleanup",
+            replace_existing=True,
         )
         scheduler.start()
 
@@ -267,6 +287,7 @@ async def run() -> None:
             APP_VERSION,
             check_interval,
         )
+        readiness_file.write_text(APP_VERSION, encoding="utf-8")
         await dispatcher.start_polling(
             bot,
             allowed_updates=dispatcher.resolve_used_update_types(),
@@ -279,6 +300,8 @@ async def run() -> None:
             zarinpal_provider=zarinpal_provider,
         )
     finally:
+        with suppress(OSError):
+            readiness_file.unlink(missing_ok=True)
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await profile_preview.close()
