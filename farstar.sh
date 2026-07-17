@@ -84,6 +84,39 @@ compose() {
     "$@"
 }
 
+compose_up_healthy() {
+  local instance="$1"
+  shift
+  if compose "${instance}" up -d --wait --wait-timeout 300 "$@"; then
+    return 0
+  fi
+  warn "Instance '${instance}' did not become healthy within 300 seconds."
+  compose "${instance}" ps >&2 || true
+  compose "${instance}" logs --tail=100 bot-app warp_proxy >&2 || true
+  return 1
+}
+
+instance_should_resume_after_update() {
+  local instance="$1"
+  local container_id state exit_code
+  container_id="$(compose "${instance}" ps -a -q bot-app 2>/dev/null || true)"
+  [[ -n "${container_id}" ]] || return 1
+  state="$("${DOCKER[@]}" inspect --format '{{.State.Status}}' "${container_id}" 2>/dev/null || true)"
+  exit_code="$("${DOCKER[@]}" inspect --format '{{.State.ExitCode}}' "${container_id}" 2>/dev/null || true)"
+  case "${state}" in
+    running|restarting)
+      return 0
+      ;;
+    exited)
+      [[ "${exit_code}" =~ ^[0-9]+$ && "${exit_code}" -ne 0 ]]
+      return
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 list_instances() {
   log "Configured bot instances"
   local found=false
@@ -331,7 +364,7 @@ EOF
   if ! "${DOCKER[@]}" image inspect farstar-warner:latest >/dev/null 2>&1; then
     build_image
   fi
-  compose "${instance}" up -d --no-build
+  compose_up_healthy "${instance}" --no-build
   compose "${instance}" ps
   log "Instance '${instance}' was installed successfully."
 }
@@ -343,7 +376,7 @@ start_instance() {
   if ! "${DOCKER[@]}" image inspect farstar-warner:latest >/dev/null 2>&1; then
     build_image
   fi
-  compose "${instance}" up -d --no-build
+  compose_up_healthy "${instance}" --no-build
 }
 
 stop_instance() {
@@ -359,7 +392,7 @@ restart_instance() {
   if ! "${DOCKER[@]}" image inspect farstar-warner:latest >/dev/null 2>&1; then
     build_image
   fi
-  compose "${instance}" up -d --no-build --force-recreate
+  compose_up_healthy "${instance}" --no-build --force-recreate
 }
 
 apply_instance() {
@@ -369,7 +402,7 @@ apply_instance() {
   if ! "${DOCKER[@]}" image inspect farstar-warner:latest >/dev/null 2>&1; then
     build_image
   fi
-  compose "${instance}" up -d --no-build --force-recreate
+  compose_up_healthy "${instance}" --no-build --force-recreate
 }
 
 show_status() {
@@ -393,7 +426,9 @@ update_application() {
   while IFS= read -r env_file; do
     local instance
     instance="$(basename -- "${env_file}" .env)"
-    if [[ -n "$(compose "${instance}" ps --status running -q bot-app 2>/dev/null || true)" ]]; then
+    # Recreate both live instances and crash-looped/failed instances. An instance
+    # stopped cleanly by its operator remains stopped after the source update.
+    if instance_should_resume_after_update "${instance}"; then
       running_instances+=("${instance}")
     fi
   done < <("${SUDO[@]}" find "${INSTANCE_DIR}" -maxdepth 1 -type f -name '*.env' -print 2>/dev/null | sort)
@@ -431,9 +466,9 @@ update_application() {
   build_image
   for instance in "${running_instances[@]}"; do
     ensure_instance_defaults "${instance}"
-    compose "${instance}" up -d --no-build --force-recreate
+    compose_up_healthy "${instance}" --no-build --force-recreate
   done
-  log "Update completed. Version $(source_version) is active; running bot instances were recreated."
+  log "Update completed. Version $(source_version) is active; running or failed bot instances were recreated and passed health checks."
   log "Pre-update source backup: ${source_backup_dir} (branch ${backup_branch}${stash_ref:+, stash ${stash_ref}})"
 }
 
@@ -501,7 +536,7 @@ edit_instance() {
   "${SUDO[@]}" "${editor}" "$(instance_env "${instance}")"
   read -r -p "Recreate this instance now? [Y/n]: " recreate
   if [[ "${recreate,,}" != "n" && "${recreate,,}" != "no" ]]; then
-    compose "${instance}" up -d --no-build --force-recreate
+    compose_up_healthy "${instance}" --no-build --force-recreate
   fi
 }
 

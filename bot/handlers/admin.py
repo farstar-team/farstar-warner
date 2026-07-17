@@ -6,13 +6,20 @@ import json
 import logging
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from redis.asyncio import Redis
@@ -20,6 +27,19 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from bot.checker import CheckOutcome, InstagramChecker
+from bot.broadcast import (
+    broadcast_confirmation_keyboard,
+    broadcast_progress_text,
+    broadcast_status_keyboard,
+    cancel_broadcast_campaign,
+    create_broadcast_campaign,
+    enqueue_broadcast_recipients,
+    find_active_campaign,
+    reconcile_broadcast_campaigns,
+    refresh_broadcast_view,
+    retry_failed_broadcast_deliveries,
+    validate_broadcast_content,
+)
 from bot.config import Settings
 from bot.credential_store import CredentialStoreError
 from bot.database import SessionFactory
@@ -203,6 +223,11 @@ class AdminMonitoringAccountState(StatesGroup):
     waiting_for_access_token = State()
 
 
+class AdminBroadcastState(StatesGroup):
+    waiting_for_message = State()
+    waiting_for_confirmation = State()
+
+
 def _digits(value: object) -> str:
     return str(value).translate(PERSIAN_DIGITS)
 
@@ -260,6 +285,8 @@ async def _reject_callback(callback: CallbackQuery, settings: Settings) -> bool:
         AdminMonitoringAccountState.waiting_for_label,
         AdminMonitoringAccountState.waiting_for_instagram_user_id,
         AdminMonitoringAccountState.waiting_for_access_token,
+        AdminBroadcastState.waiting_for_message,
+        AdminBroadcastState.waiting_for_confirmation,
     ),
     F.text == "لغو عملیات ↩️",
 )
@@ -3186,6 +3213,269 @@ async def finish_schedule_change(
     await message.answer(
         f"فاصله بررسی‌ها روی {_digits(interval)} ثانیه تنظیم شد. ✅",
         reply_markup=main_menu_keyboard(is_admin=True),
+    )
+
+
+async def _prepare_broadcast_in_background(
+    bot: Bot,
+    session_factory: SessionFactory,
+    redis: Redis,
+    campaign_id: int,
+) -> None:
+    await enqueue_broadcast_recipients(session_factory, redis, campaign_id)
+    await reconcile_broadcast_campaigns(bot, session_factory, redis)
+
+
+@router.callback_query(F.data == "admin:broadcast")
+async def begin_admin_broadcast(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    active_campaign_id = await find_active_campaign(session_factory)
+    if active_campaign_id is not None:
+        view = await refresh_broadcast_view(session_factory, active_campaign_id)
+        if view is not None and callback.message:
+            await callback.message.edit_text(
+                broadcast_progress_text(view),
+                reply_markup=broadcast_status_keyboard(view),
+            )
+        await callback.answer("یک پیام همگانی در حال اجراست.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminBroadcastState.waiting_for_message)
+    if callback.message:
+        await callback.message.answer(
+            "متن پیام همگانی را ارسال کنید. قالب‌بندی تلگرام حفظ می‌شود.\n\n"
+            "پس از ارسال متن، ابتدا پیش‌نمایش و دکمه تأیید نمایش داده می‌شود. "
+            "کاربران مسدودشده و حساب مدیر در فهرست گیرندگان قرار نمی‌گیرند.",
+            reply_markup=cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+@router.message(AdminBroadcastState.waiting_for_message)
+async def receive_admin_broadcast_message(
+    message: Message,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_message(message, settings):
+        await state.clear()
+        return
+    plain_text = (message.text or "").strip()
+    message_html = message.html_text.strip() if message.text else ""
+    validation_error = validate_broadcast_content(plain_text, message_html)
+    if validation_error:
+        await message.answer(validation_error)
+        return
+    await state.update_data(
+        broadcast_message_html=message_html,
+        broadcast_campaign_key=uuid4().hex,
+    )
+    await state.set_state(AdminBroadcastState.waiting_for_confirmation)
+    await message.answer("پیش‌نمایش پیام همگانی در پیام بعدی نمایش داده می‌شود:")
+    await message.answer(
+        message_html,
+        reply_markup=broadcast_confirmation_keyboard(),
+    )
+
+
+@router.callback_query(
+    AdminBroadcastState.waiting_for_confirmation,
+    F.data == "admin:broadcast:confirm",
+)
+async def confirm_admin_broadcast(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+    session_factory: SessionFactory,
+    redis: Redis,
+    bot: Bot,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    data = await state.get_data()
+    message_html = str(data.get("broadcast_message_html") or "").strip()
+    campaign_key = str(data.get("broadcast_campaign_key") or "").strip()
+    if not message_html or not campaign_key or callback.message is None:
+        await state.clear()
+        await callback.answer(
+            "پیش‌نویس منقضی شده است؛ پیام را دوباره بسازید.", show_alert=True
+        )
+        return
+    try:
+        campaign_id, created = await create_broadcast_campaign(
+            session_factory,
+            redis,
+            admin_id=settings.admin_telegram_id,
+            campaign_key=campaign_key,
+            message_html=message_html,
+            progress_chat_id=callback.message.chat.id,
+            progress_message_id=callback.message.message_id,
+        )
+    except RuntimeError:
+        await callback.answer(
+            "سامانه ارسال مشغول است؛ چند ثانیه دیگر دوباره تلاش کنید.",
+            show_alert=True,
+        )
+        return
+    await state.clear()
+    view = await refresh_broadcast_view(session_factory, campaign_id)
+    if view is not None:
+        await callback.message.edit_text(
+            broadcast_progress_text(view),
+            reply_markup=broadcast_status_keyboard(view),
+        )
+    if created:
+        task = asyncio.create_task(
+            _prepare_broadcast_in_background(
+                bot, session_factory, redis, campaign_id
+            ),
+            name=f"prepare-broadcast-{campaign_id}",
+        )
+        task.add_done_callback(_background_task_done)
+        await callback.answer("پیام همگانی در صف پایدار ارسال قرار گرفت. ✅")
+    else:
+        await callback.answer(
+            "این درخواست قبلاً ثبت شده یا ارسال دیگری در حال اجراست.",
+            show_alert=True,
+        )
+
+
+@router.callback_query(
+    AdminBroadcastState.waiting_for_confirmation,
+    F.data == "admin:broadcast:draft_cancel",
+)
+async def cancel_admin_broadcast_draft(
+    callback: CallbackQuery,
+    state: FSMContext,
+    settings: Settings,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            "پیش‌نویس پیام همگانی لغو شد.", reply_markup=admin_panel_keyboard()
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:broadcast:view:"))
+async def view_admin_broadcast(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        campaign_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("شناسه ارسال معتبر نیست.", show_alert=True)
+        return
+    view = await refresh_broadcast_view(session_factory, campaign_id)
+    if view is None:
+        await callback.answer("این ارسال پیدا نشد.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            broadcast_progress_text(view),
+            reply_markup=broadcast_status_keyboard(view),
+        )
+    await callback.answer("وضعیت به‌روز شد. ✅")
+
+
+@router.callback_query(F.data.startswith("admin:broadcast:cancel:"))
+async def cancel_admin_broadcast(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        campaign_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("شناسه ارسال معتبر نیست.", show_alert=True)
+        return
+    view = await cancel_broadcast_campaign(session_factory, campaign_id)
+    if view is None:
+        await callback.answer("این ارسال پیدا نشد.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            broadcast_progress_text(view),
+            reply_markup=broadcast_status_keyboard(view),
+        )
+    await callback.answer("ارسال متوقف شد.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin:broadcast:cancel_prompt:"))
+async def prompt_cancel_admin_broadcast(
+    callback: CallbackQuery,
+    settings: Settings,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        campaign_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("شناسه ارسال معتبر نیست.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.answer(
+            "آیا مطمئن هستید که ارسال پیام همگانی متوقف شود؟ "
+            "پیام‌های ارسال‌شده قابل بازگردانی نیستند.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="بله، متوقف شود ⏹",
+                            callback_data=f"admin:broadcast:cancel:{campaign_id}",
+                        ),
+                        InlineKeyboardButton(
+                            text="خیر ↩️",
+                            callback_data=f"admin:broadcast:view:{campaign_id}",
+                        ),
+                    ]
+                ]
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin:broadcast:retry:"))
+async def retry_admin_broadcast_failures(
+    callback: CallbackQuery,
+    settings: Settings,
+    session_factory: SessionFactory,
+) -> None:
+    if await _reject_callback(callback, settings):
+        return
+    try:
+        campaign_id = int((callback.data or "").rsplit(":", 1)[1])
+    except ValueError:
+        await callback.answer("شناسه ارسال معتبر نیست.", show_alert=True)
+        return
+    view, retried = await retry_failed_broadcast_deliveries(
+        session_factory, campaign_id
+    )
+    if view is None:
+        await callback.answer("این ارسال پیدا نشد.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.edit_text(
+            broadcast_progress_text(view),
+            reply_markup=broadcast_status_keyboard(view),
+        )
+    await callback.answer(
+        f"{_digits(retried)} ارسال ناموفق دوباره در صف قرار گرفت.",
+        show_alert=True,
     )
 
 

@@ -679,13 +679,30 @@ async def add_page(
         return
 
     await message.answer("در حال بررسی پیج و ساخت تصویر تأیید… لطفاً کمی صبر کنید.")
-    status = await checker.fetch_profile(
+    status = await checker.fetch_registration_profile(
         username,
-        allow_stale=False,
-        force_refresh=True,
+        requester_id=db_user.telegram_id,
     )
+    await _present_registration_result(
+        message,
+        state,
+        username,
+        status,
+        profile_preview,
+    )
+
+
+async def _present_registration_result(
+    message: Message,
+    state: FSMContext,
+    username: str,
+    status: ProfileResult,
+    profile_preview: ProfilePreviewService,
+) -> None:
     if status.outcome == CheckOutcome.ACTIVE:
-        confirmed_username = status.canonical_username or username
+        confirmed_username = (
+            normalize_instagram_username(status.canonical_username or "") or username
+        )
         preview = profile_result_to_embed(status, confirmed_username)
         await state.update_data(
             pending_username=confirmed_username,
@@ -748,18 +765,88 @@ async def add_page(
     )
     await state.set_state(AddPageState.waiting_for_confirmation)
     reason = (
-        "اینستاگرام موقتاً تعداد درخواست‌ها را محدود کرده است."
+        "مسیر عمومی اینستاگرام موقتاً محدود است و نتیجه قطعی دریافت نشد."
         if status.outcome == CheckOutcome.RATE_LIMITED
         else "اینستاگرام در این لحظه پاسخ قطعی نداد."
     )
+    retry_hint = (
+        f"\nتلاش بعدی: حدود <b>{to_persian_digits(status.retry_after)}</b> ثانیه دیگر."
+        if status.retry_after and status.retry_after > 0
+        else "\nمی‌توانید با دکمه زیر یک بررسی کنترل‌شده دیگر انجام دهید."
+    )
     await message.answer(
-        f"{reason}\n\n"
+        f"{reason}{retry_hint}\n\n"
         f"نام کاربری: <b>@{html.escape(username)}</b>\n"
         "اگر پیج را می‌شناسید، وضعیت درست را انتخاب کنید. برای پیج دی‌اکتیو می‌توانید گزینه انتظار فعال‌شدن را بزنید.",
         reply_markup=registration_confirmation_keyboard(
             profile_url=f"https://www.instagram.com/{username}/",
             allow_status_choice=True,
+            allow_retry=True,
         ),
+    )
+
+
+def _registration_retry_is_locally_deferred(status: ProfileResult) -> bool:
+    """Keep the current confirmed/pending FSM data on duplicate retry clicks."""
+    return status.outcome == CheckOutcome.RATE_LIMITED and status.source in {
+        "registration_retry_cooldown",
+        "registration_singleflight_busy",
+        "registration_recovery_gate_busy",
+    }
+
+
+@router.callback_query(
+    AddPageState.waiting_for_confirmation,
+    F.data == "register:retry",
+)
+async def retry_page_registration(
+    callback: CallbackQuery,
+    state: FSMContext,
+    checker: InstagramChecker,
+    profile_preview: ProfilePreviewService,
+) -> None:
+    data = await state.get_data()
+    pending_username = data.get("pending_username")
+    username = (
+        normalize_instagram_username(pending_username)
+        if isinstance(pending_username, str)
+        else None
+    )
+    if username is None or not isinstance(callback.message, Message):
+        await state.clear()
+        await callback.answer(
+            "درخواست منقضی شده است؛ افزودن پیج را دوباره آغاز کنید.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer("در حال تلاش مجدد برای بررسی پیج…")
+    status = await checker.fetch_registration_profile(
+        username,
+        requester_id=callback.from_user.id,
+        retry=True,
+    )
+    if _registration_retry_is_locally_deferred(status):
+        # A double click can arrive after the first retry has already resolved
+        # ACTIVE and updated the FSM.  Re-presenting this local throttle as an
+        # Instagram UNKNOWN result would overwrite that authoritative state.
+        # Preserve both state and the existing confirmation keyboard instead.
+        wait_seconds = max(1, int(status.retry_after or 5))
+        await callback.message.answer(
+            "یک بررسی دیگر همین حالا در حال اجراست یا به‌تازگی انجام شده است. "
+            f"حدود <b>{to_persian_digits(wait_seconds)}</b> ثانیه دیگر دوباره تلاش کنید."
+        )
+        return
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramAPIError:
+        pass
+    await _present_registration_result(
+        callback.message,
+        state,
+        username,
+        status,
+        profile_preview,
     )
 
 

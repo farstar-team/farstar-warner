@@ -158,8 +158,18 @@ def registration_confirmation_keyboard(
     inactive: bool = False,
     profile_url: str | None = None,
     allow_status_choice: bool = False,
+    allow_retry: bool = False,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    if allow_retry:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔄 تلاش مجدد برای بررسی پیج",
+                    callback_data="register:retry",
+                )
+            ]
+        )
     if profile_url:
         rows.append(
             [
@@ -910,6 +920,12 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="📨 رونوشت گزارش کاربران",
                     callback_data="admin:report_copy",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📣 پیام همگانی به کاربران",
+                    callback_data="admin:broadcast",
                 )
             ],
             [

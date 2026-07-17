@@ -282,11 +282,24 @@ fi
 
 log "Building and starting Farstar Warner..."
 cd "${PROJECT_DIR}"
-"${DOCKER[@]}" compose \
+if ! "${DOCKER[@]}" compose \
   --project-name "farstar-${MAIN_INSTANCE}" \
   --env-file "${MAIN_INSTANCE_ENV}" \
   --file "${PROJECT_DIR}/docker-compose.yml" \
-  up --build -d
+  up --build -d --wait --wait-timeout 300; then
+  printf '\nThe application did not become healthy within 300 seconds.\n' >&2
+  "${DOCKER[@]}" compose \
+    --project-name "farstar-${MAIN_INSTANCE}" \
+    --env-file "${MAIN_INSTANCE_ENV}" \
+    --file "${PROJECT_DIR}/docker-compose.yml" \
+    ps >&2 || true
+  "${DOCKER[@]}" compose \
+    --project-name "farstar-${MAIN_INSTANCE}" \
+    --env-file "${MAIN_INSTANCE_ENV}" \
+    --file "${PROJECT_DIR}/docker-compose.yml" \
+    logs --tail=100 bot-app warp_proxy >&2 || true
+  fail "Installation stopped because the bot or one of its dependencies is unhealthy."
+fi
 "${DOCKER[@]}" compose \
   --project-name "farstar-${MAIN_INSTANCE}" \
   --env-file "${MAIN_INSTANCE_ENV}" \

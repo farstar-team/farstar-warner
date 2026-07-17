@@ -166,6 +166,9 @@ class InstagramChecker:
     RECOVERY_DUE_KEY = "farstar:checker:activation-recovery-due"
     OUTBOX_LOCK_KEY = "farstar:notification-outbox:lock"
     MANUAL_CHECK_LOCK_PREFIX = "farstar:checker:manual-lock:"
+    REGISTRATION_LOCK_PREFIX = "farstar:checker:registration-lock:"
+    REGISTRATION_RETRY_PREFIX = "farstar:checker:registration-retry:"
+    REGISTRATION_RECOVERY_GATE_KEY = "farstar:checker:registration-recovery-gate"
     GUEST_AUDIT_PREFIX = "farstar:checker:guest-audit:"
     GRAPHQL_CIRCUIT_KEY = "farstar:checker:graphql-circuit"
     CYCLE_METRICS_KEY = "farstar:checker:last-cycle"
@@ -179,6 +182,8 @@ class InstagramChecker:
     STALE_CACHE_SECONDS = 86400
     GRAPH_HEALTH_PREFIX = "farstar:graph-account-health:"
     GRAPH_HEALTH_SECONDS = 300
+    REGISTRATION_RETRY_SECONDS = 30
+    REGISTRATION_RECOVERY_GATE_SECONDS = 10
 
     def __init__(
         self,
@@ -308,6 +313,107 @@ class InstagramChecker:
         finally:
             with suppress(LockError):
                 await profile_lock.release()
+
+    async def fetch_registration_profile(
+        self,
+        username: str,
+        *,
+        requester_id: int,
+        retry: bool = False,
+    ) -> ProfileResult:
+        """Resolve a page for registration without trusting negative recovery probes.
+
+        Registration retries are intentionally rate controlled.  During a global
+        Instagram cooldown we perform a small positive-only recovery probe: an
+        ACTIVE result may be used, while 404/unknown evidence remains
+        inconclusive.  This prevents a blocked route from registering a live page
+        as deactivated.
+        """
+        normalized_username = username.strip().lower()
+        retry_key = (
+            f"{self.REGISTRATION_RETRY_PREFIX}{requester_id}:"
+            f"{normalized_username}"
+        )
+        if retry:
+            accepted = await self.redis.set(
+                retry_key,
+                "1",
+                ex=self.REGISTRATION_RETRY_SECONDS,
+                nx=True,
+            )
+            if not accepted:
+                retry_ttl = await self.redis.ttl(retry_key)
+                return ProfileResult(
+                    CheckOutcome.RATE_LIMITED,
+                    source="registration_retry_cooldown",
+                    retry_after=max(1, retry_ttl),
+                )
+
+        registration_lock = self.redis.lock(
+            f"{self.REGISTRATION_LOCK_PREFIX}{normalized_username}",
+            timeout=120,
+            blocking_timeout=1,
+        )
+        acquired = await registration_lock.acquire()
+        if not acquired:
+            return ProfileResult(
+                CheckOutcome.RATE_LIMITED,
+                source="registration_singleflight_busy",
+                retry_after=5,
+            )
+
+        try:
+            cooldown_ttl = await self.redis.ttl(self.STATUS_COOLDOWN_KEY)
+            if cooldown_ttl > 0:
+                recovery_slot = await self.redis.set(
+                    self.REGISTRATION_RECOVERY_GATE_KEY,
+                    normalized_username,
+                    ex=self.REGISTRATION_RECOVERY_GATE_SECONDS,
+                    nx=True,
+                )
+                if not recovery_slot:
+                    gate_ttl = await self.redis.ttl(
+                        self.REGISTRATION_RECOVERY_GATE_KEY
+                    )
+                    return ProfileResult(
+                        CheckOutcome.RATE_LIMITED,
+                        source="registration_recovery_gate_busy",
+                        retry_after=max(1, gate_ttl),
+                    )
+
+                recovery = await self._fetch_positive_recovery_profile(
+                    normalized_username
+                )
+                if recovery.outcome == CheckOutcome.ACTIVE:
+                    return recovery
+
+                # Absence through a route already known to be unhealthy is not
+                # authoritative.  Keep the pending registration undecided and
+                # expose a bounded retry delay to the UI.
+                return ProfileResult(
+                    CheckOutcome.RATE_LIMITED,
+                    source="registration_positive_only_inconclusive",
+                    retry_after=min(
+                        max(1, cooldown_ttl),
+                        self.REGISTRATION_RETRY_SECONDS,
+                    ),
+                    http_status=recovery.http_status,
+                )
+
+            return await self.fetch_profile(
+                normalized_username,
+                allow_stale=False,
+                force_refresh=True,
+                # Repeated blocked registration requests must participate in
+                # the same global circuit breaker as background checks.  This
+                # prevents a burst of add-page attempts from amplifying an
+                # Instagram throttle while controlled positive retries remain
+                # available during the cooldown.
+                activate_circuit=True,
+            )
+        finally:
+            with suppress(LockError):
+                await registration_lock.release()
 
     async def monitoring_accounts(self) -> list[InstagramMonitoringAccount]:
         async with self.session_factory() as session:
@@ -644,7 +750,13 @@ class InstagramChecker:
             return result
 
         status_code = response.status_code
-        if status_code == 404 or self._body_indicates_deactivated(response.body):
+        # A blocked response can still contain a JSON-shaped ``data.user=null``
+        # body.  HTTP 401/403/429 is access-control evidence, never proof that a
+        # target disappeared.  Only an explicit 404 or a successful (HTTP 200)
+        # profile response with an explicit-null user is negative evidence.
+        if status_code == 404 or (
+            status_code == 200 and self._body_indicates_deactivated(response.body)
+        ):
             return ProfileResult(
                 CheckOutcome.DEACTIVATED,
                 source="web_profile_explicit_absence",
@@ -652,7 +764,13 @@ class InstagramChecker:
             )
 
         discovery_result = await self._search_profile_via_graphql(username)
-        if discovery_result is not None:
+        # Guest search is a useful *positive* discovery source, but its result
+        # list is not exhaustive.  Absence there may mean search throttling or a
+        # private/low-ranked account, so it must never drive deactivation.
+        if (
+            discovery_result is not None
+            and discovery_result.outcome == CheckOutcome.ACTIVE
+        ):
             return discovery_result
 
         if self._browser_probe is not None:
@@ -735,6 +853,8 @@ class InstagramChecker:
             if getattr(self.settings, "instagram_proxy_url", None)
             else [False]
         )
+        absence_result: ProfileResult | None = None
+        absence_count = 0
         for use_proxy in routes:
             response = await self._execute_graphql_search_once(
                 username,
@@ -745,13 +865,16 @@ class InstagramChecker:
                 username,
                 response.status_code,
             )
+            positive = bool(
+                result is not None and result.outcome == CheckOutcome.ACTIVE
+            )
             await self.diagnostics.add(
-                level=("INFO" if result is not None else "WARNING"),
+                level=("INFO" if positive else "WARNING"),
                 event="graphql_discovery_attempt",
                 message=(
-                    "جست‌وجوی مستقل نام کاربری نتیجه قطعی داد."
-                    if result is not None
-                    else "جست‌وجوی مستقل نام کاربری پاسخ قطعی نداد."
+                    "جست‌وجوی مستقل نام کاربری شاهد مثبت داد."
+                    if positive
+                    else "جست‌وجوی مستقل نام کاربری شاهد مثبت قطعی نداد."
                 ),
                 username=username,
                 transport=response.transport,
@@ -765,8 +888,16 @@ class InstagramChecker:
                     else self._response_diagnostic(response)
                 ),
             )
-            if result is not None:
+            if positive:
                 return result
+            if (
+                result is not None
+                and result.source == "graphql_username_search_absence"
+                and result.guest_searchable is False
+            ):
+                absence_result = result
+                absence_count += 1
+                continue
             if response.status_code in {401, 403, 429}:
                 await self.redis.set(
                     self.GRAPHQL_CIRCUIT_KEY,
@@ -774,6 +905,11 @@ class InstagramChecker:
                     ex=self.settings.guest_search_audit_seconds,
                 )
                 break
+        # Mark guest-search visibility false only if every configured route
+        # independently returned a valid search payload without the target.
+        # This result remains UNKNOWN for profile status evaluation.
+        if absence_result is not None and absence_count == len(routes):
+            return absence_result
         return None
 
     async def _audit_guest_searchability(self, username: str) -> bool | None:
@@ -800,8 +936,8 @@ class InstagramChecker:
             )
             return True
         if (
-            discovery.outcome == CheckOutcome.DEACTIVATED
-            and discovery.source == "graphql_username_search_absence"
+            discovery.source == "graphql_username_search_absence"
+            and discovery.guest_searchable is False
         ):
             await self.redis.set(
                 cache_key,
@@ -952,12 +1088,15 @@ class InstagramChecker:
                 http_status=200,
             )
 
+        # Search results are ranked and non-exhaustive.  Missing from this list
+        # is useful for the searchability audit, but is not deactivation proof.
         return ProfileResult(
-            outcome=CheckOutcome.DEACTIVATED,
+            outcome=CheckOutcome.UNKNOWN,
             source="graphql_username_search_absence",
             metadata_complete=False,
             canonical_username=normalized,
-            http_status=404,
+            guest_searchable=False,
+            http_status=200,
         )
 
     async def _cache_profile(
@@ -1035,6 +1174,7 @@ class InstagramChecker:
         )
         last_response: CurlResponse | None = None
         blocked_responses: list[CurlResponse] = []
+        absence_responses: dict[str, CurlResponse] = {}
         attempt = 0
 
         # Curl is deliberately attempted first. The production diagnostics showed
@@ -1076,10 +1216,60 @@ class InstagramChecker:
             if self._response_is_authoritative(response, username):
                 await self._record_authoritative(trace_id, username, response)
                 return response
+            if self._response_indicates_absence(response):
+                absence_responses[response.transport.lower()] = response
+                continue
             if self._response_is_access_blocked(response):
                 blocked_responses.append(response)
             else:
                 last_response = response
+
+        # A 404 or explicit "user is null" from one outbound route can be a
+        # route-specific Instagram edge failure.  Proxy/direct agreement is
+        # preferred; when only the direct route works, Curl and HTTP/2 must agree.
+        # Any valid 200 above always wins, regardless of which route answered first.
+        absence_routes = {
+            self._transport_route(response)
+            for response in absence_responses.values()
+        }
+        absence_confirmed = len(absence_routes) >= 2 or (
+            absence_routes == {"direct"} and len(absence_responses) >= 2
+        )
+        if absence_confirmed:
+            confirmed_absence = next(iter(absence_responses.values()))
+            await self._record_authoritative(
+                trace_id,
+                username,
+                confirmed_absence,
+            )
+            return confirmed_absence
+        if absence_responses:
+            unconfirmed_absence = next(iter(absence_responses.values()))
+            await self.diagnostics.add(
+                level="WARNING",
+                event="profile_absence_unconfirmed",
+                message=(
+                    "نبودن پیج فقط از یک مسیر دیده شد؛ برای جلوگیری از تشخیص "
+                    "غلط، نتیجه نامشخص نگه داشته شد."
+                ),
+                trace_id=trace_id,
+                username=username,
+                transport=unconfirmed_absence.transport,
+                http_status=unconfirmed_absence.status_code,
+                detail=(
+                    f"independent_transports={len(absence_responses)}; "
+                    f"routes={','.join(sorted(absence_routes))}; "
+                    f"{self._response_diagnostic(unconfirmed_absence)}"
+                ),
+            )
+            if last_response is None:
+                last_response = CurlResponse(
+                    0,
+                    b"",
+                    "profile absence was not confirmed by an independent route",
+                    1,
+                    "absence-consensus",
+                )
 
         if blocked_responses:
             last_response = blocked_responses[0]
@@ -1169,13 +1359,25 @@ class InstagramChecker:
         response: CurlResponse,
         username: str,
     ) -> bool:
-        if response.status_code == 404:
-            return True
         if response.status_code != 200:
             return False
-        return self._parse_profile_response(
-            response.body, username, 200
-        ) is not None or self._body_indicates_deactivated(response.body)
+        return self._parse_profile_response(response.body, username, 200) is not None
+
+    @classmethod
+    def _response_indicates_absence(cls, response: CurlResponse) -> bool:
+        return response.status_code == 404 or (
+            response.status_code == 200
+            and cls._body_indicates_deactivated(response.body)
+        )
+
+    @staticmethod
+    def _transport_route(response: CurlResponse) -> str:
+        transport = response.transport.lower()
+        if "proxy" in transport:
+            return "proxy"
+        if "direct" in transport:
+            return "direct"
+        return transport
 
     @staticmethod
     def _response_is_access_blocked(response: CurlResponse) -> bool:
@@ -1312,6 +1514,8 @@ class InstagramChecker:
         requested_username: str,
         status_code: int,
     ) -> ProfileResult | None:
+        if status_code != 200:
+            return None
         try:
             payload = json.loads(body)
         except (json.JSONDecodeError, UnicodeDecodeError):

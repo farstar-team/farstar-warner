@@ -319,6 +319,111 @@ class NotificationOutbox(Base):
     )
 
 
+class BroadcastCampaign(Base):
+    """A durable administrator broadcast and its aggregate delivery state."""
+
+    __tablename__ = "broadcast_campaigns"
+    __table_args__ = (
+        Index("ix_broadcast_campaigns_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+    admin_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    message_html: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="Preparing", index=True
+    )
+    enqueue_cursor: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    progress_chat_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    progress_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    summary_notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    deliveries: Mapped[list[BroadcastDelivery]] = relationship(
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class BroadcastDelivery(Base):
+    """Per-recipient state for an at-least-once broadcast delivery."""
+
+    __tablename__ = "broadcast_deliveries"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "recipient_id", name="uq_broadcast_campaign_recipient"
+        ),
+        Index(
+            "ix_broadcast_deliveries_status_due",
+            "status",
+            "next_attempt_at",
+        ),
+        Index("ix_broadcast_deliveries_campaign_status", "campaign_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("broadcast_campaigns.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    recipient_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("users.telegram_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="Pending", index=True
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, index=True
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    campaign: Mapped[BroadcastCampaign] = relationship(back_populates="deliveries")
+
+
 class PageSnapshot(Base):
     __tablename__ = "page_snapshots"
 

@@ -20,6 +20,8 @@ from bot.checker import (
 )
 from bot.config import Settings
 from bot.credential_store import CredentialStore
+from bot.handlers.user import _registration_retry_is_locally_deferred
+from bot.keyboards.inline import registration_confirmation_keyboard
 from bot.models import (
     Base,
     NotificationOutbox,
@@ -31,6 +33,18 @@ from bot.models import (
     User,
 )
 from bot.profile_preview import PreviewOutcome, ProfilePreviewService
+
+
+class _TestRedisLock:
+    def __init__(self, acquired: bool = True) -> None:
+        self.acquired = acquired
+        self.released = False
+
+    async def acquire(self) -> bool:
+        return self.acquired
+
+    async def release(self) -> None:
+        self.released = True
 
 
 def _settings(key: str) -> Settings:
@@ -191,6 +205,45 @@ async def test_rate_limited_worker_defers_every_target_with_truthful_counters() 
 
 
 @pytest.mark.asyncio
+async def test_deferred_check_preserves_last_attempt_timestamp_for_fair_queue() -> None:
+    from datetime import datetime, timezone
+
+    previous_attempt = datetime(2026, 7, 1, 10, 30, tzinfo=timezone.utc)
+    target = SimpleNamespace(
+        last_checked_at=previous_attempt,
+        last_check_outcome="RateLimited",
+        consecutive_inconclusive_checks=3,
+    )
+
+    class Session:
+        committed = False
+
+        async def __aenter__(self) -> "Session":
+            return self
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+        async def get(self, _model: object, target_id: int) -> object | None:
+            assert target_id == 77
+            return target
+
+        async def commit(self) -> None:
+            self.committed = True
+
+    session = Session()
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.session_factory = lambda: session
+
+    await checker._record_deferred_check(77, "CircuitDeferred")
+
+    assert session.committed is True
+    assert target.last_checked_at == previous_attempt
+    assert target.last_check_outcome == "CircuitDeferred"
+    assert target.consecutive_inconclusive_checks == 4
+
+
+@pytest.mark.asyncio
 async def test_notification_outbox_retries_then_marks_successful_delivery_sent() -> None:
     from datetime import datetime, timezone
 
@@ -292,6 +345,192 @@ async def test_existing_cooldown_ttl_is_not_extended() -> None:
     checker.redis.set.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_registration_cooldown_accepts_positive_recovery() -> None:
+    lock = _TestRedisLock()
+
+    class Redis:
+        async def ttl(self, key: str) -> int:
+            return 600 if key == InstagramChecker.STATUS_COOLDOWN_KEY else 0
+
+        async def set(self, *_: object, **__: object) -> bool:
+            return True
+
+        def lock(self, *_: object, **__: object) -> _TestRedisLock:
+            return lock
+
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.redis = Redis()
+    active = ProfileResult(
+        CheckOutcome.ACTIVE,
+        canonical_username="active.page",
+        profile_id="123",
+        http_status=200,
+    )
+    checker._fetch_positive_recovery_profile = AsyncMock(return_value=active)
+    checker.fetch_profile = AsyncMock()
+
+    result = await checker.fetch_registration_profile(
+        "active.page",
+        requester_id=42,
+    )
+
+    assert result is active
+    checker._fetch_positive_recovery_profile.assert_awaited_once_with("active.page")
+    checker.fetch_profile.assert_not_awaited()
+    assert lock.released is True
+
+
+@pytest.mark.asyncio
+async def test_registration_cooldown_never_trusts_negative_recovery() -> None:
+    class Redis:
+        async def ttl(self, key: str) -> int:
+            return 600 if key == InstagramChecker.STATUS_COOLDOWN_KEY else 0
+
+        async def set(self, *_: object, **__: object) -> bool:
+            return True
+
+        def lock(self, *_: object, **__: object) -> _TestRedisLock:
+            return _TestRedisLock()
+
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.redis = Redis()
+    checker._fetch_positive_recovery_profile = AsyncMock(
+        return_value=ProfileResult(
+            CheckOutcome.DEACTIVATED,
+            source="recovery_probe_absence_untrusted",
+            http_status=404,
+        )
+    )
+    checker.fetch_profile = AsyncMock()
+
+    result = await checker.fetch_registration_profile(
+        "possibly.active",
+        requester_id=42,
+    )
+
+    assert result.outcome is CheckOutcome.RATE_LIMITED
+    assert result.source == "registration_positive_only_inconclusive"
+    assert result.http_status == 404
+    assert result.retry_after == checker.REGISTRATION_RETRY_SECONDS
+    checker.fetch_profile.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registration_retry_button_has_per_user_cooldown() -> None:
+    class Redis:
+        async def set(self, *_: object, **__: object) -> bool:
+            return False
+
+        async def ttl(self, *_: object) -> int:
+            return 17
+
+        def lock(self, *_: object, **__: object) -> _TestRedisLock:
+            raise AssertionError("lock must not be acquired for a throttled retry")
+
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.redis = Redis()
+
+    result = await checker.fetch_registration_profile(
+        "retry.page",
+        requester_id=99,
+        retry=True,
+    )
+
+    assert result.outcome is CheckOutcome.RATE_LIMITED
+    assert result.source == "registration_retry_cooldown"
+    assert result.retry_after == 17
+
+
+@pytest.mark.asyncio
+async def test_profile_request_does_not_accept_first_route_404() -> None:
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.settings = SimpleNamespace(instagram_proxy_url="socks5://warp:1080")
+    checker.diagnostics = SimpleNamespace(add=AsyncMock())
+    valid_body = json.dumps(
+        {
+            "data": {
+                "user": {
+                    "id": "123",
+                    "username": "route.test",
+                    "edge_followed_by": {"count": 10},
+                    "edge_follow": {"count": 20},
+                    "edge_owner_to_timeline_media": {"count": 3},
+                }
+            }
+        }
+    ).encode()
+    checker._execute_curl_once = AsyncMock(
+        side_effect=[
+            CurlResponse(404, b"", transport="curl-proxy"),
+            CurlResponse(200, valid_body, transport="curl-direct"),
+        ]
+    )
+    checker._execute_http2_once = AsyncMock()
+
+    result = await checker._execute_profile_request("route.test")
+
+    assert result.status_code == 200
+    assert result.transport == "curl-direct"
+    assert checker._execute_curl_once.await_count == 2
+    checker._execute_http2_once.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_two_direct_transports_can_confirm_initial_absence() -> None:
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker.settings = SimpleNamespace(instagram_proxy_url=None)
+    checker.diagnostics = SimpleNamespace(add=AsyncMock())
+    checker._execute_curl_once = AsyncMock(
+        return_value=CurlResponse(404, b"", transport="curl-direct")
+    )
+    checker._execute_http2_once = AsyncMock(
+        return_value=CurlResponse(404, b"", transport="httpx-http2-direct")
+    )
+
+    result = await checker._execute_profile_request("missing.page")
+
+    assert result.status_code == 404
+    checker._execute_curl_once.assert_awaited_once()
+    checker._execute_http2_once.assert_awaited_once()
+
+
+def test_registration_confirmation_keyboard_includes_retry_action() -> None:
+    keyboard = registration_confirmation_keyboard(
+        profile_url="https://www.instagram.com/retry.page/",
+        allow_status_choice=True,
+        allow_retry=True,
+    )
+
+    callbacks = {
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data
+    }
+    assert "register:retry" in callbacks
+    assert "register:confirm:active" in callbacks
+    assert "register:confirm:inactive" in callbacks
+
+
+def test_local_registration_retry_deferral_preserves_existing_fsm_result() -> None:
+    for source in (
+        "registration_retry_cooldown",
+        "registration_singleflight_busy",
+        "registration_recovery_gate_busy",
+    ):
+        assert _registration_retry_is_locally_deferred(
+            ProfileResult(CheckOutcome.RATE_LIMITED, source=source)
+        )
+
+    assert not _registration_retry_is_locally_deferred(
+        ProfileResult(CheckOutcome.RATE_LIMITED, source="public_web_profile")
+    )
+    assert not _registration_retry_is_locally_deferred(
+        ProfileResult(CheckOutcome.ACTIVE, source="registration_retry_cooldown")
+    )
+
+
 def test_public_parser_reads_only_root_user_node() -> None:
     body = json.dumps(
         {
@@ -330,6 +569,32 @@ def test_public_parser_reads_only_root_user_node() -> None:
     assert result.category_name == "Security Service"
 
 
+def test_public_parser_rejects_profile_payload_on_non_success_http_status() -> None:
+    body = json.dumps(
+        {
+            "data": {
+                "user": {
+                    "id": "123",
+                    "username": "blocked.page",
+                }
+            }
+        }
+    ).encode()
+
+    assert InstagramChecker._parse_profile_response(body, "blocked.page", 401) is None
+
+
+def test_blocked_null_user_body_is_not_deactivation_evidence() -> None:
+    response = CurlResponse(
+        401,
+        b'{"data":{"user":null},"status":"fail"}',
+        transport="curl-proxy",
+    )
+
+    assert InstagramChecker._body_indicates_deactivated(response.body) is True
+    assert InstagramChecker._response_indicates_absence(response) is False
+
+
 def test_embed_parser_extracts_security_metadata_from_root_profile_node() -> None:
     payload = {
         "require": [
@@ -365,6 +630,49 @@ def test_embed_parser_extracts_security_metadata_from_root_profile_node() -> Non
     assert profile.external_link_observed is True
     assert profile.account_type == "personal"
     assert profile.account_type_observed is True
+
+
+@pytest.mark.asyncio
+async def test_embed_absence_without_proxy_requires_two_http_attempts() -> None:
+    service = ProfilePreviewService.__new__(ProfilePreviewService)
+    service.settings = SimpleNamespace(
+        instagram_proxy_url=None,
+        instagram_base_url="https://www.instagram.com",
+    )
+    service._embed_direct_http = SimpleNamespace(
+        get=AsyncMock(
+            return_value=SimpleNamespace(status_code=404, content=b"", text="")
+        )
+    )
+    service._embed_http = SimpleNamespace(
+        get=AsyncMock(
+            return_value=SimpleNamespace(
+                status_code=200,
+                content=b"<html></html>",
+                text="<html></html>",
+            )
+        )
+    )
+
+    unconfirmed = await service._inspect_with_http("possibly.active")
+
+    assert unconfirmed.outcome is PreviewOutcome.UNKNOWN
+    service._embed_direct_http.get.assert_awaited_once()
+    service._embed_http.get.assert_awaited_once()
+
+    service._embed_direct_http.get.reset_mock()
+    service._embed_http.get.reset_mock()
+    service._embed_http.get.return_value = SimpleNamespace(
+        status_code=404,
+        content=b"",
+        text="",
+    )
+
+    confirmed = await service._inspect_with_http("definitely.missing")
+
+    assert confirmed.outcome is PreviewOutcome.DEACTIVATED
+    service._embed_direct_http.get.assert_awaited_once()
+    service._embed_http.get.assert_awaited_once()
 
 
 def test_malicious_link_radar_is_local_and_signature_based() -> None:
@@ -440,7 +748,7 @@ def test_graphql_search_exact_match_is_active() -> None:
     assert result.metadata_complete is False
 
 
-def test_graphql_search_valid_absence_is_deactivated_evidence() -> None:
+def test_graphql_search_absence_is_only_searchability_evidence() -> None:
     body = json.dumps(
         {
             "data": {
@@ -459,8 +767,10 @@ def test_graphql_search_valid_absence_is_deactivated_evidence() -> None:
     )
 
     assert result is not None
-    assert result.outcome is CheckOutcome.DEACTIVATED
+    assert result.outcome is CheckOutcome.UNKNOWN
     assert result.source == "graphql_username_search_absence"
+    assert result.guest_searchable is False
+    assert result.http_status == 200
 
 
 def test_graphql_search_rejects_failed_or_malformed_payload() -> None:
@@ -636,7 +946,7 @@ async def test_confirmed_active_to_deactivated_transition_notifies_owner() -> No
     )
     evidence = ProfileResult(
         CheckOutcome.DEACTIVATED,
-        source="graphql_username_search_absence",
+        source="web_profile_explicit_absence",
         http_status=404,
     )
     checker.fetch_profile = AsyncMock(side_effect=[evidence, evidence])
@@ -647,7 +957,7 @@ async def test_confirmed_active_to_deactivated_transition_notifies_owner() -> No
     assert result is evidence
     assert target.last_known_status is PageStatus.DEACTIVATED
     assert target.consecutive_deactivated_checks == 2
-    assert target.last_evidence_source == "graphql_username_search_absence"
+    assert target.last_evidence_source == "web_profile_explicit_absence"
     assert target.last_deactivation_evidence_at is not None
     outbox = [value for value in added if isinstance(value, NotificationOutbox)]
     assert len(outbox) == 1
@@ -660,9 +970,11 @@ async def test_web_profile_401_uses_discovery_before_circuit_breaker() -> None:
     checker = InstagramChecker.__new__(InstagramChecker)
     checker._official_ready = False
     evidence = ProfileResult(
-        CheckOutcome.DEACTIVATED,
-        source="graphql_username_search_absence",
-        http_status=404,
+        CheckOutcome.ACTIVE,
+        source="graphql_username_search",
+        canonical_username="missing_account",
+        profile_id="123",
+        http_status=200,
     )
     checker._search_profile_via_graphql = AsyncMock(return_value=evidence)
     checker._activate_cooldown = AsyncMock(return_value=900)
@@ -680,6 +992,43 @@ async def test_web_profile_401_uses_discovery_before_circuit_breaker() -> None:
     assert result is evidence
     checker._activate_cooldown.assert_not_awaited()
     checker._record_final_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_web_profile_401_with_null_user_cannot_deactivate_target() -> None:
+    checker = InstagramChecker.__new__(InstagramChecker)
+    checker._official_ready = False
+    checker._cycle_blocked_count = 0
+    checker._rate_limited = asyncio.Event()
+    checker._browser_probe = None
+    checker.settings = SimpleNamespace(
+        rate_limit_cooldown_seconds=900,
+        check_concurrency=4,
+    )
+    checker._search_profile_via_graphql = AsyncMock(
+        return_value=ProfileResult(
+            CheckOutcome.UNKNOWN,
+            source="graphql_username_search_absence",
+            guest_searchable=False,
+            http_status=200,
+        )
+    )
+    checker._record_final_failure = AsyncMock()
+    checker._activate_cooldown = AsyncMock(return_value=900)
+
+    result = await checker._profile_result_from_response(
+        CurlResponse(
+            401,
+            b'{"data":{"user":null},"status":"fail"}',
+            transport="curl-proxy",
+        ),
+        "possibly_active",
+    )
+
+    assert result.outcome is CheckOutcome.RATE_LIMITED
+    assert result.http_status == 401
+    checker._activate_cooldown.assert_not_awaited()
+    checker._record_final_failure.assert_awaited_once()
 
 
 @pytest.mark.asyncio

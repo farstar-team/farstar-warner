@@ -19,6 +19,11 @@ from redis.asyncio import Redis
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from bot.broadcast import (
+    cleanup_broadcast_campaigns,
+    dispatch_broadcast_deliveries,
+    reconcile_broadcast_campaigns,
+)
 from bot.checker import InstagramChecker
 from bot.config import Settings, get_settings
 from bot.database import SessionFactory, create_database, initialize_database
@@ -262,6 +267,33 @@ async def run() -> None:
             next_run_time=datetime.now(timezone.utc) + timedelta(seconds=3),
         )
         scheduler.add_job(
+            dispatch_broadcast_deliveries,
+            trigger=IntervalTrigger(seconds=2, timezone=timezone.utc),
+            id="admin-broadcast-dispatcher",
+            name="Durable rate-safe administrator broadcasts",
+            replace_existing=True,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=4),
+            kwargs={
+                "bot": bot,
+                "session_factory": session_factory,
+                "redis": redis,
+                "settings": settings,
+            },
+        )
+        scheduler.add_job(
+            reconcile_broadcast_campaigns,
+            trigger=IntervalTrigger(seconds=5, timezone=timezone.utc),
+            id="admin-broadcast-reconciler",
+            name="Broadcast preparation and progress reconciliation",
+            replace_existing=True,
+            next_run_time=datetime.now(timezone.utc) + timedelta(seconds=6),
+            kwargs={
+                "bot": bot,
+                "session_factory": session_factory,
+                "redis": redis,
+            },
+        )
+        scheduler.add_job(
             send_expiry_reminders,
             trigger=CronTrigger(hour=6, minute=0, timezone=timezone.utc),
             id="subscription-expiry-reminders",
@@ -275,6 +307,14 @@ async def run() -> None:
             id="notification-outbox-cleanup",
             name="Notification outbox retention cleanup",
             replace_existing=True,
+        )
+        scheduler.add_job(
+            cleanup_broadcast_campaigns,
+            trigger=CronTrigger(hour=3, minute=30, timezone=timezone.utc),
+            id="admin-broadcast-cleanup",
+            name="Broadcast campaign retention cleanup",
+            replace_existing=True,
+            kwargs={"session_factory": session_factory},
         )
         scheduler.start()
 

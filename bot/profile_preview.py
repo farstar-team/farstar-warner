@@ -182,7 +182,13 @@ class ProfilePreviewService:
         clients = (
             (("proxy", self._embed_http), ("direct", self._embed_direct_http))
             if self.settings.instagram_proxy_url
-            else (("direct", self._embed_direct_http),)
+            # Without a proxy, use two independent HTTP client pools.  A lone
+            # edge 404 is not enough to declare a profile deactivated during
+            # registration; both temporal/connection attempts must agree.
+            else (
+                ("direct-primary", self._embed_direct_http),
+                ("direct-confirmation", self._embed_http),
+            )
         )
         diagnostics: list[str] = []
         absence_routes = 0
@@ -574,9 +580,9 @@ class ProfilePreviewService:
             )
             if response is not None and response.status == 404:
                 return EmbedProfile(
-                    PreviewOutcome.DEACTIVATED,
+                    PreviewOutcome.UNKNOWN,
                     username=username,
-                    diagnostic="http_404",
+                    diagnostic="unconfirmed_browser_http_404",
                 )
             if response is not None and response.status != 200:
                 return EmbedProfile(
@@ -629,9 +635,9 @@ class ProfilePreviewService:
                     )
                 ):
                     return EmbedProfile(
-                        PreviewOutcome.DEACTIVATED,
+                        PreviewOutcome.UNKNOWN,
                         username=username,
-                        diagnostic="not_available_text",
+                        diagnostic="unconfirmed_browser_not_available_text",
                     )
                 return EmbedProfile(
                     PreviewOutcome.UNKNOWN,
